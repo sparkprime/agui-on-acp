@@ -1,0 +1,16 @@
+{
+  "name": "acp-to-agui",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "install:backend": "cd backend && pip install -e .",
+    "dev:backend": "PYTHONPATH=. uvicorn backend.main:app --reload --port 8000",
+    "dev:ui": "cd reference-ui && pnpm dev",
+    "dev": "concurrently \"pnpm dev:backend\" \"pnpm dev:ui\"",
+    "postinstall": "cd backend && pip install -e ."
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}

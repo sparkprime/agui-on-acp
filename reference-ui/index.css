@@ -1,0 +1,129 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ── Shape Language Design Tokens ─────────────────────────────────────── */
+/* Responsive corner radii & inset margins following the shape language spec:
+   Level 1 = outermost panel radius
+   Level 2 = inner sections (header, input, cards)
+   Level 3 = deepest nested elements (buttons, badges, chips)
+   Inset   = margin from outer dark frame
+   Gap     = space between panels
+*/
+
+:root {
+  /* Default: Desktop / MM Breakpoint 2 (11" and above) */
+  --sl-level1: 30px;
+  --sl-level2: 24px;
+  --sl-level3: 18px;
+  --sl-inset: 10px;
+  --sl-gap: 10px;
+}
+
+/* MM Breakpoint 1 (10" and below, ~1024px) */
+@media (max-width: 1024px) {
+  :root {
+    --sl-level1: 30px;
+    --sl-level2: 24px;
+    --sl-level3: 18px;
+    --sl-inset: 8px;
+    --sl-gap: 8px;
+  }
+}
+
+/* Tablet (~768px) */
+@media (max-width: 768px) {
+  :root {
+    --sl-level1: 24px;
+    --sl-level2: 18px;
+    --sl-level3: 12px;
+    --sl-inset: 8px;
+    --sl-gap: 8px;
+  }
+}
+
+/* Mobile (<640px) */
+@media (max-width: 640px) {
+  :root {
+    --sl-level1: 20px;
+    --sl-level2: 16px;
+    --sl-level3: 12px;
+    --sl-inset: 6px;
+    --sl-gap: 6px;
+  }
+}
+
+body {
+  background-color: #000000;
+  color: #A1A1A1;
+  overflow: hidden; /* Prevent body scroll, handle in app */
+}
+
+/* Custom Scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: #0A0A0A;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #2A2A2A;
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #3A3A3A;
+}
+
+/* Empty state icon animations */
+@keyframes icon-float {
+  0%, 100% {
+    transform: translateY(0px);
+  }
+  50% {
+    transform: translateY(-3px);
+  }
+}
+
+@keyframes icon-glow {
+  0%, 100% {
+    filter: drop-shadow(0 0 6px rgba(255, 107, 0, 0.15));
+  }
+  50% {
+    filter: drop-shadow(0 0 20px rgba(255, 107, 0, 0.5));
+  }
+}
+
+/* Empty state text animations */
+@keyframes text-fade-in {
+  0% {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes text-fade-out {
+  0% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+  100% {
+    opacity: 0;
+    transform: translateY(-8px);
+  }
+}
+
+.animate-text-fade-in {
+  animation: text-fade-in 0.25s ease-out forwards;
+}
+
+.animate-text-fade-out {
+  animation: text-fade-out 0.25s ease-in forwards;
+}
