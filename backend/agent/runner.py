@@ -89,6 +89,7 @@ class AgentRunner:
 
         self._context_manager = acp.spawn_agent_process(
             client, binary, *args,
+            env=proc_env,
             transport_kwargs={"limit": 16 * 1024 * 1024},  # 16 MB buffer for large responses
         )
         conn, process = await self._context_manager.__aenter__()
