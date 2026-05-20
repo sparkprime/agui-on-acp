@@ -321,3 +321,7 @@ Contributions welcome! Areas of interest:
 ## License
 
 MIT
+
+---
+
+<sub>This project is independent and is not affiliated with, endorsed by, or sponsored by Amazon/Kiro, Anthropic/Claude, OpenAI/Codex, Google/Gemini, GitHub/Copilot, Cursor/Anysphere, OpenCode, Cline, or their respective owners. All product names, logos, and trademarks are property of their respective owners.</sub>
