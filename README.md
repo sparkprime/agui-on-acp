@@ -22,27 +22,29 @@ But what if you want a **custom web workspace**? A task board for your team? A d
 
 This project is a **protocol bridge** that sits between any ACP agent and any web frontend:
 
-```
-┌─────────────────────────┐     JSON-RPC 2.0      ┌────────────────────┐
-│   ACP Agent             │ ←──── stdio ────────→  │   This Bridge      │
-│   (subprocess)          │     (bidirectional)    │   (Python/FastAPI) │
-│                         │                        │                    │
-│   kiro-cli              │                        │   Translates ACP   │
-│   claude --acp          │                        │   notifications    │
-│   codex --acp           │                        │   into AG-UI       │
-│   gemini cli acp        │                        │   events           │
-│   cursor --acp          │                        │                    │
-│   ANY ACP binary        │                        │                    │
-└─────────────────────────┘                        └────────┬───────────┘
-                                                            │
-                                                   SSE (AG-UI protocol)
-                                                            │
-                                                            ▼
-                                                   ┌────────────────────┐
-                                                   │   Your Frontend    │
-                                                   │   (React, Vue,    │
-                                                   │    anything)       │
-                                                   └────────────────────┘
+```mermaid
+graph LR
+    subgraph ACP Agents
+        A1[kiro-cli]
+        A2[claude --acp]
+        A3[codex --acp]
+        A4[gemini cli acp]
+        A5[cursor --acp]
+        A6[ANY ACP binary]
+    end
+
+    subgraph Bridge["This Bridge (Python/FastAPI)"]
+        B[ACP → AG-UI\nTranslator]
+    end
+
+    subgraph Frontend["Your Frontend"]
+        F1[React]
+        F2[CopilotKit]
+        F3[Vue / Angular / anything]
+    end
+
+    A1 & A2 & A3 & A4 & A5 & A6 <-->|"JSON-RPC 2.0\n(stdio)"| B
+    B -->|"SSE\n(AG-UI events)"| F1 & F2 & F3
 ```
 
 Clone this repo, change one line in `bridge.config.json` to point at your agent, and you have a working web UI with streaming chat, tool visualization, and human-in-the-loop approvals.
