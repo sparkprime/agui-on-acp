@@ -57,7 +57,7 @@ Clone this repo, change one line in `bridge.config.json` to point at your agent,
 - **Frontend SDKs** — TypeScript, Python, Kotlin, Go, Rust, and more
 - **Human-in-the-loop built in** — pause, approve, reject, or redirect agent execution mid-flow
 
-By emitting AG-UI events, your frontend becomes portable across the entire agent ecosystem.
+By emitting AG-UI events, your frontend becomes portable across the entire agent ecosystem. See [`docs/why-agui.md`](docs/why-agui.md) for a deep dive on what this unlocks — CopilotKit integration, shared state, generative UI, and more.
 
 ## Quick Start
 
