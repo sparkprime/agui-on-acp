@@ -2,16 +2,18 @@
 
 This document walks through the end-to-end test that proves the core thesis of this project: **any ACP-compatible agent can be given a rich web UI by changing a single config line**.
 
+> **Implementation note:** This bridge uses the official [`agent-client-protocol`](https://pypi.org/project/agent-client-protocol/) Python SDK (v0.10+) for all ACP communication. The SDK handles JSON-RPC transport, message serialization, and extension routing. Our bridge implements the `acp.Client` callback interface to receive agent notifications and translate them to AG-UI events.
+
 ---
 
 ## What We Tested
 
 We ran two completely different AI coding agents through the same bridge, with the same frontend, and observed identical AG-UI event streams — proving the protocol translation layer works generically.
 
-| Agent | Creator | Binary | ACP Protocol |
-|-------|---------|--------|--------------|
-| **Kiro CLI** | Amazon | `kiro-cli acp` | Native ACP support |
-| **Claude Agent** | Anthropic (via Zed adapter) | `claude-agent-acp` | Claude Agent SDK wrapped in ACP |
+| Agent | Creator | Binary | Version | ACP Protocol |
+|-------|---------|--------|---------|--------------|
+| **Kiro CLI** | Amazon | `kiro-cli acp` | 2.3.0 | Native ACP, 13 modes, extension notifications |
+| **Claude Agent** | Anthropic (via Zed's ACP adapter) | `claude-agent-acp` | 0.36.1 | Claude Agent SDK wrapped in ACP, 5 modes, prompt queueing |
 
 ---
 
@@ -218,13 +220,16 @@ data: {"type":"RUN_FINISHED","runId":"7abd434f-...","taskId":"a305d00b-..."}
 | Aspect | Kiro CLI | Claude Agent ACP |
 |--------|----------|-----------------|
 | **Binary** | `kiro-cli acp` | `claude-agent-acp` |
+| **Agent Info** | "Kiro CLI Agent" v2.3.0 | "Claude Agent" v0.36.1 |
 | **Underlying LLM** | Claude (via Amazon) | Claude (direct Anthropic SDK) |
 | **Modes** | 13 (kiro_default, planner, guide, ...) | 5 (Default, Accept Edits, Plan, ...) |
-| **Custom events** | Yes (`agent:commands_available`) | None in this test |
-| **Event sequence** | RUN_STARTED → CUSTOM → TEXT_* → RUN_FINISHED | RUN_STARTED → TEXT_* → RUN_FINISHED |
+| **Capabilities** | image, load_session, MCP (http) | image, embedded_context, load_session, MCP (http+sse), fork, resume, list |
+| **Extension events** | Yes (`agent:commands_available`, `agent:kiro.dev_metadata`) | None in basic prompt |
+| **Event sequence** | RUN_STARTED → TEXT_* → CUSTOM → TEXT_END → RUN_FINISHED | RUN_STARTED → TEXT_* → TEXT_END → RUN_FINISHED |
 | **Config change** | — | One line in `bridge.config.json` |
 | **Code changes** | — | **Zero** |
 | **Frontend changes** | — | **Zero** |
+| **SDK used** | `agent-client-protocol` Python SDK | Same SDK (same bridge code) |
 
 ---
 
