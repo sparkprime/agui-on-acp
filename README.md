@@ -1,5 +1,11 @@
 # ACP → AG-UI
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
+[![ACP SDK](https://img.shields.io/badge/agent--client--protocol-0.10+-blue.svg)](https://pypi.org/project/agent-client-protocol/)
+[![AG-UI](https://img.shields.io/badge/AG--UI-protocol-green.svg)](https://docs.ag-ui.com)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-teal.svg)](https://fastapi.tiangolo.com)
+
 > Coding agents live in terminals. This adapter gives them rich web UIs.
 
 <p align="center">
