@@ -4,5 +4,5 @@
   "description": "Give any ACP-compatible coding agent a rich web UI",
   "agentCommand": ["kiro-cli", "acp"],
   "backendPort": 8000,
-  "corsOrigins": ["http://localhost:5173", "http://localhost:3000"]
+  "corsOrigins": ["http://localhost:5173", "http://localhost:3000", "http://localhost:3001", "http://localhost:3002"]
 }

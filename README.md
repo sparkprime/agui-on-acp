@@ -3,12 +3,18 @@
 > Coding agents live in terminals. This adapter gives them rich web UIs.
 
 <p align="center">
-  <img src="docs/assets/demo.gif" alt="ACP agent running in a full web workspace" width="800"/>
-  <br/>
-  <em>Any ACP-compatible agent, running in a custom web workspace instead of a terminal</em>
+  <img src="docs/assets/httpagent-demo-chat.png" alt="AG-UI HttpAgent consuming ACP agent events" width="700"/>
+</p>
+<p align="center">
+  <em>An ACP coding agent (kiro-cli) powering a web chat UI via AG-UI events</em>
 </p>
 
-<!-- TODO: Add demo.gif before the talk -->
+<details>
+<summary>Raw AG-UI events over SSE (what the frontend consumes)</summary>
+<p align="center">
+  <img src="docs/assets/sse-events-terminal.png" alt="AG-UI SSE events" width="700"/>
+</p>
+</details>
 
 ---
 
