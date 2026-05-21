@@ -53,7 +53,7 @@ pnpm dev:backend
 ### 2. Install and run this demo
 
 ```bash
-cd examples/copilotkit-demo
+cd example-frontends/copilotkit-demo
 pnpm install
 pnpm dev
 # Open http://localhost:3001
@@ -120,19 +120,19 @@ const agent = new HttpAgent({
 });
 ```
 
-## Comparison: Reference UI vs CopilotKit
+## Comparison: Custom Workspace vs CopilotKit vs HttpAgent
 
-| Aspect | Reference UI (included) | CopilotKit |
-|--------|------------------------|------------|
-| Lines of code | ~2000 | ~30 |
-| Setup time | 0 (included) | 5 min (npm install) |
-| Customization | Full control | Theme + labels |
-| Streaming | Custom SSE hook | Built-in |
-| Tools | Custom ToolCard | Built-in |
-| Approvals | Custom dialog | Built-in |
-| State sync | Custom Zustand | useCoAgent hook |
-| Generative UI | Not included | Built-in |
-| Mobile | Not included | React Native SDK |
+| Aspect | Custom Workspace | CopilotKit (this) | HttpAgent |
+|--------|-----------------|-------------------|-----------|
+| AG-UI consumption | Direct REST + raw SSE | Framework handles it | Client library |
+| Lines of code | ~2000 | ~30 | ~50 |
+| Customization | Full control | Theme + labels | Full (you build it) |
+| Streaming | Custom SSE hook | Built-in | Observable |
+| Tools | Custom ToolCard | Built-in | Your implementation |
+| Approvals | Custom dialog | Built-in | Your implementation |
+| State sync | Custom Zustand | useCoAgent hook | Your choice |
+| Generative UI | Not included | Built-in | Not included |
 
-**Use the reference UI** when you want full control over every pixel.
+**Use Custom Workspace** when you want full control over every pixel.
 **Use CopilotKit** when you want to ship fast and get production features for free.
+**Use HttpAgent** when you want typed AG-UI events with your own UI framework.

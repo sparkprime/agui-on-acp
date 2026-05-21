@@ -99,16 +99,17 @@ All configuration lives in `bridge.config.json`:
 
 Just change `agentCommand` to point at your agent:
 
-| Agent | Command |
-|-------|---------|
-| Kiro CLI | `["kiro-cli", "acp"]` |
-| Claude Agent | `["claude-agent-acp"]` |
-| Codex CLI | `["codex", "--acp"]` |
-| Gemini CLI | `["gemini", "cli", "acp"]` |
-| Cursor | `["cursor", "--acp"]` |
-| OpenCode | `["opencode", "acp"]` |
-| GitHub Copilot | `["github-copilot-cli", "--acp"]` |
-| Any ACP binary | `["your-agent", "acp"]` |
+| Agent | Command | Auth |
+|-------|---------|------|
+| Kiro CLI | `["kiro-cli", "acp"]` | AWS Builder ID |
+| Claude Agent | `["claude-agent-acp"]` | `ANTHROPIC_API_KEY` |
+| Codex CLI | `["codex-acp"]` | ChatGPT subscription or API key |
+| OpenCode | `["opencode", "acp"]` | OpenCode Zen or provider API key |
+| Gemini CLI | `["gemini", "cli", "acp"]` | Google auth |
+| Cursor | `["cursor", "--acp"]` | Cursor subscription |
+| GitHub Copilot | `["github-copilot-cli", "--acp"]` | GitHub auth |
+| Goose | `["goose", "--acp"]` | Provider API key |
+| Any ACP binary | `["your-agent", "acp"]` | Varies |
 
 ## Architecture
 
@@ -214,7 +215,7 @@ graph TB
     bridge --> path2
     bridge --> path3
 
-    path1["Reference UI\nFull React app, ~2000 lines, full control"]
+    path1["Custom Workspace\nDirect REST + SSE, ~2000 lines, full control"]
     path2["CopilotKit\nCopilotChat component, ~20 lines, ship fast"]
     path3["AG-UI HttpAgent\n@ag-ui/client, ~50 lines, build anything"]
 
@@ -224,11 +225,11 @@ graph TB
     style path3 fill:#4a2c17,stroke:#fbbf24,color:#fff
 ```
 
-| Approach | Lines of Code | Use When |
-|----------|--------------|----------|
-| **Reference UI** (`reference-ui/`) | ~2000 | You want full control over every pixel |
-| **CopilotKit** (`examples/copilotkit-demo/`) | ~20 | You want to ship fast with production features |
-| **AG-UI HttpAgent** (`examples/httpagent-demo/`) | ~50 | You want the raw protocol with your own UI framework |
+| Approach | How it consumes AG-UI | Lines of Code | Use When |
+|----------|----------------------|--------------|----------|
+| **Custom Workspace** (`example-frontends/custom-workspace-ui-demo/`) | Direct REST + raw SSE parsing | ~2000 | You want full control over every pixel |
+| **CopilotKit** (`example-frontends/copilotkit-demo/`) | AG-UI via framework (zero UI code) | ~20 | You want to ship fast with production features |
+| **AG-UI HttpAgent** (`example-frontends/httpagent-demo/`) | AG-UI via client library (you build UI) | ~50 | You want the raw protocol with your own UI framework |
 
 ## How It Works
 
@@ -250,17 +251,18 @@ graph TB
 │   ├── policy/                 # Tool approval engine
 │   ├── api/                    # Side-channel REST (files, git)
 │   └── agui_endpoint.py        # POST /ag-ui (AG-UI standard endpoint)
-├── reference-ui/               # Full React frontend (Vite + Tailwind)
-├── examples/
-│   ├── copilotkit-demo/        # CopilotKit in 20 lines
-│   ├── httpagent-demo/         # Raw @ag-ui/client AG-UI HttpAgent
-│   └── agents.md              # Agent configuration guide
+├── example-frontends/
+│   ├── custom-workspace-ui-demo/  # Full workspace UI (React + Vite + Tailwind)
+│   ├── copilotkit-demo/           # CopilotKit in 20 lines
+│   ├── httpagent-demo/            # Raw @ag-ui/client AG-UI HttpAgent
+│   └── agents.md                  # Agent configuration guide
 ├── docs/
 │   ├── architecture.md         # Detailed system design
 │   ├── integration-contract.md # REST + SSE API spec
 │   ├── protocol-translation.md # Full ACP ↔ AG-UI mapping
 │   ├── why-agui.md            # AG-UI ecosystem benefits
 │   ├── demo-walkthrough.md    # End-to-end test results
+│   ├── ROADMAP.md             # Planned features
 │   └── talk-qanda.md          # Anticipated Q&A
 ├── bridge.config.json          # Your agent configuration
 └── package.json                # Workspace orchestrator
@@ -295,14 +297,28 @@ See [`docs/integration-contract.md`](docs/integration-contract.md) for the full 
 |-------|---------|--------|-------|
 | **Kiro CLI** | 2.3.0 | ✅ Working | 13 modes, extension notifications, full streaming |
 | **Claude Agent** (claude-agent-acp) | 0.36.1 | ✅ Working | 5 modes, prompt queueing, embedded context |
+| **Codex CLI** (codex-acp) | 0.14.0 | 🟡 Supported | Via Zed adapter, tool calls + edit review |
+| **OpenCode** | 1.15.6 | 🟡 Supported | Native ACP, 2 agents (build/plan), MCP servers |
 
-Both tested end-to-end with zero code changes between them. Just swap `agentCommand`. See [`docs/demo-walkthrough.md`](docs/demo-walkthrough.md) for full test results.
+Kiro and Claude Agent tested end-to-end with zero code changes between them. Codex and OpenCode are ACP-compatible and supported by this bridge — community testing welcome. Just swap `agentCommand`. See [`docs/demo-walkthrough.md`](docs/demo-walkthrough.md) for full test results and [`example-frontends/agents.md`](example-frontends/agents.md) for setup guides.
 
 ## Supported Agents (ACP Ecosystem)
 
 ACP is supported by 33+ agents. Any of them can be used with this bridge:
 
-Augment Code, AutoDev, Blackbox AI, Claude Code, Cline, Codex CLI, Cursor, Docker cagent, fast-agent, Factory Droid, Gemini CLI, GitHub Copilot, Goose, Hermes Agent, Junie (JetBrains), Kimi CLI, Kiro CLI, Mistral Vibe, OpenCode, OpenHands, Poolside, Qwen Code, and more.
+| Agent | ACP Type | Notes |
+|-------|----------|-------|
+| Kiro CLI | Native | Full-featured, 13+ modes, custom agents |
+| Claude Code | Via adapter ([claude-agent-acp](https://github.com/zed-industries/claude-code-acp)) | Permission modes, tool calls, MCP |
+| Codex CLI | Via adapter ([codex-acp](https://github.com/zed-industries/codex-acp)) | Edit review, slash commands, MCP |
+| OpenCode | Native | 2 built-in agents, custom tools, MCP |
+| Gemini CLI | Native | Google's coding agent |
+| GitHub Copilot | Native (public preview) | Copilot in terminal |
+| Cursor | Native | IDE agent over ACP |
+| Goose | Native | Block's open-source agent |
+| Cline | Native | VS Code agent with ACP |
+
+Also supported: Augment Code, AutoDev, Blackbox AI, Docker cagent, fast-agent, Factory Droid, Hermes Agent, Junie (JetBrains), Kimi CLI, Mistral Vibe, OpenHands, Poolside, Qwen Code, and more.
 
 Full list: [agentclientprotocol.com/get-started/agents](https://agentclientprotocol.com/get-started/agents)
 

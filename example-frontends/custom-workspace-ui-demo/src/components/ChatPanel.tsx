@@ -10,7 +10,7 @@ import { ToolCard } from './ToolCard';
 import { ThinkingBlock } from './ThinkingBlock';
 import { useSessionStore, ChatMessage, ToolCall, MessageAttachment } from '../stores/sessionStore';
 
-import { fetchPathSuggestions, PathSuggestion } from '../src/services/api';
+import { fetchPathSuggestions, PathSuggestion } from '../services/api';
 import { slashCommands } from '../services/slashCommands';
 
 

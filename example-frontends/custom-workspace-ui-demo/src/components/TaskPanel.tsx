@@ -32,7 +32,7 @@ import {
   Session,
   SessionStatus,
 } from '../stores/sessionStore';
-import * as v2Api from '../src/services/v2Api';
+import * as v2Api from '../services/v2Api';
 
 // ============================================================================
 // Types

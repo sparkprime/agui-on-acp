@@ -9,7 +9,7 @@ import { useCallback, useRef, useState } from 'react';
 import { connectAguiStream, disconnectAguiStream } from '../services/aguiClient';
 import { AguiEventType, type AguiEvent, type ApprovalState } from '../services/aguiTypes';
 import * as v2Api from '../services/v2Api';
-import { useSessionStore, type MessageAttachment } from '../../stores/sessionStore';
+import { useSessionStore, type MessageAttachment } from '../stores/sessionStore';
 
 export interface UseAgUiStreamReturn {
   /** Start a new run: POST /v2/tasks/{taskId}/run then connect SSE. */

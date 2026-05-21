@@ -6,7 +6,7 @@
 
 import { ChatSession, TaskData, TaskItem, TaskStatus, Sender, isTaskSession } from '../types';
 import { parseTodoMd, serializeTodoMd, createDefaultTodoMd } from './todoParser';
-import { createDirectory, readFile, writeFile } from '../src/services/api';
+import { createDirectory, readFile, writeFile } from './api';
 
 // Debounce timer for file writes
 let saveTimer: ReturnType<typeof setTimeout> | null = null;

@@ -15,8 +15,8 @@ import {
   createSessionFromTask,
   type MessageAttachment,
 } from './stores/sessionStore';
-import * as v2Api from './src/services/v2Api';
-import { useAgUiStream } from './src/hooks/useAgUiStream';
+import * as v2Api from './services/v2Api';
+import { useAgUiStream } from './hooks/useAgUiStream';
 
 const App: React.FC = () => {
   // Project directory

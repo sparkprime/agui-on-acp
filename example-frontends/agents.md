@@ -228,18 +228,193 @@ This project handles all of that. You just:
 
 ---
 
+## Codex CLI (via codex-acp)
+
+[Codex CLI](https://github.com/openai/codex) is OpenAI's coding agent. ACP support is provided through Zed's adapter ([codex-acp](https://github.com/zed-industries/codex-acp)).
+
+### Prerequisites
+
+One of the following authentication methods:
+
+1. **ChatGPT subscription** (Plus, Pro, Team, or Enterprise) — sign in interactively via browser OAuth
+2. **`CODEX_API_KEY`** — dedicated Codex API key
+3. **`OPENAI_API_KEY`** — standard OpenAI Platform API key
+
+No API key is required if you authenticate with your ChatGPT subscription. The interactive sign-in flow uses your plan's limits rather than usage-based billing.
+
+You only need an API key when:
+- Running in remote/headless environments where browser OAuth isn't available
+- Using programmatic workflows that can't do interactive login
+- Wanting to bypass ChatGPT subscription message limits
+
+### Install
+
+```bash
+# Option 1: npm (recommended)
+npm install -g @zed-industries/codex-acp
+
+# Option 2: npx (no install needed)
+# The bridge will run: npx @zed-industries/codex-acp
+
+# Option 3: Download pre-built binary from GitHub releases
+# https://github.com/zed-industries/codex-acp/releases
+```
+
+### Configure
+
+If installed globally:
+
+```json
+{
+  "agentCommand": ["codex-acp"]
+}
+```
+
+If using npx:
+
+```json
+{
+  "agentCommand": ["npx", "@zed-industries/codex-acp"]
+}
+```
+
+### Environment Variables (optional)
+
+Only needed if you cannot use interactive ChatGPT sign-in:
+
+| Variable | Description |
+|----------|-------------|
+| `CODEX_API_KEY` | Dedicated Codex API key |
+| `OPENAI_API_KEY` | Standard OpenAI Platform API key |
+
+### ACP Features Supported
+
+- Context @-mentions and images
+- Tool calls with permission requests
+- Edit review
+- TODO lists
+- Following (real-time streaming)
+- Client MCP servers
+- Slash commands: `/review`, `/review-branch`, `/review-commit`, `/init`, `/compact`, custom prompts
+
+### Verify It Works
+
+```bash
+# If using API key:
+export CODEX_API_KEY="..."
+# Or just start — you'll get a browser sign-in prompt on first use
+
+pnpm dev
+
+# Open http://localhost:5173
+# Create a task, send a message
+# You should see Codex's streaming response in the chat panel
+```
+
+---
+
+## OpenCode
+
+[OpenCode](https://opencode.ai) is an open-source AI coding agent by SST with native ACP support built-in (no adapter needed).
+
+### Prerequisites
+
+One of the following authentication methods:
+
+1. **OpenCode Zen** (recommended for new users) — a pay-as-you-go AI gateway with a single API key that gives access to all curated models (GPT, Claude, Gemini, Qwen, and more). Sign up at [opencode.ai/auth](https://opencode.ai/auth), add billing details, and get your key. Includes free models during beta.
+2. **Provider API key** — bring your own key for any supported provider (Anthropic, OpenAI, Google, etc.)
+
+### Install
+
+```bash
+# Option 1: Quick install script
+curl -fsSL https://opencode.ai/install | bash
+
+# Option 2: npm
+npm install -g opencode-ai@latest
+
+# Option 3: Homebrew (macOS/Linux)
+brew install anomalyco/tap/opencode
+
+# Option 4: Windows (Scoop)
+scoop install opencode
+```
+
+### Configure
+
+```json
+{
+  "agentCommand": ["opencode", "acp"]
+}
+```
+
+### Authentication Setup
+
+Run `/connect` in OpenCode's TUI to configure your provider:
+
+- Select "opencode" for Zen, or choose another provider
+- For Zen: sign in at [opencode.ai/auth](https://opencode.ai/auth), copy your API key
+- For other providers: paste your provider's API key
+
+### Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `OPENCODE_API_KEY` | OpenCode Zen API key (access to all curated models) |
+| `ANTHROPIC_API_KEY` | If using Claude directly |
+| `OPENAI_API_KEY` | If using OpenAI directly |
+
+OpenCode reads its own config file for LLM provider settings. See [opencode.ai/docs](https://opencode.ai/docs) for provider configuration.
+
+### ACP Features Supported
+
+- Built-in tools (file operations, terminal commands)
+- Custom tools and slash commands
+- MCP servers from OpenCode config
+- Project-specific rules from `AGENTS.md`
+- Custom formatters and linters
+- Agents: `build` (full-access, default) and `plan` (read-only analysis)
+- Permissions system
+- Subagent support (`@general` for complex searches)
+
+### Agents (Modes)
+
+OpenCode ships with two built-in agents switchable via ACP:
+
+| Agent | Description |
+|-------|-------------|
+| `build` | Default, full-access agent for development work |
+| `plan` | Read-only agent for analysis and code exploration |
+
+### Limitations
+
+Some built-in slash commands like `/undo` and `/redo` are currently unsupported over ACP.
+
+### Verify It Works
+
+```bash
+pnpm dev
+
+# Open http://localhost:5173
+# Create a task, send a message
+# You should see OpenCode's streaming response
+# Try switching to "plan" mode if the bridge exposes it
+```
+
+---
+
 ## Other Agents
 
 Any ACP-compatible agent works. Here are more examples:
 
 | Agent | Install | Command |
 |-------|---------|---------|
-| Codex CLI | `npm i -g @openai/codex` | `["codex", "--acp"]` |
 | Gemini CLI | [gemini.google.com/cli](https://gemini.google.com/cli) | `["gemini", "cli", "acp"]` |
 | Cursor | Built into Cursor IDE | `["cursor", "--acp"]` |
-| OpenCode | `go install github.com/sst/opencode@latest` | `["opencode", "acp"]` |
 | Cline | [cline.bot](https://cline.bot) | `["cline", "--acp"]` |
-| GitHub Copilot | Part of GitHub CLI | `["github-copilot-cli", "--acp"]` |
+| GitHub Copilot | Part of GitHub CLI (public preview) | `["github-copilot-cli", "--acp"]` |
 | Goose | [github.com/block/goose](https://github.com/block/goose) | `["goose", "--acp"]` |
+| Junie | JetBrains AI agent | `["junie", "--acp"]` |
+| Qwen Code | [github.com/QwenLM/qwen-code](https://github.com/QwenLM/qwen-code) | `["qwen-code", "acp"]` |
 
 See the full list of 33+ ACP agents at [agentclientprotocol.com/get-started/agents](https://agentclientprotocol.com/get-started/agents).

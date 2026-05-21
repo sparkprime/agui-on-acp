@@ -19,7 +19,7 @@ cd ../..
 PYTHONPATH=. uvicorn backend.main:app --port 8000 &
 
 # 2. Install and run this demo
-cd examples/httpagent-demo
+cd example-frontends/httpagent-demo
 pnpm install
 pnpm dev
 # Open http://localhost:3002
