@@ -33,11 +33,13 @@
 
 There are now **33+ coding agents** that support the [Agent Client Protocol (ACP)](https://agentclientprotocol.com): Kiro, Claude Code, Codex CLI, Cursor, Gemini CLI, GitHub Copilot, OpenCode, Cline, and many more. They all speak JSON-RPC 2.0 over stdio. You can use them in terminals. You can use them in editors.
 
-But what if you want a **custom web workspace**? A task board for your team? A domain-specific IDE? A deployment dashboard powered by an AI agent? You'd need to implement the protocol bridge yourself: parsing JSON-RPC streams, managing subprocesses, translating events into something a web frontend can render.
+But teams keep needing **purpose-built web interfaces** on top of these agents — a micro-app creation platform where non-engineers iterate on device experiences, a report generation UI where analysts interact with agents without learning CLI commands, deployment dashboards with team-visible approval flows, domain-specific editors powered by an agent underneath.
+
+Today, building any of these means implementing the protocol bridge yourself: parsing JSON-RPC streams, managing subprocesses, translating events into something a web frontend can render.
 
 ## The Solution
 
-This project is a **protocol bridge** that sits between any ACP agent and any web frontend:
+This project is a **reference bridge** that sits between any ACP agent and any web frontend:
 
 ```mermaid
 graph TB
@@ -66,15 +68,13 @@ Clone this repo, select your agent, and you have a working web UI with streaming
 
 ## Use Cases
 
-This pattern works anywhere you want a purpose-built web interface on top of a coding agent:
+Same agent underneath. Different frontend for each audience:
 
-- **Micro-app creation platforms** — let teams generate and iterate on apps through a web workspace instead of the terminal
-- **Automated report generation** — give non-technical teams a UI to interact with agents that produce data summaries, analysis, or documents
-- **Deployment dashboards** — surface agent-driven infrastructure changes with approval flows in a team-visible interface
-- **Domain-specific IDEs** — build focused editing environments (e.g., config editors, pipeline builders) powered by an agent underneath
-- **Internal tooling for non-engineering teams** — any workflow where the agent does the heavy lifting but the user shouldn't need to know CLI commands
-
-Same agent underneath. Different frontend for each audience.
+- **Micro-app creation platforms** — non-engineers iterating on apps through a web workspace
+- **Report generation** — analysts interacting with agents without CLI commands
+- **Deployment dashboards** — team-visible approval flows for infrastructure changes
+- **Domain-specific IDEs** — focused editors (config, pipelines) powered by an agent
+- **Any internal tooling** — the agent does the heavy lifting, users get a tailored UI
 
 ## Why AG-UI?
 
