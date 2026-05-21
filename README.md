@@ -1,12 +1,16 @@
-# ACP → AG-UI
+<h1 align="center">ACP → AG-UI</h1>
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
-[![ACP SDK](https://img.shields.io/badge/agent--client--protocol-0.10+-blue.svg)](https://pypi.org/project/agent-client-protocol/)
-[![AG-UI](https://img.shields.io/badge/AG--UI-protocol-green.svg)](https://docs.ag-ui.com)
-[![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-teal.svg)](https://fastapi.tiangolo.com)
+<p align="center">
+  A reference bridge that gives any ACP coding agent (Kiro, Claude, Codex, etc.) a web UI via the AG-UI protocol.
+</p>
 
-> A reference bridge that gives any ACP coding agent a web UI.
+<p align="center">
+  <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"/></a>
+  <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.11+-blue.svg" alt="Python 3.11+"/></a>
+  <a href="https://pypi.org/project/agent-client-protocol/"><img src="https://img.shields.io/badge/agent--client--protocol-0.10+-blue.svg" alt="ACP SDK"/></a>
+  <a href="https://docs.ag-ui.com"><img src="https://img.shields.io/badge/AG--UI-protocol-green.svg" alt="AG-UI"/></a>
+  <a href="https://fastapi.tiangolo.com"><img src="https://img.shields.io/badge/FastAPI-0.115+-teal.svg" alt="FastAPI"/></a>
+</p>
 
 <p align="center">
   <img src="docs/assets/reference-ui-over-kiro.gif" alt="Reference UI powered by Kiro CLI" width="49%"/>
