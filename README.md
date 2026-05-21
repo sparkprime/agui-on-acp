@@ -9,21 +9,15 @@
 > A reference bridge that gives any ACP coding agent a web UI.
 
 <p align="center">
-  <img src="docs/assets/reference-ui-over-kiro.gif" alt="Reference UI powered by Kiro CLI" width="700"/>
+  <img src="docs/assets/reference-ui-over-kiro.gif" alt="Reference UI powered by Kiro CLI" width="49%"/>
+  <img src="docs/assets/reference-ui-over-claudecode.gif" alt="Reference UI powered by Claude Code" width="49%"/>
 </p>
 <p align="center">
-  <em>Kiro CLI powering the reference workspace UI — streaming chat, tool calls, and approvals.</em>
-</p>
-
-<p align="center">
-  <img src="docs/assets/reference-ui-over-claudecode.gif" alt="Reference UI powered by Claude Code" width="700"/>
-</p>
-<p align="center">
-  <em>Same UI, same bridge — just swap the agent to Claude Code. One config line.</em>
+  <em>Left: Kiro CLI powering the workspace. Right: same UI with Claude Code — just swap the agent.</em>
 </p>
 
 <p align="center">
-  <img src="docs/assets/ui-toggle.gif" alt="Agent toggle on project selector" width="700"/>
+  <img src="docs/assets/ui-toggle.gif" alt="Agent toggle on project selector" width="500"/>
 </p>
 <p align="center">
   <em>Select your agent from the frontend. No restart needed — each session spawns the chosen binary.</em>
@@ -64,7 +58,19 @@ graph TB
     style frontends fill:#1a4731,stroke:#6ee7b7,color:#fff
 ```
 
-Clone this repo, change one line in `bridge.config.json` to point at your agent, and you have a working web UI with streaming chat, tool visualization, and human-in-the-loop approvals.
+Clone this repo, select your agent, and you have a working web UI with streaming chat, tool visualization, and human-in-the-loop approvals.
+
+## Use Cases
+
+This pattern works anywhere you want a purpose-built web interface on top of a coding agent:
+
+- **Micro-app creation platforms** — let teams generate and iterate on apps through a web workspace instead of the terminal
+- **Automated report generation** — give non-technical teams a UI to interact with agents that produce data summaries, analysis, or documents
+- **Deployment dashboards** — surface agent-driven infrastructure changes with approval flows in a team-visible interface
+- **Domain-specific IDEs** — build focused editing environments (e.g., config editors, pipeline builders) powered by an agent underneath
+- **Internal tooling for non-engineering teams** — any workflow where the agent does the heavy lifting but the user shouldn't need to know CLI commands
+
+Same agent underneath. Different frontend for each audience.
 
 ## Why AG-UI?
 
@@ -177,41 +183,6 @@ graph TB
 
 ## Protocol Translation
 
-The core contribution: how ACP maps to AG-UI.
-
-```mermaid
-graph TB
-    subgraph acp["ACP Notifications (input)"]
-        direction TB
-        N1["agent_message_chunk"]
-        N2["tool_call"]
-        N3["tool_call_update"]
-        N4["turn_end"]
-        N5["request_permission"]
-        N6["_vendor.dev/*"]
-    end
-
-    N1 --> E1
-    N2 --> E2
-    N3 --> E3
-    N4 --> E4
-    N5 --> E5
-    N6 --> E6
-
-    subgraph agui["AG-UI Events (output)"]
-        direction TB
-        E1["TEXT_MESSAGE_START + CONTENT"]
-        E2["TOOL_CALL_START + ARGS"]
-        E3["TOOL_CALL_ARGS or TOOL_CALL_END"]
-        E4["TEXT_MESSAGE_END + RUN_FINISHED"]
-        E5["STATE_UPDATE (approval)"]
-        E6["CUSTOM (agent:* namespace)"]
-    end
-
-    style acp fill:#1e3a5f,stroke:#60a5fa,color:#fff
-    style agui fill:#1a4731,stroke:#6ee7b7,color:#fff
-```
-
 | ACP Event | AG-UI Event(s) | Notes |
 |-----------|---------------|-------|
 | `agent_message_chunk` | `TEXT_MESSAGE_START` + `TEXT_MESSAGE_CONTENT` | Opens message on first chunk |
@@ -220,6 +191,8 @@ graph TB
 | `turn_end` | `TEXT_MESSAGE_END` + `TOOL_CALL_END`(s) + `RUN_FINISHED` | Closes everything |
 | `session/request_permission` | `STATE_UPDATE` (approval pending) | Uses asyncio.Future for async bridge |
 | Vendor extensions (`_*.dev/*`) | `CUSTOM` events | Normalized to `agent:*` namespace |
+
+See [`docs/protocol-translation.md`](docs/protocol-translation.md) for the full mapping with diagrams.
 
 ## The Tricky Parts
 
@@ -232,24 +205,6 @@ ACP and AG-UI do not map one-to-one. These required a normalization layer:
 **Vendor Extensions:** ACP agents send custom notifications (e.g., `_kiro.dev/mcp_servers_ready`). The SDK routes these to `ext_notification()`. We normalize them into `CUSTOM` AG-UI events with a clean `agent:*` namespace.
 
 ## Three Ways to Build Your Frontend
-
-```mermaid
-graph TB
-    bridge["POST /ag-ui endpoint"]
-
-    bridge --> path1
-    bridge --> path2
-    bridge --> path3
-
-    path1["Custom Workspace\nDirect REST + SSE, ~2000 lines, full control"]
-    path2["CopilotKit\nCopilotChat component, ~20 lines, ship fast"]
-    path3["AG-UI HttpAgent\n@ag-ui/client, ~50 lines, build anything"]
-
-    style bridge fill:#3b1f6e,stroke:#a78bfa,color:#fff
-    style path1 fill:#1e3a5f,stroke:#60a5fa,color:#fff
-    style path2 fill:#1a4731,stroke:#6ee7b7,color:#fff
-    style path3 fill:#4a2c17,stroke:#fbbf24,color:#fff
-```
 
 | Approach | How it consumes AG-UI | Lines of Code | Use When |
 |----------|----------------------|--------------|----------|
@@ -266,7 +221,8 @@ graph TB
 5. **Or use the standard endpoint**: `POST /ag-ui` (what CopilotKit and AG-UI HttpAgent use)
 6. **Handle approvals**: `POST /v2/tasks/{id}/approval` resolves pending tool permissions
 
-## Project Structure
+<details>
+<summary>Project Structure</summary>
 
 ```
 ├── backend/                    # Python FastAPI (the bridge)
@@ -286,36 +242,12 @@ graph TB
 │   ├── architecture.md         # Detailed system design
 │   ├── integration-contract.md # REST + SSE API spec
 │   ├── protocol-translation.md # Full ACP ↔ AG-UI mapping
-│   ├── why-agui.md            # AG-UI ecosystem benefits
-│   ├── demo-walkthrough.md    # End-to-end test results
-│   ├── ROADMAP.md             # Planned features
-│   └── talk-qanda.md          # Anticipated Q&A
+│   └── why-agui.md            # AG-UI ecosystem benefits
 ├── bridge.config.json          # Your agent configuration
 └── package.json                # Workspace orchestrator
 ```
 
-## For UI Builders
-
-The backend exposes a **standard AG-UI endpoint** at `POST /ag-ui`. Any AG-UI client can connect:
-
-```typescript
-// CopilotKit
-<CopilotKit runtimeUrl="http://localhost:8000/ag-ui">
-  <CopilotChat />
-</CopilotKit>
-
-// AG-UI HttpAgent (@ag-ui/client)
-const agent = new HttpAgent({ url: "http://localhost:8000/ag-ui" });
-agent.run({ messages, threadId }).subscribe(event => ...);
-```
-
-Or use the granular REST API for more control:
-- `POST /v2/tasks`: create session (spawn agent)
-- `POST /v2/tasks/{id}/run`: start a run
-- `GET /v2/tasks/{id}/events?runId=...`: SSE stream
-- `POST /v2/tasks/{id}/approval`: resolve tool approval
-
-See [`docs/integration-contract.md`](docs/integration-contract.md) for the full API spec.
+</details>
 
 ## Tested With Real Agents
 
@@ -328,9 +260,8 @@ See [`docs/integration-contract.md`](docs/integration-contract.md) for the full 
 
 Kiro and Claude Agent tested end-to-end with zero code changes between them. Codex and OpenCode are ACP-compatible and supported by this bridge — community testing welcome. Just swap `agentCommand`. See [`docs/demo-walkthrough.md`](docs/demo-walkthrough.md) for full test results and [`example-frontends/agents.md`](example-frontends/agents.md) for setup guides.
 
-## Supported Agents (ACP Ecosystem)
-
-ACP is supported by 33+ agents. Any of them can be used with this bridge:
+<details>
+<summary>Full ACP Ecosystem (33+ agents)</summary>
 
 | Agent | ACP Type | Notes |
 |-------|----------|-------|
@@ -348,13 +279,11 @@ Also supported: Augment Code, AutoDev, Blackbox AI, Docker cagent, fast-agent, F
 
 Full list: [agentclientprotocol.com/get-started/agents](https://agentclientprotocol.com/get-started/agents)
 
+</details>
+
 ## The Talk
 
-This repository accompanies the talk:
-
-**"I Built an ACP → AG-UI Adapter So Coding Agents Can Escape the Terminal"**
-
-Presented at [Seattle AI Tinkerers](https://seattle.aitinkerers.org/), May 2025.
+This repository accompanies a live demo presented at [Seattle AI Tinkerers](https://seattle.aitinkerers.org/), May 2025.
 
 ## Contributing
 
