@@ -93,6 +93,8 @@ By emitting AG-UI events, your frontend becomes portable across the entire agent
 
 ## Quick Start
 
+Works on macOS, Linux, and Windows (PowerShell or cmd). Prereqs: Python 3.11+, Node.js 18+, pnpm.
+
 ```bash
 git clone https://github.com/namanrajpal/acp-to-agui.git
 cd acp-to-agui
@@ -101,6 +103,24 @@ pnpm dev
 ```
 
 Open **http://localhost:3000**. Select your agent (Kiro, Claude, Codex, or OpenCode), enter a project path, and start chatting. The bridge spawns the agent subprocess, translates its output to AG-UI events, and streams them to the React frontend.
+
+Prefer side-by-side logs? Run each half in its own terminal:
+
+```bash
+pnpm dev:backend   # FastAPI on :8000
+pnpm dev:ui        # Vite on :3000
+```
+
+Both commands run identically on every platform. The launcher resolves `PYTHONPATH` to the repo root, so you can run them from any working directory.
+
+<details>
+<summary>Platform notes</summary>
+
+- **macOS / Linux**: `pnpm dev:backend` runs uvicorn with `--reload`, so Python edits hot-reload automatically.
+- **Windows**: `--reload` is skipped automatically because uvicorn's reload supervisor installs an asyncio event loop policy that can't spawn subprocesses (you'd hit `NotImplementedError` from `_make_subprocess_transport` the moment you tried to start a session). Restart `pnpm dev:backend` manually after backend edits. The Vite frontend hot-reloads everywhere.
+- **Windows + non-`.exe` agents** (`npx`, `claude-agent-acp`, etc.): the bridge auto-wraps `.cmd`/`.bat` shims with `cmd.exe /c` so you can use the same `agentCommand` config as on Unix. Native `.exe` agents like `kiro-cli` pass through unchanged.
+
+</details>
 
 ## Configuration
 
@@ -290,7 +310,7 @@ Full list: [agentclientprotocol.com/get-started/agents](https://agentclientproto
 
 ## The Talk
 
-This repository accompanies a live demo presented at [Seattle AI Tinkerers](https://seattle.aitinkerers.org/), May 2025.
+This repository accompanies a live demo presented at [Seattle AI Tinkerers](https://seattle.aitinkerers.org/), May 2026.
 
 ## Contributing
 

@@ -418,3 +418,25 @@ Any ACP-compatible agent works. Here are more examples:
 | Qwen Code | [github.com/QwenLM/qwen-code](https://github.com/QwenLM/qwen-code) | `["qwen-code", "acp"]` |
 
 See the full list of 33+ ACP agents at [agentclientprotocol.com/get-started/agents](https://agentclientprotocol.com/get-started/agents).
+
+---
+
+## Troubleshooting
+
+### `FileNotFoundError: [WinError 2] The system cannot find the file specified` (Windows)
+
+The agent binary is not on `PATH`. `asyncio.create_subprocess_exec` calls Windows `CreateProcess`, which only runs `.exe` files. Globally-installed npm shims ship as `.cmd` / `.ps1` files; the bridge auto-wraps those with `cmd.exe /c` in `backend/agent/runner.py:_resolve_windows_command` — **but only if `shutil.which` can resolve the binary**. If the binary isn't installed at all, you'll see WinError 2 instead.
+
+**Fix one of three ways:**
+
+1. Install the agent globally via npm:
+   ```
+   npm install -g @agentclientprotocol/claude-agent-acp
+   ```
+2. Use the `npx` form in your `agentCommand` (the dropdown in `ProjectSelector.tsx` already does this for Claude and Codex):
+   ```json
+   { "agentCommand": ["npx", "-y", "@agentclientprotocol/claude-agent-acp"] }
+   ```
+3. Run `pnpm install` at the repo root — npm-installable agents are declared as `devDependencies` so they're cached locally and `npx -y` resolves instantly.
+
+For native binaries (Kiro, OpenCode, Gemini, etc.) you must install them separately — they're not on npm.

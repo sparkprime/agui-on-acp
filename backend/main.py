@@ -1,7 +1,15 @@
 """FastAPI main application for the ACP → AG-UI Bridge."""
 
+import asyncio
 import logging
+import sys
 from contextlib import asynccontextmanager
+
+# Windows: force the Proactor event loop. uvicorn's --reload supervisor sets
+# WindowsSelectorEventLoopPolicy, which doesn't implement subprocess_exec and
+# breaks spawning ACP agents (NotImplementedError from _make_subprocess_transport).
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
 from dotenv import load_dotenv
 load_dotenv()

@@ -10,6 +10,7 @@ import os
 import signal
 import shutil
 import subprocess
+import sys
 from typing import Any
 
 import acp
@@ -51,6 +52,36 @@ def _kill_process_tree(root_pid: int) -> None:
     _kill_recursive(root_pid)
 
 
+def _resolve_windows_command(command: list[str]) -> list[str]:
+    """On Windows, wrap shim-only executables (.cmd/.bat/.ps1) with cmd.exe /c.
+
+    asyncio.create_subprocess_exec calls Windows CreateProcess, which only
+    runs .exe files. Tools like npx, claude-agent-acp, opencode, and many
+    globally-installed npm bins ship as .cmd shims and fail with
+    FileNotFoundError unless invoked through a shell.
+
+    Returns the command unchanged on non-Windows, or when the first arg
+    already resolves to a .exe (or to nothing — we let the original error
+    surface instead of hiding a typo behind cmd.exe).
+    """
+    if sys.platform != "win32" or not command:
+        return command
+
+    first = command[0]
+    # Already shell-wrapped — caller knows what they're doing.
+    if first.lower() in ("cmd", "cmd.exe", "powershell", "powershell.exe", "pwsh", "pwsh.exe"):
+        return command
+
+    resolved = shutil.which(first)
+    if resolved is None:
+        return command
+
+    if resolved.lower().endswith(".exe"):
+        return command
+
+    return ["cmd.exe", "/c", *command]
+
+
 class AgentRunner:
     """Manages a single ACP agent subprocess via the official SDK.
 
@@ -84,8 +115,12 @@ class AgentRunner:
         if env:
             proc_env.update(env)
 
-        binary = self._command[0]
-        args = self._command[1:]
+        effective_command = _resolve_windows_command(self._command)
+        if effective_command is not self._command and effective_command != self._command:
+            self._log.info("wrapped non-.exe agent shim with cmd.exe: %s", " ".join(effective_command))
+
+        binary = effective_command[0]
+        args = effective_command[1:]
 
         self._context_manager = acp.spawn_agent_process(
             client, binary, *args,

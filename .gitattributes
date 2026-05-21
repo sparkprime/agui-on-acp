@@ -1,0 +1,28 @@
+# Normalize line endings — store LF in the repo, check out the same on every OS.
+# Prevents Windows tools from making every file look modified after a re-encode.
+
+* text=auto eol=lf
+
+# Treat known binaries as binary regardless of detection.
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.webp binary
+*.ico  binary
+*.pdf  binary
+*.zip  binary
+*.gz   binary
+*.tar  binary
+*.tgz  binary
+*.woff binary
+*.woff2 binary
+*.ttf  binary
+*.otf  binary
+
+# Lockfiles often LF-only — keep them that way explicitly.
+pnpm-lock.yaml text eol=lf
+package-lock.json text eol=lf
+
+# Shell scripts must stay LF.
+*.sh text eol=lf

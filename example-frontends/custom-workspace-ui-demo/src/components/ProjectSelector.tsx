@@ -41,8 +41,8 @@ const saveRecentProject = (path: string): void => {
 
 const AGENTS = [
   { id: 'kiro', name: 'Kiro', command: 'kiro-cli acp' },
-  { id: 'claude', name: 'Claude', command: 'claude-agent-acp' },
-  { id: 'codex', name: 'Codex', command: 'codex-acp' },
+  { id: 'claude', name: 'Claude', command: 'npx -y @agentclientprotocol/claude-agent-acp' },
+  { id: 'codex', name: 'Codex', command: 'npx -y @zed-industries/codex-acp' },
   { id: 'opencode', name: 'OpenCode', command: 'opencode acp' },
 ];
 

@@ -4,13 +4,15 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "install:backend": "cd backend && pip install -e .",
-    "dev:backend": "PYTHONPATH=. uvicorn backend.main:app --reload --port 8000 --log-level warning",
+    "install:backend": "pip install -e ./backend",
+    "dev:backend": "node scripts/dev-backend.mjs",
     "dev:ui": "cd example-frontends/custom-workspace-ui-demo && pnpm dev",
-    "dev": "concurrently \"pnpm dev:backend\" \"pnpm dev:ui\"",
-    "postinstall": "cd backend && pip install -e ."
+    "dev": "concurrently --names backend,ui --prefix-colors magenta,green \"pnpm dev:backend\" \"pnpm dev:ui\"",
+    "postinstall": "pip install -e ./backend"
   },
   "devDependencies": {
+    "@agentclientprotocol/claude-agent-acp": "^0.36.1",
+    "@zed-industries/codex-acp": "*",
     "concurrently": "^8.2.2"
   }
 }
