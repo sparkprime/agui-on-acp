@@ -6,21 +6,28 @@
 [![AG-UI](https://img.shields.io/badge/AG--UI-protocol-green.svg)](https://docs.ag-ui.com)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-teal.svg)](https://fastapi.tiangolo.com)
 
-> Coding agents live in terminals. This adapter gives them rich web UIs.
+> A reference bridge that gives any ACP coding agent a web UI.
 
 <p align="center">
-  <img src="docs/assets/httpagent-demo-chat.png" alt="AG-UI HttpAgent consuming ACP agent events" width="700"/>
+  <img src="docs/assets/reference-ui-over-kiro.gif" alt="Reference UI powered by Kiro CLI" width="700"/>
 </p>
 <p align="center">
-  <em>An ACP coding agent (kiro-cli) powering a web chat UI via AG-UI events. Zero custom protocol code.</em>
+  <em>Kiro CLI powering the reference workspace UI — streaming chat, tool calls, and approvals.</em>
 </p>
 
-<details>
-<summary>See the raw AG-UI events flowing over SSE</summary>
 <p align="center">
-  <img src="docs/assets/sse-events-terminal.png" alt="AG-UI SSE events" width="700"/>
+  <img src="docs/assets/reference-ui-over-claudecode.gif" alt="Reference UI powered by Claude Code" width="700"/>
 </p>
-</details>
+<p align="center">
+  <em>Same UI, same bridge — just swap the agent to Claude Code. One config line.</em>
+</p>
+
+<p align="center">
+  <img src="docs/assets/ui-toggle.gif" alt="Agent toggle on project selector" width="700"/>
+</p>
+<p align="center">
+  <em>Select your agent from the frontend. No restart needed — each session spawns the chosen binary.</em>
+</p>
 
 ---
 
