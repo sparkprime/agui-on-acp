@@ -84,6 +84,9 @@ class AcpToAguiBridge:
         # Working directory for file operations (set by session manager)
         self._cwd: str = ""
 
+        # Log collapsing for streaming chunks
+        self._content_chunk_count: int = 0
+
     # ── Run lifecycle ────────────────────────────────────────────────────────
 
     def start_run(self, run_id: str, queue: asyncio.Queue) -> None:
@@ -158,6 +161,10 @@ class AcpToAguiBridge:
             return
 
         # Handle typed SDK objects
+        update_type = type(update).__name__
+        if not isinstance(update, acp.schema.AgentMessageChunk):
+            self._log.info("recv %s", update_type)
+
         if isinstance(update, acp.schema.AgentMessageChunk):
             self._handle_agent_message_chunk_typed(update)
         elif isinstance(update, acp.schema.ToolCallStart):
@@ -252,8 +259,9 @@ class AcpToAguiBridge:
         future: asyncio.Future[acp.RequestPermissionResponse] = loop.create_future()
         self._permission_futures[tool_call_id] = future
 
-        # Await the future — this blocks until the REST endpoint resolves it
+        self._log.info("⏸ awaiting approval for %s (callId=%s)", tool_name, tool_call_id)
         response = await future
+        self._log.info("✓ approval resolved for %s → %s", tool_name, getattr(response, 'option_id', 'approved'))
         return response
 
     async def ext_notification(self, method: str, params: dict[str, Any]) -> None:
@@ -657,5 +665,14 @@ class AcpToAguiBridge:
             return
         try:
             self._queue.put_nowait(event)
+            # Collapse streaming content logs — only log transitions
+            event_name = event.type.value
+            if event_name == "TEXT_MESSAGE_CONTENT":
+                self._content_chunk_count += 1
+            else:
+                if self._content_chunk_count > 0:
+                    self._log.info("emit TEXT_MESSAGE_CONTENT ×%d", self._content_chunk_count)
+                    self._content_chunk_count = 0
+                self._log.info("emit %s", event_name)
         except asyncio.QueueFull:
             self._log.error("Event queue full, dropping: %s", event.type)

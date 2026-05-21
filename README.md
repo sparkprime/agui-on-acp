@@ -77,15 +77,24 @@ By emitting AG-UI events, your frontend becomes portable across the entire agent
 git clone https://github.com/namanrajpal/acp-to-agui.git
 cd acp-to-agui
 pnpm install
-# Edit bridge.config.json → set "agentCommand" to your agent
 pnpm dev
 ```
 
-Open **http://localhost:5173**. The bridge spawns your agent, translates its output to AG-UI events, and streams them to the React frontend.
+Open **http://localhost:3000**. Select your agent (Kiro, Claude, Codex, or OpenCode), enter a project path, and start chatting. The bridge spawns the agent subprocess, translates its output to AG-UI events, and streams them to the React frontend.
 
 ## Configuration
 
-All configuration lives in `bridge.config.json`:
+There are two ways to select an agent:
+
+### 1. Frontend selector (per-session)
+
+The workspace UI has an agent toggle on the project selector page. Pick Kiro, Claude, Codex, or OpenCode — the selected agent command is sent with the session creation request and the backend spawns that specific binary.
+
+This means you can switch agents between sessions without restarting anything.
+
+### 2. Default via `bridge.config.json`
+
+The config file sets the fallback agent when no command is specified per-session:
 
 ```json
 {
@@ -93,11 +102,11 @@ All configuration lives in `bridge.config.json`:
   "displayTitle": "ACP → AG-UI Bridge",
   "agentCommand": ["kiro-cli", "acp"],
   "backendPort": 8000,
-  "corsOrigins": ["http://localhost:5173"]
+  "corsOrigins": ["http://localhost:3000", "http://localhost:3001"]
 }
 ```
 
-Just change `agentCommand` to point at your agent:
+### Supported agents
 
 | Agent | Command | Auth |
 |-------|---------|------|
@@ -110,6 +119,16 @@ Just change `agentCommand` to point at your agent:
 | GitHub Copilot | `["github-copilot-cli", "--acp"]` | GitHub auth |
 | Goose | `["goose", "--acp"]` | Provider API key |
 | Any ACP binary | `["your-agent", "acp"]` | Varies |
+
+### API-level control
+
+You can also pass `agentCommand` directly when creating a session via REST:
+
+```bash
+curl -X POST http://localhost:8000/v2/tasks \
+  -H "Content-Type: application/json" \
+  -d '{"cwd": "/your/project", "agentCommand": ["claude-agent-acp"]}'
+```
 
 ## Architecture
 
@@ -233,7 +252,7 @@ graph TB
 
 ## How It Works
 
-1. **Configure an agent** in `bridge.config.json`
+1. **Select an agent** — via the UI toggle, the `agentCommand` API field, or the `bridge.config.json` default
 2. **Create a session**: `POST /v2/tasks` spawns the agent subprocess, initializes ACP
 3. **Start a run**: `POST /v2/tasks/{id}/run` sends your prompt via JSON-RPC
 4. **Stream events**: `GET /v2/tasks/{id}/events?runId=...` returns AG-UI SSE stream

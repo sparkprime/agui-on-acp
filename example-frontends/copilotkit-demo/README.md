@@ -1,6 +1,6 @@
 # CopilotKit + ACP Agent Demo
 
-> **The "blow them away" demo:** A full-featured AI chat UI on top of your custom ACP agent in ~30 lines of React.
+> A full-featured AI chat UI on top of your custom ACP agent in ~30 lines of React.
 
 ## What This Shows
 

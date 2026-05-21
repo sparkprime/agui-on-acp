@@ -308,14 +308,10 @@ interface CommandSuggestion {
 
 // Motivational texts for empty session state carousel
 const motivationalTexts = [
-  "Let's build something beautiful together",
-  "How can I help you today?",
-  "Let's build something amazing",
-  "What will you create today?",
-  "Turn your ideas into reality",
-  "Let's ship something great",
-  "Ready to bring your vision to life?",
-  "What's on your mind today?",
+  "Your agent workspace starts here",
+  "Connect any ACP agent, build any UI",
+  "A reference implementation — make it yours",
+  "Swap agents with one config line",
 ];
 
 const ChatPanel: React.FC<ChatPanelProps> = ({
@@ -881,8 +877,8 @@ const ChatPanel: React.FC<ChatPanelProps> = ({
       case 'claude': return { name: 'Claude Code', icon: Sun, color: 'text-orange-500' };
       case 'gemini': return { name: 'Gemini CLI', icon: Sparkles, color: 'text-white' };
       case 'codex': return { name: 'Codex CLI', icon: TerminalIcon, color: 'text-white' };
-      case 'agent': return { name: 'Agent', icon: Bot, color: 'text-orange-500' };
-      default: return { name: 'Agent', icon: Bot, color: 'text-gray-400' };
+      case 'agent': return { name: 'Your Agent', icon: Bot, color: 'text-orange-500' };
+      default: return { name: 'Your Agent', icon: Bot, color: 'text-gray-400' };
     }
   };
 

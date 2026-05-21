@@ -53,6 +53,7 @@ class SessionManager:
         mode: str | None = None,
         model: str | None = None,
         mcp_servers: dict[str, Any] | None = None,
+        agent_command: list[str] | None = None,
     ) -> ActiveSession:
         # Create the bridge (satisfies acp.Client Protocol) before spawning
         policy = ToolPolicyEngine(workspace_cwd=cwd)
@@ -60,7 +61,9 @@ class SessionManager:
         bridge._cwd = cwd
 
         # Spawn the agent using the SDK via our runner
-        runner = AgentRunner(task_id, command=self._agent_command)
+        command = agent_command or self._agent_command
+        logger.info("agent command: %s", " ".join(command))
+        runner = AgentRunner(task_id, command=command)
         conn = await runner.spawn(client=bridge)
 
         # Wrap connection in our protocol layer for logging
@@ -102,8 +105,8 @@ class SessionManager:
                     modes = [{"id": getattr(m, "id", ""), "name": getattr(m, "name", "")} for m in available]
                     current_mode_id = getattr(result_modes, "current_mode_id", None) or getattr(result_modes, "currentModeId", None)
 
-        # Set mode/model if requested
-        if mode and agent_session_id:
+        # Set mode/model if requested (skip generic "default" placeholder)
+        if mode and mode != "default" and agent_session_id:
             try:
                 await protocol.set_mode(agent_session_id, mode)
                 current_mode_id = mode
@@ -132,7 +135,7 @@ class SessionManager:
         await self._store.create(
             task_id=task_id, agent_session_id=agent_session_id, cwd=cwd, title=title
         )
-        logger.info("Session %s created (agent_session=%s, cwd=%s)", task_id, agent_session_id, cwd)
+        logger.info("session ready → %s (agent=%s)", task_id, " ".join(command))
         return active
 
     async def start_run(self, task_id: str, input_data: dict[str, Any], config: dict[str, Any] | None = None) -> str:

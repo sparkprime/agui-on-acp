@@ -96,7 +96,7 @@ class AgentRunner:
 
         self.conn = conn
         self.process = process
-        self._log.info("Spawned agent %s PID=%s via SDK", self._command, process.pid)
+        self._log.info("spawned %s (pid=%s)", " ".join(self._command), process.pid)
 
         return conn
 

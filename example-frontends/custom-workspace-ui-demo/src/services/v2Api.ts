@@ -14,6 +14,7 @@ export interface CreateTaskOptions {
   mode?: string;
   model?: string;
   mcpServers?: Record<string, unknown>;
+  agentCommand?: string[];
 }
 
 export interface CreateTaskResponse {

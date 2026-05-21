@@ -12,6 +12,7 @@ class CreateTaskRequest(BaseModel):
     mode: str | None = None
     model: str | None = None
     mcpServers: dict[str, Any] | None = None
+    agentCommand: list[str] | None = None
 
 
 class StartRunRequest(BaseModel):

@@ -19,8 +19,9 @@ import * as v2Api from './services/v2Api';
 import { useAgUiStream } from './hooks/useAgUiStream';
 
 const App: React.FC = () => {
-  // Project directory
+  // Project directory and agent command
   const [projectDir, setProjectDir] = useState<string | null>(null);
+  const [agentCommand, setAgentCommand] = useState<string[] | undefined>(undefined);
 
   // Session store
   const activeSessionId = useSessionStore((s) => s.activeSessionId);
@@ -174,6 +175,7 @@ const App: React.FC = () => {
         const resp = await v2Api.createTask(cwd, {
           resumeSessionId: resumeSessionId,
           mode: defaultAgentId || undefined,
+          agentCommand,
         });
         const session = createSessionFromTask(
           resp.taskId,
@@ -198,7 +200,7 @@ const App: React.FC = () => {
         setIsCreatingSession(false);
       }
     },
-    [addSession, setActive, loadSessionHistory, defaultAgentId],
+    [addSession, setActive, loadSessionHistory, defaultAgentId, agentCommand],
   );
 
   const handleDeleteTask = useCallback(
@@ -247,7 +249,7 @@ const App: React.FC = () => {
   // ── Render ─────────────────────────────────────────────────────────────
 
   if (!projectDir) {
-    return <ProjectSelector onProjectSelect={setProjectDir} />;
+    return <ProjectSelector onProjectSelect={(path, cmd) => { setProjectDir(path); setAgentCommand(cmd); }} />;
   }
 
   const chatSessions = sessionsList.map((s) => ({
@@ -324,6 +326,7 @@ const App: React.FC = () => {
               try {
                 const resp = await v2Api.createTask(projectDir, {
                 mode: defaultAgentId || undefined,
+                agentCommand,
               });
                 const session = createSessionFromTask(
                   resp.taskId,

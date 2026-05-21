@@ -79,6 +79,7 @@ async def create_task(body: CreateTaskRequest, request: Request):
             mode=body.mode,
             model=body.model,
             mcp_servers=body.mcpServers,
+            agent_command=body.agentCommand,
         )
         return CreateTaskResponse(
             taskId=active.task_id,

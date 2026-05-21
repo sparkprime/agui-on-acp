@@ -3,18 +3,14 @@ import { Bot } from 'lucide-react';
 
 // Motivational texts for animated carousel
 const motivationalTexts = [
-  "How can I help you code today?",
-  "Let's build something amazing",
-  "What will you create today?",
-  "Turn your ideas into reality",
-  "Let's ship something great",
-  "Ready to bring your vision to life?",
-  "What's on your mind today?",
-  "Let's write some beautiful code",
+  "Your agent workspace starts here",
+  "Connect any ACP agent, build any UI",
+  "A reference implementation — make it yours",
+  "Swap agents with one config line",
 ];
 
 interface ProjectSelectorProps {
-  onProjectSelect: (path: string) => void;
+  onProjectSelect: (path: string, agentCommand?: string[]) => void;
 }
 
 const RECENT_PROJECTS_KEY = 'acp-agui-recent-projects';
@@ -43,10 +39,18 @@ const saveRecentProject = (path: string): void => {
   }
 };
 
+const AGENTS = [
+  { id: 'kiro', name: 'Kiro', command: 'kiro-cli acp' },
+  { id: 'claude', name: 'Claude', command: 'claude-agent-acp' },
+  { id: 'codex', name: 'Codex', command: 'codex-acp' },
+  { id: 'opencode', name: 'OpenCode', command: 'opencode acp' },
+];
+
 const ProjectSelector: React.FC<ProjectSelectorProps> = ({ onProjectSelect }) => {
   const [projectPath, setProjectPath] = useState('');
   const [recentProjects, setRecentProjects] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [selectedAgent, setSelectedAgent] = useState('kiro');
 
   // Text carousel state
   const [textIndex, setTextIndex] = useState(0);
@@ -68,6 +72,11 @@ const ProjectSelector: React.FC<ProjectSelectorProps> = ({ onProjectSelect }) =>
     return () => clearInterval(interval);
   }, []);
 
+  const getSelectedCommand = (): string[] => {
+    const agent = AGENTS.find(a => a.id === selectedAgent);
+    return agent ? agent.command.split(' ') : ['kiro-cli', 'acp'];
+  };
+
   const handleSubmit = () => {
     const trimmedPath = projectPath.trim();
 
@@ -84,12 +93,12 @@ const ProjectSelector: React.FC<ProjectSelectorProps> = ({ onProjectSelect }) =>
 
     setError(null);
     saveRecentProject(trimmedPath);
-    onProjectSelect(trimmedPath);
+    onProjectSelect(trimmedPath, getSelectedCommand());
   };
 
   const handleRecentSelect = (path: string) => {
     saveRecentProject(path);
-    onProjectSelect(path);
+    onProjectSelect(path, getSelectedCommand());
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -133,6 +142,30 @@ const ProjectSelector: React.FC<ProjectSelectorProps> = ({ onProjectSelect }) =>
               <li>Or enter an existing project path to continue</li>
               <li>All CLI-generated files will be stored here</li>
             </ul>
+          </div>
+
+          {/* Agent Toggle */}
+          <div className="mb-5">
+            <p className="text-xs text-gray-500 mb-2 text-center">Select your ACP agent:</p>
+            <div className="flex rounded-lg border border-ide-border overflow-hidden">
+              {AGENTS.map((agent) => (
+                <button
+                  key={agent.id}
+                  onClick={() => setSelectedAgent(agent.id)}
+                  className={`flex-1 px-3 py-2 text-xs font-medium transition-colors ${
+                    selectedAgent === agent.id
+                      ? 'bg-orange-500/20 text-orange-400 border-b-2 border-orange-500'
+                      : 'text-gray-500 hover:text-gray-300 hover:bg-white/5'
+                  }`}
+                  title={agent.command}
+                >
+                  {agent.name}
+                </button>
+              ))}
+            </div>
+            <p className="text-[10px] text-gray-600 mt-1.5 text-center font-mono">
+              agentCommand: ["{AGENTS.find(a => a.id === selectedAgent)?.command}"]
+            </p>
           </div>
 
           {/* Path Input */}
@@ -195,7 +228,7 @@ const ProjectSelector: React.FC<ProjectSelectorProps> = ({ onProjectSelect }) =>
         {/* Footer */}
         <div className="mt-4 text-center">
           <p className="text-xs text-ide-textLight">
-            Powered by ACP Agent
+            Powered by ACP → AG-UI Bridge
           </p>
         </div>
       </div>

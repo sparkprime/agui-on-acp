@@ -13,10 +13,8 @@ from backend import __version__
 from backend.config import load_config
 from backend.types.api import HealthResponse
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
+from backend.logging_config import setup_logging
+setup_logging()
 logger = logging.getLogger(__name__)
 
 config = load_config()
@@ -25,7 +23,19 @@ config = load_config()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan context manager for startup/shutdown."""
-    logger.info(f"Starting {config.display_title} v{__version__}")
+    setup_logging()  # Re-apply after uvicorn's setup
+    logger.info(f"ACP → AG-UI Bridge v{__version__} (FastAPI)")
+    logger.info(f"Backend: http://localhost:{config.backend_port}")
+    logger.info("Endpoints:")
+    skip = {"/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc"}
+    for route in app.routes:
+        if hasattr(route, "methods") and hasattr(route, "path"):
+            if route.path in skip:
+                continue
+            methods = ", ".join(sorted(route.methods - {"HEAD", "OPTIONS"}))
+            if methods:
+                logger.info(f"  {methods:6s} {route.path}")
+    logger.info("---")
 
     app.state.config = config
 

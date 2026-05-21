@@ -40,7 +40,7 @@ const Sidebar: React.FC<SidebarProps> = ({ activeTool, onToolSelect, onRequestAg
     { id: 'codex', name: 'Codex CLI', icon: <Terminal size={24} />, color: 'text-purple-400' },
     {
       id: 'agent',
-      name: 'Agent',
+      name: 'Your Agent',
       icon: (
         <div className="w-6 h-6 rounded-[6px] bg-[#7c3aed] flex items-center justify-center shadow-sm">
            <Bot size={15} className="text-white" />

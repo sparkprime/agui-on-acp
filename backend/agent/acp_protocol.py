@@ -34,20 +34,24 @@ class AcpProtocol:
         self._conn = value
 
     async def initialize(self) -> Any:
-        self._log.info("Initializing ACP connection")
+        self._log.info("initializing connection...")
         result = await self.conn.initialize(
             protocol_version=acp.PROTOCOL_VERSION,
             client_info={"name": "acp-to-agui", "version": "0.1.0"},
         )
-        self._log.info("ACP initialized: %s", result)
+        agent_info = getattr(result, "agent_info", None)
+        name = getattr(agent_info, "title", None) or getattr(agent_info, "name", "unknown")
+        version = getattr(agent_info, "version", "?")
+        self._log.info("connected → %s v%s", name, version)
         return result
 
     async def new_session(
         self, cwd: str, mcp_servers: list | None = None
     ) -> Any:
-        self._log.info("Creating new session (cwd=%s)", cwd)
+        self._log.info("new session (cwd=%s)", cwd)
         result = await self.conn.new_session(cwd=cwd, mcp_servers=mcp_servers or [])
-        self._log.info("Session created: %s", getattr(result, "session_id", result))
+        session_id = getattr(result, "session_id", result)
+        self._log.info("session ready: %s", session_id)
         return result
 
     async def load_session(
