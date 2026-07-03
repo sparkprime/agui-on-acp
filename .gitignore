@@ -1,5 +1,4 @@
 # Dependencies
-node_modules/
 .venv/
 __pycache__/
 *.pyc
@@ -30,7 +29,5 @@ Thumbs.db
 # Logs
 *.log
 /tmp/
-
-# Lock files (include pnpm-lock but not others)
-package-lock.json
-yarn.lock
+bridge.config.json
+*~
