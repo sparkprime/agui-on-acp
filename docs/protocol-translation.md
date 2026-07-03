@@ -22,6 +22,7 @@ The bridge sits between them, maintaining state and emitting properly sequenced 
 | `session/update` → `turn_end` | — | `TEXT_MESSAGE_END` + all `TOOL_CALL_END` + `RUN_FINISHED` | Closes everything |
 | `session/update` → `current_mode_update` | — | `CUSTOM` (name: `agent:mode_update`) | Mode change |
 | `session/request_permission` | — | `RUN_FINISHED{outcome:interrupt}` | Parks prompt task at Future; resumed via new run |
+| `new_session` / `load_session` result | modes/models present | `STATE_SNAPSHOT` | Advertises available modes/models to the UI (emitted once after task creation) |
 | Vendor extensions (`_*.dev/*`) | — | `CUSTOM` events | Normalized namespace |
 
 ## State Machine
@@ -100,6 +101,11 @@ ACP uses a request/response pattern for tool approvals: `request_permission` is 
 
 One logical ACP turn maps to N+1 AG-UI runs when it hits N permission points. The correlation key `interrupt.id === toolCallId === ACP callId` is threaded through the entire flow.
 
+### Edge cases
+
+- **TTL / no resume.** A parked Future has a 300-second TTL. If no resume run arrives in that window (e.g. the user closed the tab), the Future is resolved with `cancelled` (ACP replies `reject`), the prompt task unwinds, and a terminal `RUN_FINISHED`/`RUN_ERROR` is emitted so the ACP subprocess and prompt task don't leak. `Interrupt.expiresAt` is set to the same deadline so the AG-UI client's own expiry guard (agent.ts:407-411) agrees with the server-side cleanup.
+- **Client disconnect mid-stream.** A genuine TCP disconnect (distinct from the clean `RUN_FINISHED`-driven close of an interrupt-suspend) is detected as a `CancelledError` in the SSE drain. The `on_cancel` callback wired into `event_stream` calls `manager.cancel_run(thread_id)`, which resolves any parked permission Futures with `cancelled` and then issues ACP `session/cancel`. The AG-UI schema requires the client to reply `cancelled` to every pending `request_permission` on `session/cancel` (schema.json:5080), so the prompt task unblocks and unwinds cleanly instead of hanging.
+
 ## Custom Events
 
 Vendor-specific ACP notifications (prefixed with `_*.dev/`) are translated to `CUSTOM` AG-UI events:
@@ -132,7 +138,9 @@ event: TEXT_MESSAGE_END
 data: {"type":"TEXT_MESSAGE_END","messageId":"msg_abc","timestamp":1707820803}
 
 event: RUN_FINISHED
-data: {"type":"RUN_FINISHED","runId":"run_xyz","taskId":"task_123","timestamp":1707820810}
+data: {"type":"RUN_FINISHED","runId":"run_xyz","taskId":"task_123","threadId":"task_123","timestamp":1707820810}
 ```
+
+`RUN_FINISHED` requires `threadId` (ag-ui events.ts:240). In this bridge the task id is reused as the thread id, so `taskId === threadId`. When the run ends at a permission point, the event also carries `outcome: { type: "interrupt", interrupts: [...] }`; `outcome` is omitted (`exclude_none=True`) for a normal finish, which the AG-UI schema accepts (it tolerates `"outcome": null`).
 
 A keepalive comment (`: keepalive\n\n`) is sent every 30 seconds if no events are pending.

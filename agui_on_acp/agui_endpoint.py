@@ -144,18 +144,6 @@ async def ag_ui_run(body: RunAgentInput, request: Request):
                 media_type="text/event-stream",
             )
 
-    # Emit a STATE_SNAPSHOT with available modes/models so the UI can
-    # populate selectors (design-v2: STATE_SNAPSHOT for modes/models).
-    snapshot: dict[str, Any] = {}
-    if active.modes:
-        snapshot["modes"] = active.modes
-    if active.models:
-        snapshot["models"] = active.models
-    if active.current_mode_id:
-        snapshot["currentModeId"] = active.current_mode_id
-    if snapshot:
-        active.bridge._emit(StateSnapshotEvent(snapshot=snapshot))
-
     # Extract the last user message
     user_message = ""
     if body.messages:
@@ -182,6 +170,20 @@ async def ag_ui_run(body: RunAgentInput, request: Request):
             _error_stream(str(exc)),
             media_type="text/event-stream",
         )
+
+    # Emit a STATE_SNAPSHOT with available modes/models AFTER start_run has
+    # attached the bridge to the run's queue — emitting it before
+    # start_run (the previous placement) dropped it because the bridge's
+    # _queue was still None.
+    snapshot: dict[str, Any] = {}
+    if active.modes:
+        snapshot["modes"] = active.modes
+    if active.models:
+        snapshot["models"] = active.models
+    if active.current_mode_id:
+        snapshot["currentModeId"] = active.current_mode_id
+    if snapshot:
+        active.bridge._emit(StateSnapshotEvent(snapshot=snapshot))
 
     queue = manager.get_event_queue(thread_id, actual_run_id)
     if queue is None:

@@ -253,7 +253,7 @@ class SessionManager:
         # request_permission unblocks and the prompt task unwinds instead of
         # hanging on a dead session.
         active.bridge.cancel_all_permissions()
-        active.protocol.cancel(active.agent_session_id)
+        await active.protocol.cancel(active.agent_session_id)
         await self._store.update(task_id, status="idle")
 
     async def set_mode(self, task_id: str, mode_id: str) -> Any:

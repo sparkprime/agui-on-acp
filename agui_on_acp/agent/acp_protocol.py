@@ -81,9 +81,16 @@ class AcpProtocol:
         result = await self.conn.prompt(prompt=content_blocks, session_id=session_id)
         return result
 
-    def cancel(self, session_id: str) -> None:
+    async def cancel(self, session_id: str) -> None:
+        """Send ``session/cancel`` to the agent.
+
+        This MUST be awaited: ``conn.cancel`` sends a JSON-RPC notification
+        over the transport. Calling it without ``await`` (the previous
+        behaviour) created the coroutine and discarded it, so the cancel
+        notification was never actually written and the agent kept running.
+        """
         self._log.info("Cancelling session %s", session_id)
-        self.conn.cancel(session_id=session_id)
+        await self.conn.cancel(session_id=session_id)
 
     async def set_mode(self, session_id: str, mode_id: str) -> Any:
         self._log.info("Setting mode %s for session %s", mode_id, session_id)
