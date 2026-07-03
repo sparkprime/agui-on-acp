@@ -1,8 +1,4 @@
 {
-  "projectName": "acp-to-agui",
-  "displayTitle": "ACP → AG-UI Bridge",
-  "description": "Give any ACP-compatible coding agent a rich web UI",
-  "agentCommand": ["kiro-cli", "acp"],
-  "backendPort": 8000,
-  "corsOrigins": ["http://localhost:5173", "http://localhost:3000", "http://localhost:3001", "http://localhost:3002"]
+  "agentCommand": ["opencode", "acp"],
+  "backendPort": 9001
 }

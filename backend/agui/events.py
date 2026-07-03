@@ -25,6 +25,7 @@ class AguiEventType(str, Enum):
     TOOL_CALL_START = "TOOL_CALL_START"
     TOOL_CALL_ARGS = "TOOL_CALL_ARGS"
     TOOL_CALL_END = "TOOL_CALL_END"
+    TOOL_CALL_RESULT = "TOOL_CALL_RESULT"
     STATE_UPDATE = "STATE_UPDATE"
     STATE_SNAPSHOT = "STATE_SNAPSHOT"
     CUSTOM = "CUSTOM"
@@ -49,6 +50,7 @@ class RunFinishedEvent(BaseAguiEvent):
     type: Literal[AguiEventType.RUN_FINISHED] = AguiEventType.RUN_FINISHED
     runId: str
     taskId: str
+    threadId: str | None = None
 
 
 class RunErrorEvent(BaseAguiEvent):
@@ -57,6 +59,7 @@ class RunErrorEvent(BaseAguiEvent):
     taskId: str
     message: str
     code: str | None = None
+    threadId: str | None = None
 
 
 class TextMessageStartEvent(BaseAguiEvent):
@@ -95,6 +98,27 @@ class ToolCallEndEvent(BaseAguiEvent):
     result: str | None = None
 
 
+class ToolCallResultEvent(BaseAguiEvent):
+    """AG-UI event carrying the actual output of a completed tool call.
+
+    Distinct from ``ToolCallEndEvent`` (which only signals end-of-args-streaming):
+    CopilotKit's runtime listens for ``TOOL_CALL_RESULT`` to synthesize a
+    ``ToolMessage`` (role="tool") in its message store, which is what flips a
+    tool-call renderer from ``inProgress`` to ``complete`` and surfaces the
+    ``result`` string. Without this event the renderer stays stuck at
+    ``inProgress`` with empty ``parameters`` forever, even though the agent has
+    long since finished executing the tool.
+
+    Schema: ``{ messageId, type, toolCallId, content, role?="tool" }``
+    """
+
+    type: Literal[AguiEventType.TOOL_CALL_RESULT] = AguiEventType.TOOL_CALL_RESULT
+    messageId: str
+    toolCallId: str
+    content: str
+    role: Literal["tool"] = "tool"
+
+
 class StateUpdateEvent(BaseAguiEvent):
     type: Literal[AguiEventType.STATE_UPDATE] = AguiEventType.STATE_UPDATE
     state: dict[str, Any]  # arbitrary JSON state
@@ -122,6 +146,7 @@ AguiEvent = (
     | ToolCallStartEvent
     | ToolCallArgsEvent
     | ToolCallEndEvent
+    | ToolCallResultEvent
     | StateUpdateEvent
     | StateSnapshotEvent
     | CustomEvent

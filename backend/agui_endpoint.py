@@ -29,10 +29,23 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+class ToolCall(BaseModel):
+    id: str
+    type: str = "function"
+    function: dict[str, Any] = Field(default_factory=dict)
+
+
 class AgUiMessage(BaseModel):
+    """AG-UI message. `content` is optional because assistant messages
+    that only carry tool calls (no text) legitimately omit it, per the
+    AG-UI spec's AssistantMessageSchema."""
+
     id: str | None = None
     role: str
-    content: str
+    content: str | None = None
+    name: str | None = None
+    toolCalls: list[ToolCall] | None = None
+    toolCallId: str | None = None
 
 
 class RunAgentInput(BaseModel):
@@ -86,7 +99,7 @@ async def ag_ui_run(body: RunAgentInput, request: Request):
     user_message = ""
     if body.messages:
         for msg in reversed(body.messages):
-            if msg.role == "user":
+            if msg.role == "user" and msg.content:
                 user_message = msg.content
                 break
 

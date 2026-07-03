@@ -248,7 +248,7 @@ async def _enqueue_demo_events(
     await queue.put(TextMessageEndEvent(messageId=msg_id))
     await asyncio.sleep(0.05)
 
-    await queue.put(RunFinishedEvent(runId=run_id, taskId=task_id))
+    await queue.put(RunFinishedEvent(runId=run_id, taskId=task_id, threadId=task_id))
 
 
 @router.get("/tasks/{task_id}/events")

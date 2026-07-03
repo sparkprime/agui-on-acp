@@ -4,11 +4,11 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "install:backend": "pip install -e ./backend",
+    "install:backend": "uv pip install -e ./backend",
     "dev:backend": "node scripts/dev-backend.mjs",
     "dev:ui": "cd example-frontends/custom-workspace-ui-demo && pnpm dev",
     "dev": "concurrently --names backend,ui --prefix-colors magenta,green \"pnpm dev:backend\" \"pnpm dev:ui\"",
-    "postinstall": "pip install -e ./backend"
+    "postinstall": "uv pip install -e ./backend"
   },
   "devDependencies": {
     "@agentclientprotocol/claude-agent-acp": "^0.36.1",

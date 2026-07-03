@@ -66,8 +66,13 @@ class SessionStore:
     async def create(self, task_id: str, agent_session_id: str, cwd: str, title: str = "New Task") -> TaskSummary:
         db = self._ensure_db()
         now = _now_iso()
+        # Use INSERT OR REPLACE: the caller only invokes create() when it has
+        # already decided an in-memory session for this task_id doesn't exist
+        # (e.g. after a bridge restart), so a stale row left over from a
+        # previous process run for the same task_id is expected and should be
+        # overwritten rather than raising a UNIQUE constraint error.
         await db.execute(
-            "INSERT INTO tasks (task_id, agent_session_id, cwd, title, status, created_at, updated_at) VALUES (?, ?, ?, ?, 'idle', ?, ?)",
+            "INSERT OR REPLACE INTO tasks (task_id, agent_session_id, cwd, title, status, created_at, updated_at) VALUES (?, ?, ?, ?, 'idle', ?, ?)",
             (task_id, agent_session_id, cwd, title, now, now),
         )
         await db.commit()

@@ -16,7 +16,7 @@ const reloadFlag = process.platform === "win32" ? [] : ["--reload"];
 const args = [
   "backend.main:app",
   ...reloadFlag,
-  "--port", "8000",
+  "--port", "9001",
   "--log-level", "info",
   ...process.argv.slice(2),
 ];

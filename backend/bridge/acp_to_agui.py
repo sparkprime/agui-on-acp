@@ -39,6 +39,7 @@ from backend.agui.events import (
     TextMessageStartEvent,
     ToolCallArgsEvent,
     ToolCallEndEvent,
+    ToolCallResultEvent,
     ToolCallStartEvent,
 )
 from backend.policy.tool_policy import ToolPolicyEngine
@@ -121,7 +122,7 @@ class AcpToAguiBridge:
         self._close_open_message()
         self._close_all_tool_calls()
         if self._run_id:
-            self._emit(RunFinishedEvent(runId=self._run_id, taskId=self.task_id))
+            self._emit(RunFinishedEvent(runId=self._run_id, taskId=self.task_id, threadId=self.task_id))
         self._run_id = None
 
     def error_run(self, message: str, code: str | None = None) -> None:
@@ -135,6 +136,7 @@ class AcpToAguiBridge:
                     taskId=self.task_id,
                     message=message,
                     code=code,
+                    threadId=self.task_id,
                 )
             )
         self._run_id = None
@@ -464,6 +466,9 @@ class AcpToAguiBridge:
         if isinstance(raw_input, dict):
             raw_input.pop("__tool_use_purpose", None)
 
+        if isinstance(raw_input, dict):
+            raw_input.pop("__tool_use_purpose", None)
+
         self._emit(
             ToolCallStartEvent(
                 toolCallId=tool_call_id,
@@ -473,7 +478,20 @@ class AcpToAguiBridge:
         )
         self._open_tool_calls.add(tool_call_id)
 
-        args_json = json.dumps(raw_input) if isinstance(raw_input, dict) else str(raw_input)
+        # opencode's ACP implementation doesn't populate raw_input for
+        # read/glob/bash — only `kind` ("read"/"search"/"execute") and an
+        # empty `locations` list are available at ToolCallStart time. Enrich
+        # the args delta with what IS available so the renderer isn't a
+        # blank `{}`. When raw_input is populated (e.g. bash's {cwd}), it
+        # passes through unchanged.
+        args_obj: dict[str, Any] = raw_input if isinstance(raw_input, dict) else {}
+        kind = getattr(update, "kind", None)
+        locations = getattr(update, "locations", None)
+        if kind:
+            args_obj.setdefault("kind", kind)
+        if locations:
+            args_obj.setdefault("locations", locations)
+        args_json = json.dumps(args_obj) if args_obj else "{}"
         self._emit(
             ToolCallArgsEvent(
                 toolCallId=tool_call_id,
@@ -508,22 +526,40 @@ class AcpToAguiBridge:
         """Handle ToolCallProgress from the SDK."""
         tool_call_id = str(getattr(update, "tool_call_id", None) or getattr(update, "toolCallId", ""))
         status = getattr(update, "status", "")
-        result = getattr(update, "result", None)
+        # ACP carries the tool result in `raw_output`, not `result`. The old
+        # code read a nonexistent `result` attribute, so every TOOL_CALL_RESULT
+        # arrived with empty content.
+        raw_output = getattr(update, "raw_output", None)
+        result_obj = raw_output if raw_output is not None else getattr(update, "result", None)
 
         if status in ("completed", "failed"):
             if tool_call_id in self._open_tool_calls:
+                result_str = self._serialize_tool_result(result_obj)
                 self._emit(
                     ToolCallEndEvent(
                         toolCallId=tool_call_id,
-                        result=str(result) if result is not None else None,
+                        result=result_str or None,
+                    )
+                )
+                # TOOL_CALL_RESULT is what CopilotKit's runtime listens for to
+                # synthesize a ToolMessage (role="tool") in its message store —
+                # the renderer keys off that message to flip from inProgress to
+                # complete. TOOL_CALL_END alone only signals end-of-args-streaming
+                # and carries no message payload, so without this event the
+                # renderer stays stuck at inProgress with empty parameters.
+                self._emit(
+                    ToolCallResultEvent(
+                        messageId=f"{tool_call_id}-result",
+                        toolCallId=tool_call_id,
+                        content=result_str,
                     )
                 )
                 self._open_tool_calls.discard(tool_call_id)
-        elif result is not None:
+        elif result_obj is not None:
             self._emit(
                 ToolCallArgsEvent(
                     toolCallId=tool_call_id,
-                    delta=json.dumps({"_progress": result}),
+                    delta=json.dumps({"_progress": result_obj}),
                 )
             )
 
@@ -602,22 +638,36 @@ class AcpToAguiBridge:
         """Translate tool_call_update dict to TOOL_CALL_ARGS or TOOL_CALL_END."""
         tool_call_id = update.get("toolCallId", "")
         status = update.get("status", "")
-        result = update.get("result")
+        # Prefer raw_output (ACP field); fall back to result for legacy dicts.
+        result_obj = update.get("raw_output")
+        if result_obj is None:
+            result_obj = update.get("result")
 
         if status in ("completed", "failed"):
             if tool_call_id in self._open_tool_calls:
+                result_str = self._serialize_tool_result(result_obj)
                 self._emit(
                     ToolCallEndEvent(
                         toolCallId=tool_call_id,
-                        result=str(result) if result is not None else None,
+                        result=result_str or None,
+                    )
+                )
+                # See _handle_tool_call_update_typed for rationale: emit a
+                # TOOL_CALL_RESULT so CopilotKit synthesizes a ToolMessage and
+                # the renderer can flip to "complete" with the actual output.
+                self._emit(
+                    ToolCallResultEvent(
+                        messageId=f"{tool_call_id}-result",
+                        toolCallId=tool_call_id,
+                        content=result_str,
                     )
                 )
                 self._open_tool_calls.discard(tool_call_id)
-        elif result is not None:
+        elif result_obj is not None:
             self._emit(
                 ToolCallArgsEvent(
                     toolCallId=tool_call_id,
-                    delta=json.dumps({"_progress": result}),
+                    delta=json.dumps({"_progress": result_obj}),
                 )
             )
 
@@ -656,6 +706,16 @@ class AcpToAguiBridge:
         """Close all open tool calls."""
         for tc_id in list(self._open_tool_calls):
             self._emit(ToolCallEndEvent(toolCallId=tc_id))
+            # Synthesize an empty result so CopilotKit's renderer can still
+            # flip these orphaned tool calls to "complete" rather than hanging
+            # at "inProgress" forever when the turn ends abruptly.
+            self._emit(
+                ToolCallResultEvent(
+                    messageId=f"{tc_id}-result",
+                    toolCallId=tc_id,
+                    content="",
+                )
+            )
         self._open_tool_calls.clear()
 
     def _emit(self, event: BaseAguiEvent) -> None:
@@ -676,3 +736,39 @@ class AcpToAguiBridge:
                 self._log.info("emit %s", event_name)
         except asyncio.QueueFull:
             self._log.error("Event queue full, dropping: %s", event.type)
+
+    @staticmethod
+    def _serialize_tool_result(result_obj: Any) -> str:
+        """Serialize a tool call result (from ACP ``raw_output``) to a string
+        suitable for ``ToolCallResultEvent.content``.
+
+        ACP's ``raw_output`` may be:
+        - a plain string → returned as-is
+        - a dict with structured fields (``output``, ``error``, ``metadata``) →
+          JSON-serialized so the renderer can display the full payload
+        - a pydantic model → ``model_dump()``
+        - None → empty string
+        """
+        if result_obj is None:
+            return ""
+        if isinstance(result_obj, str):
+            return result_obj
+        if hasattr(result_obj, "model_dump"):
+            try:
+                result_obj = result_obj.model_dump()
+            except Exception:
+                pass
+        if isinstance(result_obj, dict):
+            # Prefer the ``output`` field when present (opencode populates this
+            # for read/glob/bash results); fall back to the full dict so the
+            # renderer still shows error/metadata payloads on failure.
+            if "output" in result_obj and isinstance(result_obj["output"], str):
+                return result_obj["output"]
+            try:
+                return json.dumps(result_obj, default=str)
+            except Exception:
+                return str(result_obj)
+        try:
+            return json.dumps(result_obj, default=str)
+        except Exception:
+            return str(result_obj)
