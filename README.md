@@ -99,49 +99,30 @@ Works on macOS, Linux, and Windows (PowerShell or cmd). Prereqs: Python 3.11+, N
 git clone https://github.com/namanrajpal/acp-to-agui.git
 cd acp-to-agui
 pnpm install
-pnpm dev
+pnpm dev:backend
 ```
 
-Open **http://localhost:3000**. Select your agent (Kiro, Claude, Codex, or OpenCode), enter a project path, and start chatting. The bridge spawns the agent subprocess, translates its output to AG-UI events, and streams them to the React frontend.
-
-Prefer side-by-side logs? Run each half in its own terminal:
-
-```bash
-pnpm dev:backend   # FastAPI on :8000
-pnpm dev:ui        # Vite on :3000
-```
-
-Both commands run identically on every platform. The launcher resolves `PYTHONPATH` to the repo root, so you can run them from any working directory.
+The bridge runs on **http://localhost:9001**. Any AG-UI client (CopilotKit, `@ag-ui/client` HttpAgent, or your own) can POST to `http://localhost:9001/ag-ui` and receive an SSE stream of AG-UI events. Connect your own frontend, or use the AG-UI SDK to build one.
 
 <details>
 <summary>Platform notes</summary>
 
 - **macOS / Linux**: `pnpm dev:backend` runs uvicorn with `--reload`, so Python edits hot-reload automatically.
-- **Windows**: `--reload` is skipped automatically because uvicorn's reload supervisor installs an asyncio event loop policy that can't spawn subprocesses (you'd hit `NotImplementedError` from `_make_subprocess_transport` the moment you tried to start a session). Restart `pnpm dev:backend` manually after backend edits. The Vite frontend hot-reloads everywhere.
+- **Windows**: `--reload` is skipped automatically because uvicorn's reload supervisor installs an asyncio event loop policy that can't spawn subprocesses (you'd hit `NotImplementedError` from `_make_subprocess_transport` the moment you tried to start a session). Restart `pnpm dev:backend` manually after backend edits.
 - **Windows + non-`.exe` agents** (`npx`, `claude-agent-acp`, etc.): the bridge auto-wraps `.cmd`/`.bat` shims with `cmd.exe /c` so you can use the same `agentCommand` config as on Unix. Native `.exe` agents like `kiro-cli` pass through unchanged.
 
 </details>
 
 ## Configuration
 
-There are two ways to select an agent:
-
-### 1. Frontend selector (per-session)
-
-The workspace UI has an agent toggle on the project selector page. Pick Kiro, Claude, Codex, or OpenCode. the selected agent command is sent with the session creation request and the backend spawns that specific binary.
-
-This means you can switch agents between sessions without restarting anything.
-
-### 2. Default via `bridge.config.json`
-
-The config file sets the fallback agent when no command is specified per-session:
+The config file sets the default agent:
 
 ```json
 {
   "projectName": "acp-to-agui",
   "displayTitle": "ACP → AG-UI Bridge",
-  "agentCommand": ["kiro-cli", "acp"],
-  "backendPort": 8000,
+  "agentCommand": ["opencode", "acp"],
+  "backendPort": 9001,
   "corsOrigins": ["http://localhost:3000", "http://localhost:3001"]
 }
 ```
@@ -174,27 +155,15 @@ curl -X POST http://localhost:8000/v2/tasks \
 
 ```mermaid
 graph TB
-    subgraph frontend["React Frontend (Vite)"]
-        direction LR
-        CP["ChatPanel"]
-        AD["ApprovalDialog"]
-        TC["ToolCard"]
-        SS["SessionSidebar"]
-    end
-
-    frontend -->|"SSE stream + REST"| backend
-
     subgraph backend["Python Backend (FastAPI)"]
         SM["SessionManager"]
         BR["AcpToAguiBridge"]
         ST["SessionStore"]
         AR["AgentRunner"]
-        PE["PolicyEngine"]
         API["REST APIs"]
         SM --> AR
         SM --> BR
         SM --> ST
-        BR --> PE
     end
 
     AR <-->|"JSON-RPC 2.0 / stdio"| agent
@@ -203,9 +172,15 @@ graph TB
         AG["kiro-cli / claude-agent-acp / any"]
     end
 
-    style frontend fill:#1a4731,stroke:#6ee7b7,color:#fff
+    backend -->|"AG-UI Events over SSE"| client
+
+    subgraph client["Your AG-UI Client"]
+        C1["CopilotKit"] ~~~ C2["HttpAgent"] ~~~ C3["Anything"]
+    end
+
     style backend fill:#3b1f6e,stroke:#a78bfa,color:#fff
     style agent fill:#1e3a5f,stroke:#60a5fa,color:#fff
+    style client fill:#1a4731,stroke:#6ee7b7,color:#fff
 ```
 
 ## Protocol Translation
@@ -216,7 +191,7 @@ graph TB
 | `tool_call` | `TOOL_CALL_START` + `TOOL_CALL_ARGS` | Closes open text message first |
 | `tool_call_update` | `TOOL_CALL_ARGS` or `TOOL_CALL_END` | Based on status field |
 | `turn_end` | `TEXT_MESSAGE_END` + `TOOL_CALL_END`(s) + `RUN_FINISHED` | Closes everything |
-| `session/request_permission` | `STATE_UPDATE` (approval pending) | Uses asyncio.Future for async bridge |
+| `session/request_permission` | `RUN_FINISHED{outcome:interrupt}` | Parks the prompt task; resumed via a new run with `resume` entries |
 | Vendor extensions (`_*.dev/*`) | `CUSTOM` events | Normalized to `agent:*` namespace |
 
 See [`docs/protocol-translation.md`](docs/protocol-translation.md) for the full mapping with diagrams.
@@ -225,28 +200,20 @@ See [`docs/protocol-translation.md`](docs/protocol-translation.md) for the full 
 
 ACP and AG-UI do not map one-to-one. These required a normalization layer:
 
-**Tool Approvals:** ACP's SDK calls `request_permission()` and blocks waiting for a return value. But our approval comes asynchronously from a REST endpoint. We bridge this with `asyncio.Future`: the SDK callback awaits the future, the REST endpoint resolves it.
+**Tool Approvals:** ACP's SDK calls `request_permission()` and blocks waiting for a return value. AG-UI's standard HITL works the opposite way: the run *ends* with `RUN_FINISHED{outcome:interrupt}` and the client resumes with a new run carrying `resume` entries. The bridge parks the prompt task at an `asyncio.Future`, emits the interrupt, and resolves the Future when the resume run arrives — one logical ACP turn maps to N+1 AG-UI runs.
 
 **Message Boundaries:** ACP streams `agent_message_chunk` continuously. AG-UI needs explicit `TEXT_MESSAGE_START` and `TEXT_MESSAGE_END` events. The bridge tracks open message state and auto-closes before tool calls or turn end.
 
 **Vendor Extensions:** ACP agents send custom notifications (e.g., `_kiro.dev/mcp_servers_ready`). The SDK routes these to `ext_notification()`. We normalize them into `CUSTOM` AG-UI events with a clean `agent:*` namespace.
 
-## Three Ways to Build Your Frontend
-
-| Approach | How it consumes AG-UI | Lines of Code | Use When |
-|----------|----------------------|--------------|----------|
-| **Custom Workspace** (`example-frontends/custom-workspace-ui-demo/`) | Direct REST + raw SSE parsing | ~2000 | You want full control over every pixel |
-| **CopilotKit** (`example-frontends/copilotkit-demo/`) | AG-UI via framework (zero UI code) | ~20 | You want to ship fast with production features |
-| **AG-UI HttpAgent** (`example-frontends/httpagent-demo/`) | AG-UI via client library (you build UI) | ~50 | You want the raw protocol with your own UI framework |
-
 ## How It Works
 
-1. **Select an agent**. via the UI toggle, the `agentCommand` API field, or the `bridge.config.json` default
+1. **Select an agent** via the `agentCommand` API field or the `bridge.config.json` default
 2. **Create a session**: `POST /v2/tasks` spawns the agent subprocess, initializes ACP
 3. **Start a run**: `POST /v2/tasks/{id}/run` sends your prompt via JSON-RPC
 4. **Stream events**: `GET /v2/tasks/{id}/events?runId=...` returns AG-UI SSE stream
 5. **Or use the standard endpoint**: `POST /ag-ui` (what CopilotKit and AG-UI HttpAgent use)
-6. **Handle approvals**: `POST /v2/tasks/{id}/approval` resolves pending tool permissions
+6. **Handle approvals**: the run ends with `RUN_FINISHED{outcome:interrupt}`; resume with a new run carrying `resume: [{interruptId, status, payload}]`
 
 <details>
 <summary>Project Structure</summary>
@@ -257,21 +224,15 @@ ACP and AG-UI do not map one-to-one. These required a normalization layer:
 │   ├── bridge/                 # ACP → AG-UI event translation
 │   ├── agui/                   # AG-UI event types + SSE encoding
 │   ├── sessions/               # Session lifecycle, store, routes
-│   ├── policy/                 # Tool approval engine
 │   ├── api/                    # Side-channel REST (files, git)
 │   └── agui_endpoint.py        # POST /ag-ui (AG-UI standard endpoint)
-├── example-frontends/
-│   ├── custom-workspace-ui-demo/  # Full workspace UI (React + Vite + Tailwind)
-│   ├── copilotkit-demo/           # CopilotKit in 20 lines
-│   ├── httpagent-demo/            # Raw @ag-ui/client AG-UI HttpAgent
-│   └── agents.md                  # Agent configuration guide
 ├── docs/
 │   ├── architecture.md         # Detailed system design
 │   ├── integration-contract.md # REST + SSE API spec
 │   ├── protocol-translation.md # Full ACP ↔ AG-UI mapping
 │   └── why-agui.md            # AG-UI ecosystem benefits
 ├── bridge.config.json          # Your agent configuration
-└── package.json                # Workspace orchestrator
+└── package.json                # Backend dev launcher
 ```
 
 </details>
@@ -285,7 +246,7 @@ ACP and AG-UI do not map one-to-one. These required a normalization layer:
 | **Codex CLI** (codex-acp) | 0.14.0 | 🟡 Supported | Via Zed adapter, tool calls + edit review |
 | **OpenCode** | 1.15.6 | 🟡 Supported | Native ACP, 2 agents (build/plan), MCP servers |
 
-Kiro and Claude Agent tested end-to-end with zero code changes between them. Codex and OpenCode are ACP-compatible and supported by this bridge; community testing welcome. Just swap `agentCommand`. See [`docs/demo-walkthrough.md`](docs/demo-walkthrough.md) for full test results and [`example-frontends/agents.md`](example-frontends/agents.md) for setup guides.
+Kiro and Claude Agent tested end-to-end with zero code changes between them. Codex and OpenCode are ACP-compatible and supported by this bridge; community testing welcome. Just swap `agentCommand`. See [`docs/demo-walkthrough.md`](docs/demo-walkthrough.md) for full test results.
 
 <details>
 <summary>Full ACP Ecosystem (33+ agents)</summary>
@@ -317,10 +278,9 @@ This repository accompanies a live demo presented at [Seattle AI Tinkerers](http
 Contributions welcome! Areas of interest:
 
 - Additional agent configuration examples
-- Frontend components for new AG-UI event types
-- Policy engine enhancements (configurable approval rules)
 - Session resume/persistence improvements
 - More AG-UI event types (STATE_DELTA, activities, reasoning)
+- Interrupt/resume edge case handling
 
 ## License
 

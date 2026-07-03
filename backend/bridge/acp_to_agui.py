@@ -30,10 +30,11 @@ from backend.agui.events import (
     AguiEventType,
     BaseAguiEvent,
     CustomEvent,
+    Interrupt,
+    InterruptOutcome,
     RunErrorEvent,
     RunFinishedEvent,
     RunStartedEvent,
-    StateUpdateEvent,
     TextMessageContentEvent,
     TextMessageEndEvent,
     TextMessageStartEvent,
@@ -42,9 +43,13 @@ from backend.agui.events import (
     ToolCallResultEvent,
     ToolCallStartEvent,
 )
-from backend.policy.tool_policy import ToolPolicyEngine
 
 logger = logging.getLogger(__name__)
+
+# TTL for parked permission futures. If no resume arrives within this window
+# (e.g. the user closed the tab), the future resolves with `cancelled` so the
+# prompt task unwinds instead of hanging forever (leaking the ACP subprocess).
+PERMISSION_TTL_SECONDS = 300.0
 
 
 class AcpToAguiBridge:
@@ -60,10 +65,8 @@ class AcpToAguiBridge:
     def __init__(
         self,
         task_id: str,
-        policy_engine: ToolPolicyEngine,
     ) -> None:
         self.task_id = task_id
-        self._policy = policy_engine
         self._log = logging.LoggerAdapter(logger, {"task_id": task_id})
 
         # Per-run state — reset on start_run()
@@ -79,8 +82,13 @@ class AcpToAguiBridge:
         self._pending_notifications: list[tuple[str, dict[str, Any]]] = []
 
         # Permission futures — maps call_id to asyncio.Future that
-        # request_permission awaits. Resolved by the REST approval endpoint.
+        # request_permission awaits. Resolved by resume_run (AG-UI resume) or
+        # cancel_run. Correlation invariant: the call_id equals the interrupt
+        # id and the ACP permission tool callId — one key through the flow.
         self._permission_futures: dict[str, asyncio.Future[acp.RequestPermissionResponse]] = {}
+        # Per-future TTL handles so we can cancel the expiry timer when a
+        # resume/cancel resolves the future first.
+        self._permission_timers: dict[str, asyncio.TimerHandle] = {}
 
         # Working directory for file operations (set by session manager)
         self._cwd: str = ""
@@ -140,6 +148,60 @@ class AcpToAguiBridge:
                 )
             )
         self._run_id = None
+
+    def attach_resume_queue(self, run_id: str, queue: asyncio.Queue) -> None:
+        """Re-attach a new SSE stream to a prompt task suspended at a
+        permission Future.
+
+        Unlike ``start_run``, this does NOT reset ``_open_tool_calls`` — the
+        tool call that triggered the permission is still open and continues
+        across the suspend/resume boundary. Emits RUN_STARTED so the new SSE
+        stream has a clean start, then flushes any buffered notifications.
+        """
+        self._run_id = run_id
+        self._queue = queue
+        self._has_open_message = False
+
+        self._emit(
+            RunStartedEvent(
+                runId=run_id,
+                taskId=self.task_id,
+                threadId=self.task_id,
+            )
+        )
+
+        if self._pending_notifications:
+            self._log.debug(
+                "Flushing %d buffered notifications into resume run %s",
+                len(self._pending_notifications),
+                run_id,
+            )
+            for method, params in self._pending_notifications:
+                self._handle_agent_extension(method, params)
+            self._pending_notifications.clear()
+
+    def _suspend_run(self, interrupt: Interrupt) -> None:
+        """End the current SSE stream with an interrupt outcome, WITHOUT
+        closing tool calls or going through ``finish_run`` (which would emit a
+        second outcome-less RUN_FINISHED and close tool calls we want to keep
+        open across the suspend).
+
+        The prompt task remains parked at ``await future`` in
+        ``request_permission``; ``attach_resume_queue`` re-attaches a new
+        stream on resume.
+        """
+        self._close_open_message()
+        if self._run_id:
+            self._emit(
+                RunFinishedEvent(
+                    runId=self._run_id,
+                    taskId=self.task_id,
+                    threadId=self.task_id,
+                    outcome=InterruptOutcome(interrupts=[interrupt]),
+                )
+            )
+        self._run_id = None
+        self._queue = None
 
     # ── acp.Client Protocol — Core callbacks ─────────────────────────────────
 
@@ -203,9 +265,11 @@ class AcpToAguiBridge:
     ) -> acp.RequestPermissionResponse:
         """Handle tool approval requests from the SDK.
 
-        This is called by the SDK and expects a return value. We create an
-        asyncio.Future that the REST approval endpoint will resolve, then
-        await it.
+        Emits a ``RUN_FINISHED{outcome:interrupt}`` so the AG-UI client
+        (CopilotKit ``useInterrupt``) surfaces an approval UI, then parks a
+        Future and suspends. The SSE stream closes on the interrupt
+        ``RUN_FINISHED``; a subsequent resume run re-attaches a stream and
+        resolves the Future, unblocking the prompt task.
         """
         # Extract info from tool_call
         tool_call_id = str(
@@ -221,7 +285,7 @@ class AcpToAguiBridge:
             or (tool_call.get("title", tool_call.get("toolName", "unknown")) if isinstance(tool_call, dict) else "unknown")
         )
 
-        # Extract options list
+        # Extract options list for the client UI
         if isinstance(options, list):
             options_list = options
         elif hasattr(options, "__iter__"):
@@ -229,7 +293,6 @@ class AcpToAguiBridge:
         else:
             options_list = []
 
-        # Serialize options for the frontend
         serialized_options = []
         for opt in options_list:
             if isinstance(opt, dict):
@@ -241,30 +304,61 @@ class AcpToAguiBridge:
             else:
                 serialized_options.append(str(opt))
 
-        # Emit STATE_UPDATE with pending approval info
-        self._emit(
-            StateUpdateEvent(
-                state={
-                    "approval": {
-                        "pending": True,
-                        "callId": tool_call_id,
-                        "toolName": tool_name,
-                        "summary": f"Permission required: {tool_name}",
-                        "options": serialized_options,
-                    }
-                }
-            )
+        # Compute an expiry deadline shared by the interrupt and the Future TTL
+        # so the AG-UI client guard (agent.ts:407-411) and our server-side
+        # cleanup agree.
+        loop = asyncio.get_event_loop()
+        import datetime as _dt
+        expires_at_iso = _dt.datetime.fromtimestamp(
+            _dt.datetime.now().timestamp() + PERMISSION_TTL_SECONDS,
+            tz=_dt.timezone.utc,
+        ).isoformat()
+
+        interrupt = Interrupt(
+            id=tool_call_id,
+            reason="tool_call",
+            toolCallId=tool_call_id,
+            message=f"Permission required: {tool_name}",
+            expiresAt=expires_at_iso,
+            metadata={
+                "toolName": tool_name,
+                "options": serialized_options,
+            },
         )
 
-        # Create a future that the REST endpoint will resolve
-        loop = asyncio.get_event_loop()
+        # Park the Future BEFORE emitting the interrupt outcome — the outcome
+        # closes the SSE stream, so the Future must exist when a resume
+        # arrives. ``_suspend_run`` nulls _queue/_run_id; the prompt task then
+        # suspends at ``await future`` below.
         future: asyncio.Future[acp.RequestPermissionResponse] = loop.create_future()
         self._permission_futures[tool_call_id] = future
 
-        self._log.info("⏸ awaiting approval for %s (callId=%s)", tool_name, tool_call_id)
+        # Schedule a TTL expiry: if no resume arrives, resolve with cancelled
+        # so the prompt unwinds instead of hanging.
+        timer = loop.call_later(
+            PERMISSION_TTL_SECONDS,
+            self._expire_permission,
+            tool_call_id,
+        )
+        self._permission_timers[tool_call_id] = timer
+
+        self._log.info("⏸ interrupting for %s (callId=%s)", tool_name, tool_call_id)
+        self._suspend_run(interrupt)
+
         response = await future
-        self._log.info("✓ approval resolved for %s → %s", tool_name, getattr(response, 'option_id', 'approved'))
+        self._log.info("✓ permission resolved for %s → %s", tool_name, getattr(response, "outcome", "?"))
         return response
+
+    def _expire_permission(self, call_id: str) -> None:
+        """TTL callback — resolve a parked permission Future as cancelled if
+        no resume arrived in time."""
+        future = self._permission_futures.pop(call_id, None)
+        self._permission_timers.pop(call_id, None)
+        if future is None or future.done():
+            return
+        self._log.warning("permission future %s expired (no resume) → cancelled", call_id)
+        response = acp.RequestPermissionResponse(outcome={"outcome": "cancelled"})
+        future.set_result(response)
 
     async def ext_notification(self, method: str, params: dict[str, Any]) -> None:
         """Handle vendor extension notifications like _kiro.dev/*.
@@ -372,40 +466,50 @@ class AcpToAguiBridge:
         """Kill a terminal."""
         return acp.KillTerminalResponse()
 
-    # ── Permission resolution (called by SessionManager via REST) ────────────
+    # ── Permission resolution (called by SessionManager on resume/cancel) ────
 
-    def resolve_permission(self, call_id: str, approved: bool, option_id: str | None = None) -> None:
+    def resolve_permission(self, call_id: str, approved: bool, option_id: str | None = None) -> bool:
         """Resolve a pending permission future.
 
-        Called by the SessionManager when the REST approval endpoint is hit.
+        Called by ``SessionManager.resume_run`` (AG-UI resume) or
+        ``cancel_run``. Returns True if a pending future was found and
+        resolved, False if there was nothing to resolve (e.g. unknown
+        interrupt id / already expired).
         """
         future = self._permission_futures.pop(call_id, None)
+        timer = self._permission_timers.pop(call_id, None)
+        if timer is not None:
+            timer.cancel()
+
         if future is None:
             self._log.warning("No pending permission future for call_id=%s", call_id)
-            return
+            return False
+        if future.done():
+            self._log.warning("Permission future for call_id=%s already done", call_id)
+            return False
 
         if approved:
-            outcome = {"outcome": "selected", "optionId": option_id or "allow_once"}
+            # OpenCode's option IDs are once/always/reject, NOT allow_once.
+            outcome = {"outcome": "selected", "optionId": option_id or "once"}
         else:
             outcome = {"outcome": "cancelled"}
 
         response = acp.RequestPermissionResponse(outcome=outcome)
+        future.set_result(response)
+        return True
 
-        if not future.done():
-            future.set_result(response)
+    def pending_interrupt_ids(self) -> list[str]:
+        """Return the call_ids of all parked (unresolved) permission futures."""
+        return [cid for cid, fut in self._permission_futures.items() if not fut.done()]
 
-        # Emit STATE_UPDATE clearing the pending approval
-        self._emit(
-            StateUpdateEvent(
-                state={
-                    "approval": {
-                        "pending": False,
-                        "callId": call_id,
-                        "approved": approved,
-                    }
-                }
-            )
-        )
+    def cancel_all_permissions(self) -> None:
+        """Resolve every parked permission future as cancelled.
+
+        Used by ``cancel_run`` so ``request_permission`` unblocks and the
+        prompt task unwinds instead of hanging on a dead session.
+        """
+        for call_id in list(self._permission_futures.keys()):
+            self.resolve_permission(call_id, approved=False)
 
     # ── Fallback dict-based session/update handling ──────────────────────────
 
@@ -461,10 +565,6 @@ class AcpToAguiBridge:
         tool_call_id = str(getattr(update, "tool_call_id", None) or getattr(update, "toolCallId", str(uuid.uuid4())))
         tool_name = getattr(update, "title", None) or getattr(update, "tool_name", "unknown")
         raw_input = getattr(update, "raw_input", None) or getattr(update, "rawInput", {})
-        requires_approval = getattr(update, "requires_approval", False) or getattr(update, "requiresApproval", False)
-
-        if isinstance(raw_input, dict):
-            raw_input.pop("__tool_use_purpose", None)
 
         if isinstance(raw_input, dict):
             raw_input.pop("__tool_use_purpose", None)
@@ -498,29 +598,8 @@ class AcpToAguiBridge:
                 delta=args_json,
             )
         )
-
-        # Check policy
-        input_dict = raw_input if isinstance(raw_input, dict) else {}
-        decision = self._policy.evaluate(
-            tool_name, input_dict, kiro_requires=bool(requires_approval)
-        )
-
-        if decision.requires_approval:
-            permission_options = getattr(update, "permission_options", []) or getattr(update, "permissionOptions", [])
-            self._emit(
-                StateUpdateEvent(
-                    state={
-                        "approval": {
-                            "pending": True,
-                            "callId": tool_call_id,
-                            "toolName": tool_name,
-                            "summary": f"Tool call: {tool_name}",
-                            "options": permission_options,
-                            "category": decision.category,
-                        }
-                    }
-                )
-            )
+        # Approval is driven solely by the ACP request_permission callback,
+        # which emits an interrupt RUN_FINISHED — no policy gate here.
 
     def _handle_tool_call_update_typed(self, update: acp.schema.ToolCallProgress) -> None:
         """Handle ToolCallProgress from the SDK."""
@@ -592,7 +671,6 @@ class AcpToAguiBridge:
         tool_call_id = update.get("toolCallId", str(uuid.uuid4()))
         tool_name = update.get("title", update.get("toolName", "unknown"))
         raw_input = update.get("rawInput", {})
-        requires_approval = update.get("requiresApproval") or update.get("requires_approval", False)
 
         raw_input.pop("__tool_use_purpose", None)
 
@@ -612,27 +690,7 @@ class AcpToAguiBridge:
                 delta=args_json,
             )
         )
-
-        decision = self._policy.evaluate(
-            tool_name, raw_input, kiro_requires=bool(requires_approval)
-        )
-
-        if decision.requires_approval:
-            permission_options = update.get("permissionOptions", [])
-            self._emit(
-                StateUpdateEvent(
-                    state={
-                        "approval": {
-                            "pending": True,
-                            "callId": tool_call_id,
-                            "toolName": tool_name,
-                            "summary": f"Tool call: {tool_name}",
-                            "options": permission_options,
-                            "category": decision.category,
-                        }
-                    }
-                )
-            )
+        # Approval is driven solely by the ACP request_permission callback.
 
     def _handle_tool_call_update_dict(self, update: dict[str, Any]) -> None:
         """Translate tool_call_update dict to TOOL_CALL_ARGS or TOOL_CALL_END."""

@@ -86,7 +86,7 @@ The ACP spec recently stabilized `session/set_config_option` as the preferred re
 
 ```
 ┌─────────────────────────────────────────────────┐
-│  Frontend (custom-workspace / CopilotKit / etc.) │
+│  Client (CopilotKit / HttpAgent / etc.)          │
 │  Shows agent picker dropdown from configOptions │
 └───────────────────────┬─────────────────────────┘
                         │ POST /ag-ui or REST API

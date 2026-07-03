@@ -17,7 +17,6 @@ dependencies = [
     "uvicorn[standard]>=0.32.0",
     "agent-client-protocol>=0.10.0",
     "pydantic>=2.9.0",
-    "aiofiles>=24.1.0",
     "python-dotenv>=1.0.0",
     "sse-starlette>=2.0.0",
     "aiosqlite>=0.20.0",

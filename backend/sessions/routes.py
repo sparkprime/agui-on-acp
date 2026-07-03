@@ -1,28 +1,17 @@
 """Session routes — FastAPI router for AG-UI session/task management.
 
-Endpoints handle task CRUD, run lifecycle, approval flows, and SSE streaming.
+Endpoints handle task CRUD, run lifecycle, and SSE streaming.
 Routes keep the /v2/tasks prefix for backward compatibility.
 """
 
-import asyncio
 import logging
 import uuid
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
-from backend.agui.events import (
-    AguiEventType,
-    RunFinishedEvent,
-    RunStartedEvent,
-    TextMessageContentEvent,
-    TextMessageEndEvent,
-    TextMessageStartEvent,
-)
-from backend.agui.sse import encode_sse_event, event_stream
+from backend.agui.sse import event_stream
 from backend.sessions.types import (
-    ApprovalRequest,
-    ApprovalResponse,
     CreateTaskRequest,
     CreateTaskResponse,
     ExecuteCommandRequest,
@@ -65,45 +54,29 @@ def _get_manager(request: Request):
 @router.post("/tasks", response_model=CreateTaskResponse)
 async def create_task(body: CreateTaskRequest, request: Request):
     """Create a new task and spawn an agent process."""
-    store = _get_store(request)
     manager = _get_manager(request)
+    if manager is None:
+        raise HTTPException(status_code=503, detail="Session manager not available")
 
     task_id = str(uuid.uuid4())
-
-    if manager is not None:
-        active = await manager.create_task(
-            task_id=task_id,
-            cwd=body.cwd,
-            title=body.title or "New Task",
-            resume_session_id=body.resumeSessionId,
-            mode=body.mode,
-            model=body.model,
-            mcp_servers=body.mcpServers,
-            agent_command=body.agentCommand,
-        )
-        return CreateTaskResponse(
-            taskId=active.task_id,
-            agentSessionId=active.agent_session_id,
-            runUrl=f"/v2/tasks/{active.task_id}/run",
-            eventsUrl=f"/v2/tasks/{active.task_id}/events",
-            modes=active.modes,
-            models=active.models,
-            currentModeId=active.current_mode_id,
-        )
-
-    # Stub fallback: no agent process, just store metadata
-    agent_session_id = f"stub-{uuid.uuid4().hex[:8]}"
-    await store.create(
+    active = await manager.create_task(
         task_id=task_id,
-        agent_session_id=agent_session_id,
         cwd=body.cwd,
         title=body.title or "New Task",
+        resume_session_id=body.resumeSessionId,
+        mode=body.mode,
+        model=body.model,
+        mcp_servers=body.mcpServers,
+        agent_command=body.agentCommand,
     )
     return CreateTaskResponse(
-        taskId=task_id,
-        agentSessionId=agent_session_id,
-        runUrl=f"/v2/tasks/{task_id}/run",
-        eventsUrl=f"/v2/tasks/{task_id}/events",
+        taskId=active.task_id,
+        agentSessionId=active.agent_session_id,
+        runUrl=f"/v2/tasks/{active.task_id}/run",
+        eventsUrl=f"/v2/tasks/{active.task_id}/events",
+        modes=active.modes,
+        models=active.models,
+        currentModeId=active.current_mode_id,
     )
 
 
@@ -191,64 +164,19 @@ async def start_run(task_id: str, body: StartRunRequest, request: Request):
     """Start a new run (send prompt to agent).
 
     Sends prompt via ACP, bridge translates to AG-UI events.
-    Falls back to demo events when no agent manager is available.
     """
-    store = _get_store(request)
     manager = _get_manager(request)
+    if manager is None:
+        raise HTTPException(status_code=503, detail="Session manager not available")
 
-    task = await store.get(task_id)
-    if task is None:
-        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
-
-    if manager is not None:
-        try:
-            run_id = await manager.start_run(task_id, body.input, body.config)
-        except KeyError:
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"Task {task_id} is no longer active. Please create a new task."
-                ),
-            )
-        return StartRunResponse(runId=run_id)
-
-    # Fallback: create a mock run with demo events
-    run_id = str(uuid.uuid4())
-    queue: asyncio.Queue = asyncio.Queue()
-
-    # Store queue for the SSE endpoint to pick up
-    if not hasattr(request.app.state, "event_queues"):
-        request.app.state.event_queues = {}
-    request.app.state.event_queues[f"{task_id}:{run_id}"] = queue
-
-    # Enqueue demo events asynchronously
-    asyncio.create_task(_enqueue_demo_events(queue, task_id, run_id))
-
+    try:
+        run_id = await manager.start_run(task_id, body.input, body.config)
+    except KeyError:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Task {task_id} is no longer active. Please create a new task.",
+        )
     return StartRunResponse(runId=run_id)
-
-
-async def _enqueue_demo_events(
-    queue: asyncio.Queue, task_id: str, run_id: str
-) -> None:
-    """Enqueue a sequence of mock AG-UI events for testing without an agent."""
-    msg_id = str(uuid.uuid4())
-
-    await queue.put(
-        RunStartedEvent(runId=run_id, taskId=task_id, threadId=task_id)
-    )
-    await asyncio.sleep(0.1)
-
-    await queue.put(TextMessageStartEvent(messageId=msg_id))
-    await asyncio.sleep(0.05)
-
-    for chunk in ["Hello! ", "This is a ", "mock AG-UI ", "streaming response."]:
-        await queue.put(TextMessageContentEvent(messageId=msg_id, delta=chunk))
-        await asyncio.sleep(0.1)
-
-    await queue.put(TextMessageEndEvent(messageId=msg_id))
-    await asyncio.sleep(0.05)
-
-    await queue.put(RunFinishedEvent(runId=run_id, taskId=task_id, threadId=task_id))
 
 
 @router.get("/tasks/{task_id}/events")
@@ -263,32 +191,14 @@ async def stream_events(
     RUN_FINISHED or RUN_ERROR is sent.
     """
     manager = _get_manager(request)
+    if manager is None:
+        raise HTTPException(status_code=503, detail="Session manager not available")
 
-    if manager is not None:
-        queue = manager.get_event_queue(task_id, runId)
-        if queue is None:
-            raise HTTPException(
-                status_code=404, detail=f"No active run {runId} for task {task_id}"
-            )
-        return StreamingResponse(
-            event_stream(queue, task_id),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",
-            },
-        )
-
-    # Fallback: get queue from app.state.event_queues
-    queues = getattr(request.app.state, "event_queues", {})
-    queue_key = f"{task_id}:{runId}"
-    queue = queues.get(queue_key)
+    queue = manager.get_event_queue(task_id, runId)
     if queue is None:
         raise HTTPException(
             status_code=404, detail=f"No active run {runId} for task {task_id}"
         )
-
     return StreamingResponse(
         event_stream(queue, task_id),
         media_type="text/event-stream",
@@ -298,42 +208,6 @@ async def stream_events(
             "X-Accel-Buffering": "no",
         },
     )
-
-
-# ── Approval ────────────────────────────────────────────────────────────────
-
-
-@router.post("/tasks/{task_id}/approval", response_model=ApprovalResponse)
-async def handle_approval(task_id: str, body: ApprovalRequest, request: Request):
-    """Resolve a pending tool call approval."""
-    manager = _get_manager(request)
-    if manager is not None:
-        await manager.approve(task_id, body.callId, body.approved, body.optionId)
-        return ApprovalResponse(success=True, callId=body.callId)
-
-    # Stub fallback
-    return ApprovalResponse(success=True, callId=body.callId)
-
-
-# ── Message history ─────────────────────────────────────────────────────────
-
-
-@router.get("/tasks/{task_id}/messages")
-async def get_messages(task_id: str, request: Request):
-    """Load message history for a task.
-
-    Returns prior conversation messages so the frontend can populate the
-    chat panel when resuming a session.
-    """
-    store = _get_store(request)
-
-    task = await store.get(task_id)
-    if task is None:
-        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
-
-    # Message history loading from on-disk session files is agent-specific.
-    # Return empty for now — implementations can override this.
-    return {"messages": []}
 
 
 # ── Mode / Model / Command ──────────────────────────────────────────────────

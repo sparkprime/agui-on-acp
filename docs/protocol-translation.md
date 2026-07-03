@@ -16,13 +16,12 @@ The bridge sits between them, maintaining state and emitting properly sequenced 
 |-----------|-----------|--------------|-------|
 | `session/update` → `agent_message_chunk` | First text in turn | `TEXT_MESSAGE_START` + `TEXT_MESSAGE_CONTENT` | Opens new message |
 | `session/update` → `agent_message_chunk` | Subsequent text | `TEXT_MESSAGE_CONTENT` only | Same message ID |
-| `session/update` → `tool_call` | No approval needed | `TOOL_CALL_START` + `TOOL_CALL_ARGS` | Closes open text message first |
-| `session/update` → `tool_call` | Approval needed | + `STATE_UPDATE` (approval pending) | Frontend shows approval dialog |
+| `session/update` → `tool_call` | — | `TOOL_CALL_START` + `TOOL_CALL_ARGS` | Closes open text message first |
 | `session/update` → `tool_call_update` | `status=running` | `TOOL_CALL_ARGS` (progress) | Intermediate update |
-| `session/update` → `tool_call_update` | `status=completed/failed` | `TOOL_CALL_END` | Removes from open set |
+| `session/update` → `tool_call_update` | `status=completed/failed` | `TOOL_CALL_END` + `TOOL_CALL_RESULT` | Removes from open set |
 | `session/update` → `turn_end` | — | `TEXT_MESSAGE_END` + all `TOOL_CALL_END` + `RUN_FINISHED` | Closes everything |
 | `session/update` → `current_mode_update` | — | `CUSTOM` (name: `agent:mode_update`) | Mode change |
-| `session/request_permission` | — | `STATE_UPDATE` (approval pending) | RPC ID stored for response |
+| `session/request_permission` | — | `RUN_FINISHED{outcome:interrupt}` | Parks prompt task at Future; resumed via new run |
 | Vendor extensions (`_*.dev/*`) | — | `CUSTOM` events | Normalized namespace |
 
 ## State Machine
@@ -73,28 +72,33 @@ The bridge maintains per-run state:
 
 4. **Vendor extensions arriving before the first run are buffered.** They're flushed as `CUSTOM` events when `start_run()` is called.
 
-## Approval Flow (Detail)
+## Approval Flow (Interrupt/Resume)
 
-ACP uses a request/response pattern for tool approvals. AG-UI has no concept of "respond to an event" — it's unidirectional. The bridge reconciles this:
+ACP uses a request/response pattern for tool approvals: `request_permission` is a callback that blocks the prompt until answered. AG-UI's standard HITL works the opposite way: the run *ends* with `RUN_FINISHED{outcome:interrupt}` and the client resumes with a new run carrying `resume` entries. The bridge reconciles this by parking the prompt task at an `asyncio.Future`:
 
 ```
-1. Agent sends: session/request_permission (JSON-RPC request, id=42)
-   Bridge stores: pending_permissions["tool_call_xyz"] = 42
-   Bridge emits:  STATE_UPDATE { approval: { pending: true, callId: "tool_call_xyz", ... } }
+1. Agent sends: session/request_permission (callback, tool_call_id="xyz")
+   Bridge: parks Future F["xyz"], emits RUN_FINISHED{outcome:{type:"interrupt", interrupts:[{id:"xyz", toolCallId:"xyz", reason:"tool_call"}]}}
+   Prompt task suspends at `await F["xyz"]`
+   SSE stream 1 closes
 
-2. Frontend shows approval dialog
-   User clicks "Approve"
-   Frontend sends: POST /v2/tasks/{id}/approval { callId: "tool_call_xyz", approved: true }
+2. Client shows approval UI (CopilotKit useInterrupt, custom dialog, etc.)
+   User approves
+   Client sends: POST /ag-ui {resume:[{interruptId:"xyz", status:"resolved", payload:"once"}]}
 
-3. TaskManager:
-   - Pops RPC ID 42 from pending_permissions
-   - Calls protocol.respond(42, { outcome: { outcome: "selected", optionId: "allow_once" } })
-   - Bridge emits: STATE_UPDATE { approval: { pending: false, callId: "tool_call_xyz", approved: true } }
+3. SessionManager.resume_run():
+   - Creates new queue + run_id
+   - bridge.attach_resume_queue() → emits RUN_STARTED
+   - bridge.resolve_permission("xyz", approved=True, option_id="once") → Future resolved
+   - Prompt task wakes, continues emitting into the new queue
 
-4. Agent receives response, executes tool
+4. Agent continues, executes tool
    Agent sends: session/update → tool_call_update (status=completed)
-   Bridge emits: TOOL_CALL_END
+   Bridge emits: TOOL_CALL_END + TOOL_CALL_RESULT
+   ... eventually RUN_FINISHED (no outcome) — SSE stream 2 closes
 ```
+
+One logical ACP turn maps to N+1 AG-UI runs when it hits N permission points. The correlation key `interrupt.id === toolCallId === ACP callId` is threaded through the entire flow.
 
 ## Custom Events
 

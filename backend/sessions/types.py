@@ -20,12 +20,6 @@ class StartRunRequest(BaseModel):
     config: dict[str, Any] | None = None
 
 
-class ApprovalRequest(BaseModel):
-    callId: str
-    approved: bool
-    optionId: str | None = None
-
-
 class UpdateTaskRequest(BaseModel):
     title: str | None = None
 
@@ -55,11 +49,6 @@ class CreateTaskResponse(BaseModel):
 
 class StartRunResponse(BaseModel):
     runId: str
-
-
-class ApprovalResponse(BaseModel):
-    success: bool
-    callId: str
 
 
 class TaskSummary(BaseModel):

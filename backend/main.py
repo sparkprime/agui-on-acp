@@ -85,11 +85,6 @@ async def health_check() -> HealthResponse:
     return HealthResponse(status="ok", version=__version__, project=config.project_name)
 
 
-from backend.api import files, git
-
-app.include_router(files.router, prefix="/api", tags=["files"])
-app.include_router(git.router, prefix="/api", tags=["git"])
-
 from backend.sessions.routes import router as sessions_router
 
 app.include_router(sessions_router, tags=["sessions"])

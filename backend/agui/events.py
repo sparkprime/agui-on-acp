@@ -46,11 +46,40 @@ class RunStartedEvent(BaseAguiEvent):
     threadId: str | None = None
 
 
+class Interrupt(BaseModel):
+    """AG-UI Interrupt — surfaces a permission/approval point to the client.
+
+    Schema matches ag-ui types.ts:193. `id` is the correlation key threaded
+    through the whole flow: interrupt.id === toolCallId === ACP permission
+    callId. `reason` is required by the AG-UI schema.
+    """
+
+    id: str
+    reason: str
+    message: str | None = None
+    toolCallId: str | None = None
+    responseSchema: dict[str, Any] | None = None
+    expiresAt: str | None = None
+    metadata: dict[str, Any] | None = None
+
+
+class InterruptOutcome(BaseModel):
+    """AG-UI RunFinishedInterruptOutcome (events.ts:226).
+
+    `.strict()` on the TS side — no extra keys — and `interrupts` must have
+    ≥ 1 element (min_length=1 here enforces that before serialization).
+    """
+
+    type: Literal["interrupt"] = "interrupt"
+    interrupts: list[Interrupt] = Field(min_length=1)
+
+
 class RunFinishedEvent(BaseAguiEvent):
     type: Literal[AguiEventType.RUN_FINISHED] = AguiEventType.RUN_FINISHED
     runId: str
     taskId: str
     threadId: str | None = None
+    outcome: InterruptOutcome | None = None
 
 
 class RunErrorEvent(BaseAguiEvent):
@@ -150,4 +179,5 @@ AguiEvent = (
     | StateUpdateEvent
     | StateSnapshotEvent
     | CustomEvent
+    | InterruptOutcome
 )

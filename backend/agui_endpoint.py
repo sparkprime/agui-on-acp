@@ -22,6 +22,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from backend.agui.events import StateSnapshotEvent
 from backend.agui.sse import event_stream
 
 logger = logging.getLogger(__name__)
@@ -47,9 +48,17 @@ class AgUiMessage(BaseModel):
     toolCalls: list[ToolCall] | None = None
     toolCallId: str | None = None
 
+class ResumeEntry(BaseModel):
+    """AG-UI ResumeEntry (types.ts:203)."""
+
+    interruptId: str
+    status: str = "resolved"  # "resolved" | "cancelled"
+    payload: Any = None
+
 
 class RunAgentInput(BaseModel):
     """AG-UI standard RunAgentInput schema."""
+
     threadId: str | None = None
     runId: str | None = None
     state: dict[str, Any] = Field(default_factory=dict)
@@ -57,6 +66,7 @@ class RunAgentInput(BaseModel):
     tools: list[dict[str, Any]] = Field(default_factory=list)
     context: list[Any] = Field(default_factory=list)
     forwardedProps: dict[str, Any] = Field(default_factory=dict)
+    resume: list[ResumeEntry] = Field(default_factory=list)
 
 
 @router.post("/ag-ui")
@@ -66,6 +76,11 @@ async def ag_ui_run(body: RunAgentInput, request: Request):
     Accepts RunAgentInput, creates/reuses a session, sends the prompt,
     and streams back AG-UI events over SSE. This makes the bridge
     compatible with any AG-UI client (CopilotKit, HttpAgent, etc.).
+
+    If ``body.resume`` is non-empty, this is a resume run: the prompt task
+    is already suspended at a permission interrupt, so we re-attach a new
+    SSE stream and resolve the parked Future instead of starting a new
+    ``prompt()``.
     """
     manager = getattr(request.app.state, "session_manager", None)
     if manager is None:
@@ -74,19 +89,53 @@ async def ag_ui_run(body: RunAgentInput, request: Request):
             media_type="text/event-stream",
         )
 
-    config = request.app.state.config
     thread_id = body.threadId or str(uuid.uuid4())
     run_id = body.runId or str(uuid.uuid4())
 
-    # Get or create a session for this thread
+    # ── Resume path ──────────────────────────────────────────────────────
+    if body.resume:
+        try:
+            actual_run_id = await manager.resume_run(thread_id, [r.model_dump() for r in body.resume])
+        except KeyError:
+            return StreamingResponse(
+                _error_stream(f"No active session for thread {thread_id}"),
+                media_type="text/event-stream",
+            )
+        except ValueError as exc:
+            # No pending interrupt to resume — surface as RUN_ERROR instead
+            # of a hanging empty stream.
+            return StreamingResponse(
+                _error_stream(str(exc)),
+                media_type="text/event-stream",
+            )
+
+        queue = manager.get_event_queue(thread_id, actual_run_id)
+        if queue is None:
+            return StreamingResponse(
+                _error_stream("No event queue for resume run"),
+                media_type="text/event-stream",
+            )
+        return _sse_response(queue, thread_id, manager)
+
+    # ── Fresh run path ───────────────────────────────────────────────────
     active = manager._sessions.get(thread_id)
     if active is None:
-        cwd = body.forwardedProps.get("cwd", ".")
+        fp = body.forwardedProps
+        cwd = fp.get("cwd", ".")
+        title = fp.get("title", "AG-UI Session")
+        resume_session_id = fp.get("resumeSessionId")
+        mode = fp.get("mode")
+        model = fp.get("model")
+        agent_command = fp.get("agentCommand")
         try:
             active = await manager.create_task(
                 task_id=thread_id,
                 cwd=cwd,
-                title="AG-UI Session",
+                title=title,
+                resume_session_id=resume_session_id,
+                mode=mode,
+                model=model,
+                agent_command=agent_command,
             )
         except Exception as exc:
             logger.error("Failed to create session for AG-UI: %s", exc)
@@ -94,6 +143,18 @@ async def ag_ui_run(body: RunAgentInput, request: Request):
                 _error_stream(str(exc)),
                 media_type="text/event-stream",
             )
+
+    # Emit a STATE_SNAPSHOT with available modes/models so the UI can
+    # populate selectors (design-v2: STATE_SNAPSHOT for modes/models).
+    snapshot: dict[str, Any] = {}
+    if active.modes:
+        snapshot["modes"] = active.modes
+    if active.models:
+        snapshot["models"] = active.models
+    if active.current_mode_id:
+        snapshot["currentModeId"] = active.current_mode_id
+    if snapshot:
+        active.bridge._emit(StateSnapshotEvent(snapshot=snapshot))
 
     # Extract the last user message
     user_message = ""
@@ -122,7 +183,6 @@ async def ag_ui_run(body: RunAgentInput, request: Request):
             media_type="text/event-stream",
         )
 
-    # Get the event queue and stream it
     queue = manager.get_event_queue(thread_id, actual_run_id)
     if queue is None:
         return StreamingResponse(
@@ -130,8 +190,16 @@ async def ag_ui_run(body: RunAgentInput, request: Request):
             media_type="text/event-stream",
         )
 
+    return _sse_response(queue, thread_id, manager)
+
+
+def _sse_response(queue: asyncio.Queue, thread_id: str, manager: Any) -> StreamingResponse:
+    """Build a StreamingResponse with the cancel-on-disconnect callback."""
+    async def _on_disconnect() -> None:
+        await manager.cancel_run(thread_id)
+
     return StreamingResponse(
-        event_stream(queue, thread_id),
+        event_stream(queue, thread_id, on_cancel=_on_disconnect),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

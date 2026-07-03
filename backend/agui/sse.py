@@ -2,7 +2,7 @@
 
 import asyncio
 import logging
-from typing import AsyncGenerator
+from typing import Any, AsyncGenerator, Awaitable, Callable
 
 from backend.agui.events import AguiEventType, BaseAguiEvent
 
@@ -15,8 +15,19 @@ def encode_sse_event(event: BaseAguiEvent) -> str:
 
 
 async def event_stream(
-    queue: asyncio.Queue, task_id: str, timeout: float = 30.0
+    queue: asyncio.Queue,
+    task_id: str,
+    timeout: float = 30.0,
+    on_cancel: Callable[[], Awaitable[Any]] | None = None,
 ) -> AsyncGenerator[str, None]:
+    """Drain AG-UI events from ``queue`` as SSE.
+
+    Terminates after ``RUN_FINISHED`` / ``RUN_ERROR`` (clean end-of-run).
+    On ``CancelledError`` (client disconnect), calls ``on_cancel`` so the
+    ACP turn is cancelled instead of orphaned. A normal interrupt-suspend
+    stops via a clean ``RUN_FINISHED`` return — NOT a ``CancelledError`` —
+    so interrupts are never mistaken for cancels.
+    """
     logger.info("SSE stream started for task %s", task_id)
 
     while True:
@@ -29,7 +40,12 @@ async def event_stream(
         except asyncio.TimeoutError:
             yield ": keepalive\n\n"
         except asyncio.CancelledError:
-            logger.info("SSE stream cancelled for task %s", task_id)
+            logger.info("SSE stream cancelled (client disconnect) for task %s", task_id)
+            if on_cancel is not None:
+                try:
+                    await on_cancel()
+                except Exception:
+                    logger.exception("on_cancel callback failed for task %s", task_id)
             return
         except Exception:
             logger.exception("SSE stream error for task %s", task_id)

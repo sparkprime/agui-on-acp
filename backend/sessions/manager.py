@@ -17,7 +17,6 @@ import acp
 from backend.bridge.acp_to_agui import AcpToAguiBridge
 from backend.agent.acp_protocol import AcpProtocol
 from backend.agent.runner import AgentRunner
-from backend.policy.tool_policy import ToolPolicyEngine
 from backend.sessions.store import SessionStore
 
 logger = logging.getLogger(__name__)
@@ -56,8 +55,7 @@ class SessionManager:
         agent_command: list[str] | None = None,
     ) -> ActiveSession:
         # Create the bridge (satisfies acp.Client Protocol) before spawning
-        policy = ToolPolicyEngine(workspace_cwd=cwd)
-        bridge = AcpToAguiBridge(task_id, policy)
+        bridge = AcpToAguiBridge(task_id)
         bridge._cwd = cwd
 
         # Spawn the agent using the SDK via our runner
@@ -202,13 +200,59 @@ class SessionManager:
             return None
         return active.event_queues.get(run_id)
 
-    async def approve(self, task_id: str, call_id: str, approved: bool, option_id: str | None = None) -> None:
+    async def resume_run(self, task_id: str, resume_entries: list[dict[str, Any]]) -> str:
+        """Resume a prompt task suspended at a permission interrupt.
+
+        Creates a new queue + run id, re-attaches the bridge sink to it (emits
+        RUN_STARTED without resetting tool-call state), then resolves the
+        parked permission Future(s) from the resume entries. The prompt task
+        wakes from ``await future`` and continues emitting into the new queue.
+
+        Returns the new run_id. Raises ``KeyError`` if the session is unknown
+        or ``ValueError`` if there are no pending interrupts to resume.
+        """
         active = self._get_active(task_id)
-        # Resolve the permission future in the bridge
-        active.bridge.resolve_permission(call_id, approved, option_id)
+        run_id = str(uuid.uuid4())
+
+        queue: asyncio.Queue = asyncio.Queue()
+        active.event_queues[run_id] = queue
+        active.current_run_id = run_id
+
+        pending = active.bridge.pending_interrupt_ids()
+        if not pending:
+            raise ValueError(f"No pending interrupts for task {task_id}")
+
+        # Re-attach the stream BEFORE resolving futures so events emitted by
+        # the woken prompt task land in the new queue, not the nulled one.
+        active.bridge.attach_resume_queue(run_id, queue)
+
+        # Resolve each resume entry against its parked future.
+        for entry in resume_entries:
+            interrupt_id = entry.get("interruptId", "")
+            status = entry.get("status", "")
+            payload = entry.get("payload")
+            if status == "cancelled":
+                active.bridge.resolve_permission(interrupt_id, approved=False)
+            else:
+                # payload may be a string (optionId), a dict with optionId,
+                # or None (default to "once").
+                if isinstance(payload, str):
+                    option_id = payload
+                elif isinstance(payload, dict):
+                    option_id = payload.get("optionId", "once")
+                else:
+                    option_id = "once"
+                active.bridge.resolve_permission(interrupt_id, approved=True, option_id=option_id)
+
+        await self._store.update(task_id, status="running")
+        return run_id
 
     async def cancel_run(self, task_id: str) -> None:
         active = self._get_active(task_id)
+        # Resolve any parked permission futures as cancelled so
+        # request_permission unblocks and the prompt task unwinds instead of
+        # hanging on a dead session.
+        active.bridge.cancel_all_permissions()
         active.protocol.cancel(active.agent_session_id)
         await self._store.update(task_id, status="idle")
 
