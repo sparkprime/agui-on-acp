@@ -1,4 +1,4 @@
-"""API type definitions for the ACP → AG-UI Bridge backend."""
+"""API type definitions for the AG-UI on ACP bridge."""
 
 from typing import Literal
 

@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 
 import aiosqlite
 
-from backend.sessions.types import TaskSummary
+from agui_on_acp.sessions.types import TaskSummary
 
 logger = logging.getLogger(__name__)
 

@@ -17,11 +17,11 @@ load_dotenv()
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from backend import __version__
-from backend.config import load_config
-from backend.types.api import HealthResponse
+from agui_on_acp import __version__
+from agui_on_acp.config import load_config
+from agui_on_acp.types.api import HealthResponse
 
-from backend.logging_config import setup_logging
+from agui_on_acp.logging_config import setup_logging
 setup_logging()
 logger = logging.getLogger(__name__)
 
@@ -47,12 +47,12 @@ async def lifespan(app: FastAPI):
 
     app.state.config = config
 
-    from backend.sessions.store import SessionStore
+    from agui_on_acp.sessions.store import SessionStore
     session_store = SessionStore(db_path=config.db_path)
     await session_store.initialize()
     app.state.session_store = session_store
 
-    from backend.sessions.manager import SessionManager
+    from agui_on_acp.sessions.manager import SessionManager
     session_manager = SessionManager(session_store, agent_command=config.agent_command)
     app.state.session_manager = session_manager
 
@@ -85,10 +85,10 @@ async def health_check() -> HealthResponse:
     return HealthResponse(status="ok", version=__version__, project=config.project_name)
 
 
-from backend.sessions.routes import router as sessions_router
+from agui_on_acp.sessions.routes import router as sessions_router
 
 app.include_router(sessions_router, tags=["sessions"])
 
-from backend.agui_endpoint import router as agui_router
+from agui_on_acp.agui_endpoint import router as agui_router
 
 app.include_router(agui_router, tags=["ag-ui"])

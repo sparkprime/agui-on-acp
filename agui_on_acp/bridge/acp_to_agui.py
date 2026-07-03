@@ -26,7 +26,7 @@ from typing import Any
 import acp
 import acp.schema
 
-from backend.agui.events import (
+from agui_on_acp.agui.events import (
     AguiEventType,
     BaseAguiEvent,
     CustomEvent,

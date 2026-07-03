@@ -219,13 +219,13 @@ ACP and AG-UI do not map one-to-one. These required a normalization layer:
 <summary>Project Structure</summary>
 
 ```
-├── backend/                    # Python FastAPI (the bridge)
+├── agui_on_acp/                # Python FastAPI bridge (the package)
 │   ├── agent/                  # ACP SDK integration (spawn + protocol)
 │   ├── bridge/                 # ACP → AG-UI event translation
 │   ├── agui/                   # AG-UI event types + SSE encoding
 │   ├── sessions/               # Session lifecycle, store, routes
-│   ├── api/                    # Side-channel REST (files, git)
 │   └── agui_endpoint.py        # POST /ag-ui (AG-UI standard endpoint)
+├── pyproject.toml              # Python package + entry point
 ├── docs/
 │   ├── architecture.md         # Detailed system design
 │   ├── integration-contract.md # REST + SSE API spec

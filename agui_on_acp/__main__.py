@@ -1,15 +1,15 @@
-"""Entry point for running the bridge with `python -m backend`."""
+"""Entry point for running the bridge with `python -m agui_on_acp`."""
 
 import uvicorn
 
-from backend.config import load_config
+from agui_on_acp.config import load_config
 
 
 def main() -> None:
-    """Run the ACP → AG-UI bridge server."""
+    """Run the AG-UI on ACP bridge server."""
     config = load_config()
     uvicorn.run(
-        "backend.main:app",
+        "agui_on_acp.main:app",
         host="0.0.0.0",
         port=config.backend_port,
         reload=True,

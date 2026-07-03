@@ -15,11 +15,11 @@ Your job is to help debug protocol translation issues — when ACP events from a
 
 - ACP uses JSON-RPC 2.0 over stdio (notifications like `agent_message_chunk`, `tool_call`, `tool_call_update`, `turn_end`, `request_permission`)
 - AG-UI uses typed SSE events (`TEXT_MESSAGE_START`, `TEXT_MESSAGE_CONTENT`, `TOOL_CALL_START`, `TOOL_CALL_ARGS`, `TOOL_CALL_END`, `TOOL_CALL_RESULT`, `RUN_FINISHED` (with optional interrupt outcome), `STATE_UPDATE`, `STATE_SNAPSHOT`, `CUSTOM`)
-- The bridge code lives in `backend/bridge/acp_to_agui.py`
-- Agent runner is in `backend/agent/runner.py`
-- ACP protocol handling is in `backend/agent/acp_protocol.py`
-- AG-UI events are defined in `backend/agui/events.py`
-- SSE encoding is in `backend/agui/sse.py`
+- The bridge code lives in `agui_on_acp/bridge/acp_to_agui.py`
+- Agent runner is in `agui_on_acp/agent/runner.py`
+- ACP protocol handling is in `agui_on_acp/agent/acp_protocol.py`
+- AG-UI events are defined in `agui_on_acp/agui/events.py`
+- SSE encoding is in `agui_on_acp/agui/sse.py`
 
 ## Debugging approach
 

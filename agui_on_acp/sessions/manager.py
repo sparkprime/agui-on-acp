@@ -14,10 +14,10 @@ from typing import Any
 
 import acp
 
-from backend.bridge.acp_to_agui import AcpToAguiBridge
-from backend.agent.acp_protocol import AcpProtocol
-from backend.agent.runner import AgentRunner
-from backend.sessions.store import SessionStore
+from agui_on_acp.bridge.acp_to_agui import AcpToAguiBridge
+from agui_on_acp.agent.acp_protocol import AcpProtocol
+from agui_on_acp.agent.runner import AgentRunner
+from agui_on_acp.sessions.store import SessionStore
 
 logger = logging.getLogger(__name__)
 

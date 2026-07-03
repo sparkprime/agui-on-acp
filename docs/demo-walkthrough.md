@@ -51,7 +51,7 @@ That's it. No code changes. No different endpoints. No different frontend. One l
 ### Step 1: Start the bridge
 
 ```bash
-PYTHONPATH=. python -m uvicorn backend.main:app --port 8111
+PYTHONPATH=. python -m uvicorn agui_on_acp.main:app --port 8111
 ```
 
 Output:
@@ -328,7 +328,7 @@ Browser receives SSE event
 cd open-source
 
 # Test with Kiro CLI (default config)
-PYTHONPATH=. uvicorn backend.main:app --port 8000 &
+PYTHONPATH=. uvicorn agui_on_acp.main:app --port 8000 &
 
 curl -X POST http://localhost:8000/v2/tasks \
   -H "Content-Type: application/json" \

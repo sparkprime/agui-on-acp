@@ -10,8 +10,8 @@ import uuid
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
-from backend.agui.sse import event_stream
-from backend.sessions.types import (
+from agui_on_acp.agui.sse import event_stream
+from agui_on_acp.sessions.types import (
     CreateTaskRequest,
     CreateTaskResponse,
     ExecuteCommandRequest,

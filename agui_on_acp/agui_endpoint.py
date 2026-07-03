@@ -22,8 +22,8 @@ from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from backend.agui.events import StateSnapshotEvent
-from backend.agui.sse import event_stream
+from agui_on_acp.agui.events import StateSnapshotEvent
+from agui_on_acp.agui.sse import event_stream
 
 logger = logging.getLogger(__name__)
 

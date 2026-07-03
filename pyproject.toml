@@ -3,13 +3,13 @@ requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-where = [".."]
-include = ["backend*"]
+where = ["."]
+include = ["agui_on_acp*"]
 
 [project]
-name = "acp-to-agui"
+name = "agui-on-acp"
 version = "0.1.0"
-description = "ACP → AG-UI Bridge: Give any ACP-compatible coding agent a rich web UI"
+description = "AG-UI on ACP — a protocol translator that exposes any ACP-compatible coding agent over the standard AG-UI event stream"
 requires-python = ">=3.11"
 
 dependencies = [
@@ -30,4 +30,4 @@ dev = [
 ]
 
 [project.scripts]
-acp-to-agui = "backend.__main__:main"
+agui-on-acp = "agui_on_acp.__main__:main"

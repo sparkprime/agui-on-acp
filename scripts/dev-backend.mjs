@@ -14,7 +14,7 @@ const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const reloadFlag = process.platform === "win32" ? [] : ["--reload"];
 
 const args = [
-  "backend.main:app",
+  "agui_on_acp.main:app",
   ...reloadFlag,
   "--port", "9001",
   "--log-level", "info",

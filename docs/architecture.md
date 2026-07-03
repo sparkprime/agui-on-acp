@@ -48,19 +48,17 @@
 
 | Module | Path | Description |
 |--------|------|-------------|
-| Main | `backend/main.py` | FastAPI app, lifespan, router setup |
-| Config | `backend/config.py` | Bridge config loader (`bridge.config.json`) |
-| Agent Runner | `backend/agent/runner.py` | Subprocess management (parameterized command) |
-| ACP Protocol | `backend/agent/acp_protocol.py` | Typed JSON-RPC interface |
-| Bridge | `backend/bridge/acp_to_agui.py` | ACP notification → AG-UI event translator (interrupt/resume HITL) |
-| AG-UI Events | `backend/agui/events.py` | Pydantic event type models (incl. Interrupt, InterruptOutcome) |
-| SSE Encoder | `backend/agui/sse.py` | SSE stream encoding (cancel-on-disconnect) |
-| Session Manager | `backend/sessions/manager.py` | Session lifecycle orchestration (start_run, resume_run, cancel_run) |
-| Session Store | `backend/sessions/store.py` | SQLite-backed persistence |
-| Session Routes | `backend/sessions/routes.py` | REST API endpoints (/v2/*) |
-| AG-UI Endpoint | `backend/agui_endpoint.py` | Standard POST /ag-ui (fresh + resume routing) |
-| Files API | `backend/api/files.py` | File system operations |
-| Git API | `backend/api/git.py` | Git operation endpoints |
+| Main | `agui_on_acp/main.py` | FastAPI app, lifespan, router setup |
+| Config | `agui_on_acp/config.py` | Bridge config loader (`bridge.config.json`) |
+| Agent Runner | `agui_on_acp/agent/runner.py` | Subprocess management (parameterized command) |
+| ACP Protocol | `agui_on_acp/agent/acp_protocol.py` | Typed JSON-RPC interface |
+| Bridge | `agui_on_acp/bridge/acp_to_agui.py` | ACP notification → AG-UI event translator (interrupt/resume HITL) |
+| AG-UI Events | `agui_on_acp/agui/events.py` | Pydantic event type models (incl. Interrupt, InterruptOutcome) |
+| SSE Encoder | `agui_on_acp/agui/sse.py` | SSE stream encoding (cancel-on-disconnect) |
+| Session Manager | `agui_on_acp/sessions/manager.py` | Session lifecycle orchestration (start_run, resume_run, cancel_run) |
+| Session Store | `agui_on_acp/sessions/store.py` | SQLite-backed persistence |
+| Session Routes | `agui_on_acp/sessions/routes.py` | REST API endpoints (/v2/*) |
+| AG-UI Endpoint | `agui_on_acp/agui_endpoint.py` | Standard POST /ag-ui (fresh + resume routing) |
 
 ## Data Flow
 

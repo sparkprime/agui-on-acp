@@ -4,7 +4,7 @@ import asyncio
 import logging
 from typing import Any, AsyncGenerator, Awaitable, Callable
 
-from backend.agui.events import AguiEventType, BaseAguiEvent
+from agui_on_acp.agui.events import AguiEventType, BaseAguiEvent
 
 logger = logging.getLogger(__name__)
 
