@@ -46,6 +46,10 @@ class SessionManager:
         self._sessions: dict[str, ActiveSession] = {}
         self._agent_command = agent_command or ["kiro-cli", "acp"]
 
+    @property
+    def store(self) -> SessionStore:
+        return self._store
+
     async def create_task(
         self,
         task_id: str,

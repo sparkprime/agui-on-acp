@@ -21,13 +21,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
+from typing import Any
 
 import httpx
 import pytest
 
+from agui_on_acp.sessions.manager import SessionManager
 from tests.fake_agent import (
-    Script,
+    FakeAcpAgent,
     end_turn,
     ext_notification,
     request_permission,
@@ -44,10 +45,10 @@ def _agui_body(
     *,
     thread_id: str = "t1",
     content: str = "hello",
-    forwarded_props: dict | None = None,
-    resume: list[dict] | None = None,
-) -> dict:
-    body: dict = {
+    forwarded_props: dict[str, Any] | None = None,
+    resume: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    body: dict[str, Any] = {
         "threadId": thread_id,
         "runId": "r1",
         "messages": [{"role": "user", "id": "u1", "content": content}],
@@ -65,11 +66,11 @@ def _agui_body(
 
 @pytest.mark.asyncio
 async def test_text_turn_streams_start_content_end_then_finished(
-    fake_agent, http_client: httpx.AsyncClient
+    fake_agent: FakeAcpAgent, http_client: httpx.AsyncClient
 ):
     """A simple agent text turn maps to TEXT_MESSAGE_START / CONTENT / END +
     RUN_FINISHED with no interrupt outcome."""
-    fake_agent._script = [
+    fake_agent.script = [
         text("hello "),
         text("world"),
         end_turn(),
@@ -113,12 +114,12 @@ async def test_text_turn_streams_start_content_end_then_finished(
 
 @pytest.mark.asyncio
 async def test_tool_call_emits_start_args_end_and_result(
-    fake_agent, http_client: httpx.AsyncClient
+    fake_agent: FakeAcpAgent, http_client: httpx.AsyncClient
 ):
     """ToolCallStart/Progress/completed maps to TOOL_CALL_START, TOOL_CALL_ARGS,
     TOOL_CALL_END, and the TOOL_CALL_RESULT event CopilotKit needs to flip
     the renderer to complete."""
-    fake_agent._script = [
+    fake_agent.script = [
         tool_start("tc1", title="read file", kind="read", raw_input={"path": "/a"}),
         tool_progress("tc1", status="in_progress"),
         tool_end("tc1", status="completed", raw_output={"output": "file-contents"}),
@@ -150,13 +151,13 @@ async def test_tool_call_emits_start_args_end_and_result(
 
 @pytest.mark.asyncio
 async def test_permission_request_interrupts_run_then_resume_resolves(
-    fake_agent, http_client: httpx.AsyncClient
+    fake_agent: FakeAcpAgent, http_client: httpx.AsyncClient
 ):
     """A ``request_permission`` mid-turn emits a
     ``RUN_FINISHED{outcome:interrupt}``, parks the prompt task, and a
     subsequent resume run re-attaches the stream and resolves the
     permission so the prompt continues."""
-    fake_agent._script = [
+    fake_agent.script = [
         text("before-approval"),
         request_permission("perm1", title="run bash"),
         text("after-approval"),
@@ -209,11 +210,11 @@ async def test_permission_request_interrupts_run_then_resume_resolves(
 
 @pytest.mark.asyncio
 async def test_permission_resume_cancelled_replies_cancelled_to_acp(
-    fake_agent, http_client: httpx.AsyncClient
+    fake_agent: FakeAcpAgent, http_client: httpx.AsyncClient
 ):
     """A resume with status "cancelled" resolves the ACP permission as
     ``cancelled`` (ACP's DeniedOutcome), not ``selected``."""
-    fake_agent._script = [
+    fake_agent.script = [
         request_permission("perm1"),
         end_turn(),
     ]
@@ -230,12 +231,12 @@ async def test_permission_resume_cancelled_replies_cancelled_to_acp(
 
 @pytest.mark.asyncio
 async def test_resume_with_no_pending_interrupt_yields_run_error(
-    fake_agent, http_client: httpx.AsyncClient
+    fake_agent: FakeAcpAgent, http_client: httpx.AsyncClient
 ):
     """A resume run for a session with no parked permission surfaces a
     RUN_ERROR rather than hanging on an empty stream."""
     # First do a normal turn so the session exists, then send a resume.
-    fake_agent._script = [text("hi"), end_turn()]
+    fake_agent.script = [text("hi"), end_turn()]
     async with http_client.stream("POST", "/ag-ui", json=_agui_body()) as resp:
         await read_sse_events(resp)
 
@@ -266,12 +267,12 @@ async def test_resume_for_unknown_session_yields_run_error(
 
 @pytest.mark.asyncio
 async def test_permission_future_expires_when_no_resume_arrives(
-    fake_agent, http_client: httpx.AsyncClient
+    fake_agent: FakeAcpAgent, http_client: httpx.AsyncClient
 ):
     """If no resume ever arrives, the parked permission Future expires
     (TTL) and resolves with ``cancelled`` so the prompt task unwinds
     instead of hanging forever (leaking the ACP subprocess)."""
-    fake_agent._script = [
+    fake_agent.script = [
         request_permission("perm1"),
         end_turn(),
     ]
@@ -293,7 +294,9 @@ async def test_permission_future_expires_when_no_resume_arrives(
 
 @pytest.mark.asyncio
 async def test_client_disconnect_triggers_acp_cancel(
-    fake_agent, session_manager, http_client: httpx.AsyncClient
+    fake_agent: FakeAcpAgent,
+    session_manager: SessionManager,
+    http_client: httpx.AsyncClient,
 ):
     """When the AG-UI client disconnects mid-run (CancelledError on the SSE
     generator), the bridge calls ``session/cancel`` on the ACP agent and
@@ -307,7 +310,7 @@ async def test_client_disconnect_triggers_acp_cancel(
     delivers on a real socket close."""
     from agui_on_acp.agui.sse import event_stream
 
-    fake_agent._script = [
+    fake_agent.script = [
         text("streaming..."),
         sleep(10.0),  # hold the turn open so we can disconnect mid-stream
         end_turn(),
@@ -345,11 +348,11 @@ async def test_client_disconnect_triggers_acp_cancel(
 
 @pytest.mark.asyncio
 async def test_cancel_while_suspended_resolves_permission_cancelled(
-    fake_agent, http_client: httpx.AsyncClient
+    fake_agent: FakeAcpAgent, http_client: httpx.AsyncClient
 ):
     """Cancelling a run while it's suspended at a permission interrupt
     resolves the parked Future as cancelled and sends ``session/cancel``."""
-    fake_agent._script = [
+    fake_agent.script = [
         request_permission("perm1"),
         end_turn(),
     ]
@@ -373,11 +376,11 @@ async def test_cancel_while_suspended_resolves_permission_cancelled(
 
 @pytest.mark.asyncio
 async def test_kiro_dev_notification_becomes_custom_event(
-    fake_agent, http_client: httpx.AsyncClient
+    fake_agent: FakeAcpAgent, http_client: httpx.AsyncClient
 ):
     """A ``_kiro.dev/*`` ext notification mid-turn is translated to an
     AG-UI CUSTOM event with a mapped name."""
-    fake_agent._script = [
+    fake_agent.script = [
         ext_notification("_kiro.dev/metadata", foo="bar"),
         end_turn(),
     ]
@@ -391,7 +394,7 @@ async def test_kiro_dev_notification_becomes_custom_event(
 
 @pytest.mark.asyncio
 async def test_pre_run_notification_is_buffered_then_flushed(
-    fake_agent, http_client: httpx.AsyncClient
+    fake_agent: FakeAcpAgent, http_client: httpx.AsyncClient
 ):
     """An ext notification that arrives before any run starts is buffered
     and flushed as a CUSTOM event when the first run begins (so session-init
@@ -399,7 +402,7 @@ async def test_pre_run_notification_is_buffered_then_flushed(
     # Drive the notification before the run by poking the agent directly:
     # the FakeAcpAgent only runs its script during prompt(), so to test the
     # buffer path we send a notification as a preamble step.
-    fake_agent._script = [
+    fake_agent.script = [
         ext_notification("_kiro.dev/mcp/server_initialized", id="srv1"),
         text("hi"),
         end_turn(),
@@ -417,15 +420,15 @@ async def test_pre_run_notification_is_buffered_then_flushed(
 
 @pytest.mark.asyncio
 async def test_state_snapshot_advertises_modes(
-    fake_agent, http_client: httpx.AsyncClient
+    fake_agent: FakeAcpAgent, http_client: httpx.AsyncClient
 ):
     """When the agent reports modes in new_session, the bridge emits a
     STATE_SNAPSHOT carrying them so the UI can populate selectors."""
-    fake_agent._modes = [
+    fake_agent.modes = [
         {"id": "build", "name": "Build"},
         {"id": "plan", "name": "Plan"},
     ]
-    fake_agent._script = [text("hi"), end_turn()]
+    fake_agent.script = [text("hi"), end_turn()]
     async with http_client.stream("POST", "/ag-ui", json=_agui_body()) as resp:
         events = await read_sse_events(resp)
     snaps = [e for e in events if e["type"] == "STATE_SNAPSHOT"]
@@ -438,12 +441,12 @@ async def test_state_snapshot_advertises_modes(
 
 @pytest.mark.asyncio
 async def test_forwarded_props_mode_and_model_are_applied(
-    fake_agent, http_client: httpx.AsyncClient
+    fake_agent: FakeAcpAgent, http_client: httpx.AsyncClient
 ):
     """``forwardedProps.mode`` / ``forwardedProps.model`` from the AG-UI
     client are translated to ACP ``session/set_mode`` / ``session/set_model``
     before the prompt runs."""
-    fake_agent._script = [text("hi"), end_turn()]
+    fake_agent.script = [text("hi"), end_turn()]
     body = _agui_body(
         forwarded_props={"cwd": "/tmp/opencode", "mode": "plan", "model": "gpt-x"}
     )
@@ -477,7 +480,7 @@ async def test_no_user_message_yields_run_error(
 
 @pytest.mark.asyncio
 async def test_prompt_exception_becomes_run_error(
-    fake_agent, http_client: httpx.AsyncClient
+    fake_agent: FakeAcpAgent, http_client: httpx.AsyncClient
 ):
     """If the agent's prompt raises, the bridge emits RUN_ERROR (not a
     hanging stream)."""

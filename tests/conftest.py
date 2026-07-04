@@ -42,12 +42,12 @@ import agui_on_acp.bridge.acp_to_agui as _bridge_mod
 from agui_on_acp.main import app as fastapi_app
 from agui_on_acp.sessions.manager import SessionManager
 from agui_on_acp.sessions.store import SessionStore
-from tests.fake_agent import FakeAcpAgent, Script
+from tests.fake_agent import FakeAcpAgent
 from tests.transport import TransportPair, make_transport_pair
 
 
 @pytest.fixture(autouse=True)
-def _short_permission_ttl() -> Iterator[None]:
+def short_permission_ttl() -> Iterator[None]:
     """Shrink the parked-future TTL for tests; restore afterwards."""
     original = _bridge_mod.PERMISSION_TTL_SECONDS
     _bridge_mod.PERMISSION_TTL_SECONDS = 2.0
@@ -110,7 +110,7 @@ def _patch_runner_spawn(agent: FakeAcpAgent) -> None:
         # requests into client_writer (which feeds the agent's reader) and
         # READS responses from client_reader (which the agent's writer feeds).
         conn = ClientSideConnection(
-            client, agent._transport.client_writer, agent._transport.client_reader
+            client, agent.transport.client_writer, agent.transport.client_reader
         )
         self.conn = conn
 
@@ -121,7 +121,6 @@ def _patch_runner_spawn(agent: FakeAcpAgent) -> None:
             returncode: int | None = None
 
         self.process = _FakeProc()  # type: ignore[assignment]
-        self._context_manager = None
         return conn
 
     async def _fake_kill(self: AgentRunner) -> None:
@@ -164,7 +163,7 @@ async def http_client(
     session_manager: SessionManager,
 ) -> AsyncIterator[httpx.AsyncClient]:
     fastapi_app.state.session_manager = session_manager
-    fastapi_app.state.session_store = session_manager._store
+    fastapi_app.state.session_store = session_manager.store
     transport = ASGITransport(app=fastapi_app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         yield client

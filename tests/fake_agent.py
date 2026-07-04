@@ -39,7 +39,7 @@ import asyncio
 import logging
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Literal, Union
+from typing import Any, Union, cast
 
 import acp
 import acp.schema as schema
@@ -77,7 +77,7 @@ class ToolProgressStep:
     """Emit ``ToolCallProgress`` — status/output update, no terminal status."""
 
     tool_call_id: str
-    status: str | None = None
+    status: schema.ToolCallStatus | None = None
     raw_output: Any = None
 
 
@@ -86,7 +86,7 @@ class ToolEndStep:
     """Emit ``ToolCallProgress`` with completed/failed status + raw_output."""
 
     tool_call_id: str
-    status: str = "completed"
+    status: schema.ToolCallStatus = "completed"
     raw_output: Any = None
 
 
@@ -115,14 +115,14 @@ class ExtNotificationStep:
     """Send a vendor-extension notification (e.g. ``_kiro.dev/metadata``)."""
 
     method: str
-    params: dict[str, Any] = field(default_factory=dict)
+    params: dict[str, Any] = field(default_factory=dict[str, Any])
 
 
 @dataclass
 class EndTurnStep:
     """Return from ``prompt`` with the given stop reason."""
 
-    stop_reason: str = "end_turn"
+    stop_reason: schema.StopReason = "end_turn"
 
 
 @dataclass
@@ -172,7 +172,7 @@ def ext_notification(method: str, **params: Any) -> ExtNotificationStep:
     return ExtNotificationStep(method=method, params=dict(params))
 
 
-def end_turn(stop_reason: str = "end_turn") -> EndTurnStep:
+def end_turn(stop_reason: schema.StopReason = "end_turn") -> EndTurnStep:
     return EndTurnStep(stop_reason=stop_reason)
 
 
@@ -212,8 +212,8 @@ class FakeAcpAgent:
     """
 
     def __init__(self, transport: TransportPair, script: Script | None = None) -> None:
-        self._transport = transport
-        self._script: Script = list(script or [])
+        self.transport = transport
+        self.script: Script = list(script or [])
         self.conn: acp.AgentSideConnection | None = None
 
         # Recorded calls
@@ -232,7 +232,7 @@ class FakeAcpAgent:
 
         # Per-session state we expose to the bridge's new_session response.
         self._session_id = "fake-session-1"
-        self._modes: list[dict[str, Any]] | None = None
+        self.modes: list[dict[str, Any]] | None = None
         self._models: list[dict[str, Any]] | None = None
 
         # The currently-running prompt task, so tests can await it.
@@ -261,8 +261,8 @@ class FakeAcpAgent:
         # method_not_found before the fake's handler ever runs.
         self.conn = AgentSideConnection(
             self,
-            self._transport.agent_writer,
-            self._transport.agent_reader,
+            self.transport.agent_writer,
+            self.transport.agent_reader,
             use_unstable_protocol=True,
         )
         return self.conn
@@ -314,12 +314,13 @@ class FakeAcpAgent:
             }
         )
         resp_kwargs: dict[str, Any] = {"session_id": self._session_id}
-        if self._modes is not None:
+        if self.modes is not None:
+            modes = self.modes
             resp_kwargs["modes"] = schema.SessionModeState(
                 available_modes=[
-                    schema.SessionMode(id=m["id"], name=m["name"]) for m in self._modes
+                    schema.SessionMode(id=m["id"], name=m["name"]) for m in modes
                 ],
-                current_mode_id=self._modes[0]["id"] if self._modes else None,
+                current_mode_id=str(modes[0]["id"]) if modes else "",
             )
         return schema.NewSessionResponse(**resp_kwargs)
 
@@ -411,11 +412,11 @@ class FakeAcpAgent:
 
     # ── Script runner ───────────────────────────────────────────────────
 
-    async def _run_script(self, session_id: str) -> str:
+    async def _run_script(self, session_id: str) -> schema.StopReason:
         """Walk the script, emitting each step through the AgentSideConnection."""
         assert self.conn is not None, "FakeAcpAgent.attach() not called"
-        stop_reason = "end_turn"
-        for step in self._script:
+        stop_reason: schema.StopReason = "end_turn"
+        for step in self.script:
             if isinstance(step, TextStep):
                 await self.conn.session_update(
                     session_id,
@@ -461,10 +462,9 @@ class FakeAcpAgent:
             elif isinstance(step, EndTurnStep):
                 stop_reason = step.stop_reason
                 break
-            elif isinstance(step, SleepStep):
-                await asyncio.sleep(step.seconds)
             else:
-                raise TypeError(f"unknown script step: {step!r}")
+                assert isinstance(step, SleepStep), f"unknown script step: {step!r}"
+                await asyncio.sleep(step.seconds)
         return stop_reason
 
     def _build_tool_call_start(self, step: ToolStartStep) -> schema.ToolCallStart:
@@ -487,7 +487,7 @@ class FakeAcpAgent:
         self,
         tool_call_id: str,
         *,
-        status: str | None = None,
+        status: schema.ToolCallStatus | None = None,
         raw_input: Any = None,
         raw_output: Any = None,
     ) -> schema.ToolCallProgress:
@@ -514,13 +514,14 @@ class FakeAcpAgent:
             session_id=session_id,
             tool_call=tool_call,
         )
-        raw_outcome = getattr(resp, "outcome", resp)
+        raw_outcome: Any = getattr(resp, "outcome", resp)
         # Serialize the pydantic AllowedOutcome/DeniedOutcome to a plain dict
         # so tests can do ``reply.outcome["outcome"]`` without import fuss.
+        outcome_dict: dict[str, Any]
         if hasattr(raw_outcome, "model_dump"):
             outcome_dict = raw_outcome.model_dump(by_alias=True, mode="json")
         elif isinstance(raw_outcome, dict):
-            outcome_dict = raw_outcome
+            outcome_dict = cast(dict[str, Any], raw_outcome)
         else:
             outcome_dict = {"outcome": str(raw_outcome)}
         self.permission_replies.append(
