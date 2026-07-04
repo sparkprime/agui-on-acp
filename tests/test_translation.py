@@ -62,6 +62,7 @@ def _agui_body(
 # Basic text turn
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_text_turn_streams_start_content_end_then_finished(
     fake_agent, http_client: httpx.AsyncClient
@@ -85,8 +86,7 @@ async def test_text_turn_streams_start_content_end_then_finished(
     # Every CONTENT falls between START and END.
     assert start_idx < end_idx
     assert all(
-        types[i] == "TEXT_MESSAGE_CONTENT"
-        for i in range(start_idx + 1, end_idx)
+        types[i] == "TEXT_MESSAGE_CONTENT" for i in range(start_idx + 1, end_idx)
     )
     assert types[-1] == "RUN_FINISHED"
 
@@ -109,6 +109,7 @@ async def test_text_turn_streams_start_content_end_then_finished(
 # ─────────────────────────────────────────────────────────────────────────────
 # Tool call lifecycle
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_tool_call_emits_start_args_end_and_result(
@@ -145,6 +146,7 @@ async def test_tool_call_emits_start_args_end_and_result(
 # ─────────────────────────────────────────────────────────────────────────────
 # Interrupt / resume — the core impedance-mismatch fix
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_permission_request_interrupts_run_then_resume_resolves(
@@ -218,9 +220,7 @@ async def test_permission_resume_cancelled_replies_cancelled_to_acp(
     async with http_client.stream("POST", "/ag-ui", json=_agui_body()) as resp:
         await read_until(resp, {"RUN_FINISHED"})
 
-    resume_body = _agui_body(
-        resume=[{"interruptId": "perm1", "status": "cancelled"}]
-    )
+    resume_body = _agui_body(resume=[{"interruptId": "perm1", "status": "cancelled"}])
     async with http_client.stream("POST", "/ag-ui", json=resume_body) as resp:
         await read_sse_events(resp)
 
@@ -263,6 +263,7 @@ async def test_resume_for_unknown_session_yields_run_error(
 # Permission TTL expiry (resume never arrives)
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_permission_future_expires_when_no_resume_arrives(
     fake_agent, http_client: httpx.AsyncClient
@@ -289,6 +290,7 @@ async def test_permission_future_expires_when_no_resume_arrives(
 # Cancel / disconnect
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_client_disconnect_triggers_acp_cancel(
     fake_agent, session_manager, http_client: httpx.AsyncClient
@@ -312,14 +314,18 @@ async def test_client_disconnect_triggers_acp_cancel(
     ]
     # Create the session + run via the manager (same path the endpoint takes).
     await session_manager.create_task(task_id="t1", cwd="/tmp/opencode")
-    run_id = await session_manager.start_run("t1", {"messages": [{"role": "user", "content": "hi"}]})
+    run_id = await session_manager.start_run(
+        "t1", {"messages": [{"role": "user", "content": "hi"}]}
+    )
     queue = session_manager.get_event_queue("t1", run_id)
     assert queue is not None
 
     async def _consume() -> list[str]:
         chunks: list[str] = []
         async for chunk in event_stream(
-            queue, "t1", timeout=2.0,
+            queue,
+            "t1",
+            timeout=2.0,
             on_cancel=lambda: session_manager.cancel_run("t1"),
         ):
             chunks.append(chunk)
@@ -364,6 +370,7 @@ async def test_cancel_while_suspended_resolves_permission_cancelled(
 # Extension notifications → CUSTOM events
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_kiro_dev_notification_becomes_custom_event(
     fake_agent, http_client: httpx.AsyncClient
@@ -407,13 +414,17 @@ async def test_pre_run_notification_is_buffered_then_flushed(
 # Modes / models snapshot
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_state_snapshot_advertises_modes(
     fake_agent, http_client: httpx.AsyncClient
 ):
     """When the agent reports modes in new_session, the bridge emits a
     STATE_SNAPSHOT carrying them so the UI can populate selectors."""
-    fake_agent._modes = [{"id": "build", "name": "Build"}, {"id": "plan", "name": "Plan"}]
+    fake_agent._modes = [
+        {"id": "build", "name": "Build"},
+        {"id": "plan", "name": "Plan"},
+    ]
     fake_agent._script = [text("hi"), end_turn()]
     async with http_client.stream("POST", "/ag-ui", json=_agui_body()) as resp:
         events = await read_sse_events(resp)
@@ -433,7 +444,9 @@ async def test_forwarded_props_mode_and_model_are_applied(
     client are translated to ACP ``session/set_mode`` / ``session/set_model``
     before the prompt runs."""
     fake_agent._script = [text("hi"), end_turn()]
-    body = _agui_body(forwarded_props={"cwd": "/tmp/opencode", "mode": "plan", "model": "gpt-x"})
+    body = _agui_body(
+        forwarded_props={"cwd": "/tmp/opencode", "mode": "plan", "model": "gpt-x"}
+    )
     async with http_client.stream("POST", "/ag-ui", json=body) as resp:
         await read_sse_events(resp)
     assert ("fake-session-1", "plan") in fake_agent.set_mode_calls
@@ -443,6 +456,7 @@ async def test_forwarded_props_mode_and_model_are_applied(
 # ─────────────────────────────────────────────────────────────────────────────
 # Error paths
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_no_user_message_yields_run_error(

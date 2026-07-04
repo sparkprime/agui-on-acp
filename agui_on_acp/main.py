@@ -12,6 +12,7 @@ if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
 from dotenv import load_dotenv
+
 load_dotenv()
 
 from fastapi import FastAPI
@@ -19,9 +20,9 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from agui_on_acp import __version__
 from agui_on_acp.config import load_config
+from agui_on_acp.logging_config import setup_logging
 from agui_on_acp.types.api import HealthResponse
 
-from agui_on_acp.logging_config import setup_logging
 setup_logging()
 logger = logging.getLogger(__name__)
 
@@ -48,11 +49,13 @@ async def lifespan(app: FastAPI):
     app.state.config = config
 
     from agui_on_acp.sessions.store import SessionStore
+
     session_store = SessionStore(db_path=config.db_path)
     await session_store.initialize()
     app.state.session_store = session_store
 
     from agui_on_acp.sessions.manager import SessionManager
+
     session_manager = SessionManager(session_store, agent_command=config.agent_command)
     app.state.session_manager = session_manager
 

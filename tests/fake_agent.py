@@ -53,33 +53,42 @@ __all__ = ["FakeAcpAgent", "ScriptStep", "Script"]
 
 # ── Script step types ──────────────────────────────────────────────────────
 
+
 @dataclass
 class TextStep:
     """Emit a single agent text delta."""
+
     text: str
+
 
 @dataclass
 class ToolStartStep:
     """Emit ``ToolCallStart`` + ``ToolCallArgs`` for a new tool call."""
+
     tool_call_id: str
     title: str = "tool"
     kind: str | None = None
     raw_input: dict[str, Any] | None = None
     locations: list[dict[str, Any]] | None = None
 
+
 @dataclass
 class ToolProgressStep:
     """Emit ``ToolCallProgress`` — status/output update, no terminal status."""
+
     tool_call_id: str
     status: str | None = None
     raw_output: Any = None
 
+
 @dataclass
 class ToolEndStep:
     """Emit ``ToolCallProgress`` with completed/failed status + raw_output."""
+
     tool_call_id: str
     status: str = "completed"
     raw_output: Any = None
+
 
 @dataclass
 class RequestPermissionStep:
@@ -89,6 +98,7 @@ class RequestPermissionStep:
     the future, so the prompt task parks here exactly as a real agent
     would (the ACP prompt is one blocking call with a mid-turn callback).
     """
+
     tool_call_id: str
     title: str = "needs approval"
     options: list[dict[str, Any]] = field(
@@ -99,21 +109,28 @@ class RequestPermissionStep:
         ]
     )
 
+
 @dataclass
 class ExtNotificationStep:
     """Send a vendor-extension notification (e.g. ``_kiro.dev/metadata``)."""
+
     method: str
     params: dict[str, Any] = field(default_factory=dict)
+
 
 @dataclass
 class EndTurnStep:
     """Return from ``prompt`` with the given stop reason."""
+
     stop_reason: str = "end_turn"
+
 
 @dataclass
 class SleepStep:
     """Await ``asyncio.sleep(seconds)`` — used to test timing/races."""
+
     seconds: float
+
 
 ScriptStep = Union[
     TextStep,
@@ -130,26 +147,34 @@ Script = list[ScriptStep]
 
 # ── Convenience constructors (so tests read like a script) ────────────────
 
+
 def text(s: str) -> TextStep:
     return TextStep(s)
+
 
 def tool_start(tid: str, title: str = "tool", **kw: Any) -> ToolStartStep:
     return ToolStartStep(tool_call_id=tid, title=title, **kw)
 
+
 def tool_progress(tid: str, **kw: Any) -> ToolProgressStep:
     return ToolProgressStep(tool_call_id=tid, **kw)
+
 
 def tool_end(tid: str, **kw: Any) -> ToolEndStep:
     return ToolEndStep(tool_call_id=tid, **kw)
 
+
 def request_permission(tid: str, **kw: Any) -> RequestPermissionStep:
     return RequestPermissionStep(tool_call_id=tid, **kw)
+
 
 def ext_notification(method: str, **params: Any) -> ExtNotificationStep:
     return ExtNotificationStep(method=method, params=dict(params))
 
+
 def end_turn(stop_reason: str = "end_turn") -> EndTurnStep:
     return EndTurnStep(stop_reason=stop_reason)
+
 
 def sleep(seconds: float) -> SleepStep:
     return SleepStep(seconds)
@@ -157,16 +182,20 @@ def sleep(seconds: float) -> SleepStep:
 
 # ── The fake agent ─────────────────────────────────────────────────────────
 
+
 @dataclass
 class _PromptCall:
     """Record of a single prompt() invocation."""
+
     session_id: str
     prompt: list[Any]
     message_id: str | None
 
+
 @dataclass
 class _PermissionReply:
     """Record of a permission response received from the bridge."""
+
     tool_call_id: str
     outcome: dict[str, Any]
 
@@ -225,6 +254,7 @@ class FakeAcpAgent:
         in-process transport. Must be called inside a running event loop.
         """
         from acp import AgentSideConnection  # deprecated but the bridge uses it
+
         # use_unstable_protocol=True so set_session_model (marked unstable in
         # the ACP router) is accepted — models a real agent that supports
         # models. Without it the router rejects session/set_model with
@@ -255,12 +285,14 @@ class FakeAcpAgent:
         client_info: Any | None = None,
         **kwargs: Any,
     ) -> schema.InitializeResponse:
-        self.initialize_calls.append({
-            "protocol_version": protocol_version,
-            "client_capabilities": client_capabilities,
-            "client_info": client_info,
-            "kwargs": kwargs,
-        })
+        self.initialize_calls.append(
+            {
+                "protocol_version": protocol_version,
+                "client_capabilities": client_capabilities,
+                "client_info": client_info,
+                "kwargs": kwargs,
+            }
+        )
         return schema.InitializeResponse(
             protocol_version=protocol_version,
             agent_info=schema.Implementation(name="fake-acp", version="0.1.0"),
@@ -273,16 +305,20 @@ class FakeAcpAgent:
         mcp_servers: list[Any] | None = None,
         **kwargs: Any,
     ) -> schema.NewSessionResponse:
-        self.new_session_calls.append({
-            "cwd": cwd,
-            "additional_directories": additional_directories,
-            "mcp_servers": mcp_servers,
-            "kwargs": kwargs,
-        })
+        self.new_session_calls.append(
+            {
+                "cwd": cwd,
+                "additional_directories": additional_directories,
+                "mcp_servers": mcp_servers,
+                "kwargs": kwargs,
+            }
+        )
         resp_kwargs: dict[str, Any] = {"session_id": self._session_id}
         if self._modes is not None:
             resp_kwargs["modes"] = schema.SessionModeState(
-                available_modes=[schema.SessionMode(id=m["id"], name=m["name"]) for m in self._modes],
+                available_modes=[
+                    schema.SessionMode(id=m["id"], name=m["name"]) for m in self._modes
+                ],
                 current_mode_id=self._modes[0]["id"] if self._modes else None,
             )
         return schema.NewSessionResponse(**resp_kwargs)
@@ -295,20 +331,26 @@ class FakeAcpAgent:
         mcp_servers: list[Any] | None = None,
         **kwargs: Any,
     ) -> schema.LoadSessionResponse:
-        self.load_session_calls.append({
-            "cwd": cwd,
-            "session_id": session_id,
-            "additional_directories": additional_directories,
-            "mcp_servers": mcp_servers,
-            "kwargs": kwargs,
-        })
+        self.load_session_calls.append(
+            {
+                "cwd": cwd,
+                "session_id": session_id,
+                "additional_directories": additional_directories,
+                "mcp_servers": mcp_servers,
+                "kwargs": kwargs,
+            }
+        )
         return schema.LoadSessionResponse()
 
-    async def set_session_mode(self, mode_id: str, session_id: str, **kwargs: Any) -> schema.SetSessionModeResponse:
+    async def set_session_mode(
+        self, mode_id: str, session_id: str, **kwargs: Any
+    ) -> schema.SetSessionModeResponse:
         self.set_mode_calls.append((session_id, mode_id))
         return schema.SetSessionModeResponse()
 
-    async def set_session_model(self, model_id: str, session_id: str, **kwargs: Any) -> schema.SetSessionModelResponse:
+    async def set_session_model(
+        self, model_id: str, session_id: str, **kwargs: Any
+    ) -> schema.SetSessionModelResponse:
         self.set_model_calls.append((session_id, model_id))
         return schema.SetSessionModelResponse()
 
@@ -319,7 +361,9 @@ class FakeAcpAgent:
         message_id: str | None = None,
         **kwargs: Any,
     ) -> schema.PromptResponse:
-        rec = _PromptCall(session_id=session_id, prompt=list(prompt), message_id=message_id)
+        rec = _PromptCall(
+            session_id=session_id, prompt=list(prompt), message_id=message_id
+        )
         self.prompt_calls.append(rec)
         if self.prompt_exception is not None:
             exc = self.prompt_exception
@@ -348,13 +392,21 @@ class FakeAcpAgent:
     # an unexpected client request doesn't crash the test; they record too.
     async def list_sessions(self, **kwargs: Any) -> schema.ListSessionsResponse:
         return schema.ListSessionsResponse(sessions=[])
-    async def close_session(self, session_id: str, **kwargs: Any) -> schema.CloseSessionResponse:
+
+    async def close_session(
+        self, session_id: str, **kwargs: Any
+    ) -> schema.CloseSessionResponse:
         return schema.CloseSessionResponse()
+
     async def fork_session(self, **kwargs: Any) -> schema.ForkSessionResponse:
         return schema.ForkSessionResponse(session_id=str(uuid.uuid4()))
+
     async def resume_session(self, **kwargs: Any) -> schema.ResumeSessionResponse:
         return schema.ResumeSessionResponse()
-    async def authenticate(self, method_id: str, **kwargs: Any) -> schema.AuthenticateResponse:
+
+    async def authenticate(
+        self, method_id: str, **kwargs: Any
+    ) -> schema.AuthenticateResponse:
         return schema.AuthenticateResponse()
 
     # ── Script runner ───────────────────────────────────────────────────
@@ -426,7 +478,9 @@ class FakeAcpAgent:
         if step.raw_input is not None:
             kwargs["raw_input"] = step.raw_input
         if step.locations:
-            kwargs["locations"] = [schema.ToolCallLocation(**loc) for loc in step.locations]
+            kwargs["locations"] = [
+                schema.ToolCallLocation(**loc) for loc in step.locations
+            ]
         return acp.start_tool_call(**kwargs)
 
     def _build_tool_call_progress(
@@ -444,7 +498,9 @@ class FakeAcpAgent:
             raw_output=raw_output,
         )
 
-    async def _do_request_permission(self, session_id: str, step: RequestPermissionStep) -> None:
+    async def _do_request_permission(
+        self, session_id: str, step: RequestPermissionStep
+    ) -> None:
         assert self.conn is not None
         options = [schema.PermissionOption(**opt) for opt in step.options]
         # The tool_call passed to request_permission is a ToolCallUpdate —

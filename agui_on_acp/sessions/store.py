@@ -63,7 +63,9 @@ class SessionStore:
             raise RuntimeError("SessionStore not initialized")
         return self._db
 
-    async def create(self, task_id: str, agent_session_id: str, cwd: str, title: str = "New Task") -> TaskSummary:
+    async def create(
+        self, task_id: str, agent_session_id: str, cwd: str, title: str = "New Task"
+    ) -> TaskSummary:
         db = self._ensure_db()
         now = _now_iso()
         # Use INSERT OR REPLACE: the caller only invokes create() when it has
@@ -76,7 +78,15 @@ class SessionStore:
             (task_id, agent_session_id, cwd, title, now, now),
         )
         await db.commit()
-        return TaskSummary(taskId=task_id, agentSessionId=agent_session_id, cwd=cwd, title=title, status="idle", createdAt=now, updatedAt=now)
+        return TaskSummary(
+            taskId=task_id,
+            agentSessionId=agent_session_id,
+            cwd=cwd,
+            title=title,
+            status="idle",
+            createdAt=now,
+            updatedAt=now,
+        )
 
     async def get(self, task_id: str) -> TaskSummary | None:
         db = self._ensure_db()

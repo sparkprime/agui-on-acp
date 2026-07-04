@@ -35,7 +35,11 @@ async def event_stream(
             event: BaseAguiEvent = await asyncio.wait_for(queue.get(), timeout=timeout)
             yield encode_sse_event(event)
             if event.type in (AguiEventType.RUN_FINISHED, AguiEventType.RUN_ERROR):
-                logger.info("SSE stream ending for task %s (event=%s)", task_id, event.type.value)
+                logger.info(
+                    "SSE stream ending for task %s (event=%s)",
+                    task_id,
+                    event.type.value,
+                )
                 return
         except asyncio.TimeoutError:
             yield ": keepalive\n\n"

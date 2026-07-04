@@ -4,11 +4,10 @@ These are the canonical AG-UI event types emitted over SSE. Each event is a
 JSON object with a `type` field identifying the event kind.
 """
 
-from enum import Enum
-from typing import Any, Literal
-
 import time
 import uuid
+from enum import Enum
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -98,7 +97,9 @@ class TextMessageStartEvent(BaseAguiEvent):
 
 
 class TextMessageContentEvent(BaseAguiEvent):
-    type: Literal[AguiEventType.TEXT_MESSAGE_CONTENT] = AguiEventType.TEXT_MESSAGE_CONTENT
+    type: Literal[AguiEventType.TEXT_MESSAGE_CONTENT] = (
+        AguiEventType.TEXT_MESSAGE_CONTENT
+    )
     messageId: str
     delta: str
 

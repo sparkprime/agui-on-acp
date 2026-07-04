@@ -7,8 +7,8 @@ SDK. Spawns the agent, holds the ClientSideConnection and subprocess reference.
 import asyncio
 import logging
 import os
-import signal
 import shutil
+import signal
 import subprocess
 import sys
 from typing import Any
@@ -69,7 +69,14 @@ def _resolve_windows_command(command: list[str]) -> list[str]:
 
     first = command[0]
     # Already shell-wrapped — caller knows what they're doing.
-    if first.lower() in ("cmd", "cmd.exe", "powershell", "powershell.exe", "pwsh", "pwsh.exe"):
+    if first.lower() in (
+        "cmd",
+        "cmd.exe",
+        "powershell",
+        "powershell.exe",
+        "pwsh",
+        "pwsh.exe",
+    ):
         return command
 
     resolved = shutil.which(first)
@@ -100,7 +107,9 @@ class AgentRunner:
         self.process: asyncio.subprocess.Process | None = None
         self._context_manager: Any = None
 
-    async def spawn(self, client: acp.Client, env: dict[str, str] | None = None) -> acp.ClientSideConnection:
+    async def spawn(
+        self, client: acp.Client, env: dict[str, str] | None = None
+    ) -> acp.ClientSideConnection:
         """Spawn the ACP agent using the SDK's spawn_agent_process.
 
         Args:
@@ -116,16 +125,26 @@ class AgentRunner:
             proc_env.update(env)
 
         effective_command = _resolve_windows_command(self._command)
-        if effective_command is not self._command and effective_command != self._command:
-            self._log.info("wrapped non-.exe agent shim with cmd.exe: %s", " ".join(effective_command))
+        if (
+            effective_command is not self._command
+            and effective_command != self._command
+        ):
+            self._log.info(
+                "wrapped non-.exe agent shim with cmd.exe: %s",
+                " ".join(effective_command),
+            )
 
         binary = effective_command[0]
         args = effective_command[1:]
 
         self._context_manager = acp.spawn_agent_process(
-            client, binary, *args,
+            client,
+            binary,
+            *args,
             env=proc_env,
-            transport_kwargs={"limit": 16 * 1024 * 1024},  # 16 MB buffer for large responses
+            transport_kwargs={
+                "limit": 16 * 1024 * 1024
+            },  # 16 MB buffer for large responses
         )
         conn, process = await self._context_manager.__aenter__()
 

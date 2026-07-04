@@ -15,8 +15,8 @@ from agui_on_acp.sessions.types import (
     CreateTaskRequest,
     CreateTaskResponse,
     ExecuteCommandRequest,
-    SetModeRequest,
     SetModelRequest,
+    SetModeRequest,
     StartRunRequest,
     StartRunResponse,
     TaskListResponse,
@@ -246,9 +246,7 @@ async def set_model(task_id: str, body: SetModelRequest, request: Request):
 
 
 @router.post("/tasks/{task_id}/command")
-async def execute_command(
-    task_id: str, body: ExecuteCommandRequest, request: Request
-):
+async def execute_command(task_id: str, body: ExecuteCommandRequest, request: Request):
     """Execute a slash command on a task."""
     manager = _get_manager(request)
     if manager is None:

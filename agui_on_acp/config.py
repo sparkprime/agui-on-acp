@@ -82,7 +82,9 @@ def load_config(config_path: str = "bridge.config.json") -> BridgeConfig:
         return BridgeConfig()
 
     if not isinstance(raw_data, dict):
-        logger.warning("Config '%s' is not a JSON object — using defaults.", config_path)
+        logger.warning(
+            "Config '%s' is not a JSON object — using defaults.", config_path
+        )
         return BridgeConfig()
 
     snake_data = _camel_to_snake(raw_data)
@@ -90,5 +92,7 @@ def load_config(config_path: str = "bridge.config.json") -> BridgeConfig:
     try:
         return BridgeConfig(**snake_data)
     except Exception as exc:
-        logger.warning("Invalid config values in '%s': %s — using defaults.", config_path, exc)
+        logger.warning(
+            "Invalid config values in '%s': %s — using defaults.", config_path, exc
+        )
         return BridgeConfig()

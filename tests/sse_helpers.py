@@ -29,9 +29,9 @@ def parse_sse_frame(frame: str) -> dict[str, Any] | None:
         if not line:
             continue
         if line.startswith("event: "):
-            event_type = line[len("event: "):]
+            event_type = line[len("event: ") :]
         elif line.startswith("data: "):
-            data_lines.append(line[len("data: "):])
+            data_lines.append(line[len("data: ") :])
     if event_type is None or not data_lines:
         return None
     payload = json.loads("\n".join(data_lines))

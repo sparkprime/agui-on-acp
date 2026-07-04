@@ -40,14 +40,14 @@ class AcpProtocol:
             client_info={"name": "acp-to-agui", "version": "0.1.0"},
         )
         agent_info = getattr(result, "agent_info", None)
-        name = getattr(agent_info, "title", None) or getattr(agent_info, "name", "unknown")
+        name = getattr(agent_info, "title", None) or getattr(
+            agent_info, "name", "unknown"
+        )
         version = getattr(agent_info, "version", "?")
         self._log.info("connected → %s v%s", name, version)
         return result
 
-    async def new_session(
-        self, cwd: str, mcp_servers: list | None = None
-    ) -> Any:
+    async def new_session(self, cwd: str, mcp_servers: list | None = None) -> Any:
         self._log.info("new session (cwd=%s)", cwd)
         result = await self.conn.new_session(cwd=cwd, mcp_servers=mcp_servers or [])
         session_id = getattr(result, "session_id", result)
@@ -71,13 +71,22 @@ class AcpProtocol:
 
     async def prompt(self, session_id: str, prompt: list[dict[str, Any]]) -> Any:
         self._log.debug("Sending prompt to session %s", session_id)
-        from acp.schema import TextContentBlock, ImageContentBlock
+        from acp.schema import ImageContentBlock, TextContentBlock
+
         content_blocks = []
         for item in prompt:
             if item.get("type") == "image":
-                content_blocks.append(ImageContentBlock(type="image", data=item.get("data", ""), media_type=item.get("mimeType", "image/png")))
+                content_blocks.append(
+                    ImageContentBlock(
+                        type="image",
+                        data=item.get("data", ""),
+                        media_type=item.get("mimeType", "image/png"),
+                    )
+                )
             else:
-                content_blocks.append(TextContentBlock(type="text", text=item.get("text", "")))
+                content_blocks.append(
+                    TextContentBlock(type="text", text=item.get("text", ""))
+                )
         result = await self.conn.prompt(prompt=content_blocks, session_id=session_id)
         return result
 
@@ -98,9 +107,13 @@ class AcpProtocol:
 
     async def set_model(self, session_id: str, model_id: str) -> Any:
         self._log.info("Setting model %s for session %s", model_id, session_id)
-        return await self.conn.set_session_model(model_id=model_id, session_id=session_id)
+        return await self.conn.set_session_model(
+            model_id=model_id, session_id=session_id
+        )
 
-    async def execute_command(self, session_id: str, command: str, args: str | None = None) -> Any:
+    async def execute_command(
+        self, session_id: str, command: str, args: str | None = None
+    ) -> Any:
         self._log.info("Executing command /%s for session %s", command, session_id)
         name = command.lstrip("/")
         return await self.conn.ext_method(

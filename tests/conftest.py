@@ -37,15 +37,13 @@ import acp
 import httpx
 from httpx import ASGITransport
 
+# Use a short permission TTL in tests so expiry paths don't take 5 minutes.
+import agui_on_acp.bridge.acp_to_agui as _bridge_mod
 from agui_on_acp.main import app as fastapi_app
 from agui_on_acp.sessions.manager import SessionManager
 from agui_on_acp.sessions.store import SessionStore
-
 from tests.fake_agent import FakeAcpAgent, Script
 from tests.transport import TransportPair, make_transport_pair
-
-# Use a short permission TTL in tests so expiry paths don't take 5 minutes.
-import agui_on_acp.bridge.acp_to_agui as _bridge_mod
 
 
 @pytest.fixture(autouse=True)
@@ -103,18 +101,25 @@ def _patch_runner_spawn(agent: FakeAcpAgent) -> None:
     """
     from agui_on_acp.agent.runner import AgentRunner
 
-    async def _fake_spawn(self: AgentRunner, client: acp.Client, env: dict[str, str] | None = None) -> acp.ClientSideConnection:
+    async def _fake_spawn(
+        self: AgentRunner, client: acp.Client, env: dict[str, str] | None = None
+    ) -> acp.ClientSideConnection:
         from acp import ClientSideConnection  # deprecated import path the bridge uses
+
         # ClientSideConnection(to_client, writer, reader): the client WRITES
         # requests into client_writer (which feeds the agent's reader) and
         # READS responses from client_reader (which the agent's writer feeds).
-        conn = ClientSideConnection(client, agent._transport.client_writer, agent._transport.client_reader)
+        conn = ClientSideConnection(
+            client, agent._transport.client_writer, agent._transport.client_reader
+        )
         self.conn = conn
+
         # No subprocess — fabricate a process stand-in with a pid so
         # AgentRunner.is_alive() and kill() don't blow up.
         class _FakeProc:
             pid = 12345
             returncode: int | None = None
+
         self.process = _FakeProc()  # type: ignore[assignment]
         self._context_manager = None
         return conn
@@ -155,7 +160,9 @@ async def session_manager(fake_agent: FakeAcpAgent) -> AsyncIterator[SessionMana
 
 
 @pytest_asyncio.fixture
-async def http_client(session_manager: SessionManager) -> AsyncIterator[httpx.AsyncClient]:
+async def http_client(
+    session_manager: SessionManager,
+) -> AsyncIterator[httpx.AsyncClient]:
     fastapi_app.state.session_manager = session_manager
     fastapi_app.state.session_store = session_manager._store
     transport = ASGITransport(app=fastapi_app)

@@ -14,9 +14,9 @@ from typing import Any
 
 import acp
 
-from agui_on_acp.bridge.acp_to_agui import AcpToAguiBridge
 from agui_on_acp.agent.acp_protocol import AcpProtocol
 from agui_on_acp.agent.runner import AgentRunner
+from agui_on_acp.bridge.acp_to_agui import AcpToAguiBridge
 from agui_on_acp.sessions.store import SessionStore
 
 logger = logging.getLogger(__name__)
@@ -38,7 +38,9 @@ class ActiveSession:
 
 
 class SessionManager:
-    def __init__(self, store: SessionStore, agent_command: list[str] | None = None) -> None:
+    def __init__(
+        self, store: SessionStore, agent_command: list[str] | None = None
+    ) -> None:
         self._store = store
         self._sessions: dict[str, ActiveSession] = {}
         self._agent_command = agent_command or ["kiro-cli", "acp"]
@@ -82,26 +84,46 @@ class SessionManager:
             if isinstance(result, dict):
                 agent_session_id = result.get("sessionId", resume_session_id)
                 if "modes" in result and result["modes"]:
-                    modes = [{"id": m["id"], "name": m["name"]} for m in result["modes"].get("availableModes", [])]
+                    modes = [
+                        {"id": m["id"], "name": m["name"]}
+                        for m in result["modes"].get("availableModes", [])
+                    ]
                     current_mode_id = result["modes"].get("currentModeId")
                 if "models" in result and result["models"]:
-                    models = [{"id": m.get("modelId", ""), "name": m.get("name", "")} for m in result["models"].get("availableModels", [])]
+                    models = [
+                        {"id": m.get("modelId", ""), "name": m.get("name", "")}
+                        for m in result["models"].get("availableModels", [])
+                    ]
             else:
-                agent_session_id = getattr(result, "session_id", None) or getattr(result, "sessionId", resume_session_id)
+                agent_session_id = getattr(result, "session_id", None) or getattr(
+                    result, "sessionId", resume_session_id
+                )
         else:
             result = await protocol.new_session(cwd, mcp_list)
             if isinstance(result, dict):
                 agent_session_id = result.get("sessionId", str(uuid.uuid4()))
                 if "modes" in result and result["modes"]:
-                    modes = [{"id": m["id"], "name": m["name"]} for m in result["modes"].get("availableModes", [])]
+                    modes = [
+                        {"id": m["id"], "name": m["name"]}
+                        for m in result["modes"].get("availableModes", [])
+                    ]
                     current_mode_id = result["modes"].get("currentModeId")
             else:
-                agent_session_id = getattr(result, "session_id", None) or getattr(result, "sessionId", str(uuid.uuid4()))
+                agent_session_id = getattr(result, "session_id", None) or getattr(
+                    result, "sessionId", str(uuid.uuid4())
+                )
                 result_modes = getattr(result, "modes", None)
                 if result_modes:
-                    available = getattr(result_modes, "available_modes", None) or getattr(result_modes, "availableModes", [])
-                    modes = [{"id": getattr(m, "id", ""), "name": getattr(m, "name", "")} for m in available]
-                    current_mode_id = getattr(result_modes, "current_mode_id", None) or getattr(result_modes, "currentModeId", None)
+                    available = getattr(
+                        result_modes, "available_modes", None
+                    ) or getattr(result_modes, "availableModes", [])
+                    modes = [
+                        {"id": getattr(m, "id", ""), "name": getattr(m, "name", "")}
+                        for m in available
+                    ]
+                    current_mode_id = getattr(
+                        result_modes, "current_mode_id", None
+                    ) or getattr(result_modes, "currentModeId", None)
 
         # Set mode/model if requested (skip generic "default" placeholder)
         if mode and mode != "default" and agent_session_id:
@@ -136,7 +158,12 @@ class SessionManager:
         logger.info("session ready → %s (agent=%s)", task_id, " ".join(command))
         return active
 
-    async def start_run(self, task_id: str, input_data: dict[str, Any], config: dict[str, Any] | None = None) -> str:
+    async def start_run(
+        self,
+        task_id: str,
+        input_data: dict[str, Any],
+        config: dict[str, Any] | None = None,
+    ) -> str:
         active = self._get_active(task_id)
         run_id = str(uuid.uuid4())
 
@@ -166,10 +193,23 @@ class SessionManager:
             else:
                 try:
                     import base64
-                    decoded = base64.b64decode(att_data).decode("utf-8", errors="replace")
-                    prompt.append({"type": "text", "text": f"[File: {att_name}]\n```\n{decoded}\n```"})
+
+                    decoded = base64.b64decode(att_data).decode(
+                        "utf-8", errors="replace"
+                    )
+                    prompt.append(
+                        {
+                            "type": "text",
+                            "text": f"[File: {att_name}]\n```\n{decoded}\n```",
+                        }
+                    )
                 except Exception:
-                    prompt.append({"type": "text", "text": f"[File: {att_name} — could not decode]"})
+                    prompt.append(
+                        {
+                            "type": "text",
+                            "text": f"[File: {att_name} — could not decode]",
+                        }
+                    )
 
         if not prompt:
             prompt.append({"type": "text", "text": ""})
@@ -180,7 +220,9 @@ class SessionManager:
         asyncio.create_task(self._run_prompt(active, run_id, prompt))
         return run_id
 
-    async def _run_prompt(self, active: ActiveSession, run_id: str, prompt: list[dict[str, Any]]) -> None:
+    async def _run_prompt(
+        self, active: ActiveSession, run_id: str, prompt: list[dict[str, Any]]
+    ) -> None:
         queue = active.event_queues.get(run_id)
         if queue is None:
             return
@@ -200,7 +242,9 @@ class SessionManager:
             return None
         return active.event_queues.get(run_id)
 
-    async def resume_run(self, task_id: str, resume_entries: list[dict[str, Any]]) -> str:
+    async def resume_run(
+        self, task_id: str, resume_entries: list[dict[str, Any]]
+    ) -> str:
         """Resume a prompt task suspended at a permission interrupt.
 
         Creates a new queue + run id, re-attaches the bridge sink to it (emits
@@ -242,7 +286,9 @@ class SessionManager:
                     option_id = payload.get("optionId", "once")
                 else:
                     option_id = "once"
-                active.bridge.resolve_permission(interrupt_id, approved=True, option_id=option_id)
+                active.bridge.resolve_permission(
+                    interrupt_id, approved=True, option_id=option_id
+                )
 
         await self._store.update(task_id, status="running")
         return run_id
@@ -266,10 +312,14 @@ class SessionManager:
         active = self._get_active(task_id)
         await active.protocol.set_model(active.agent_session_id, model_id)
 
-    async def execute_command(self, task_id: str, command: str, args: dict[str, Any] | None = None) -> None:
+    async def execute_command(
+        self, task_id: str, command: str, args: dict[str, Any] | None = None
+    ) -> None:
         active = self._get_active(task_id)
         args_str = args.get("args", "") if args else ""
-        await active.protocol.execute_command(active.agent_session_id, command, args_str)
+        await active.protocol.execute_command(
+            active.agent_session_id, command, args_str
+        )
 
     async def stop(self, task_id: str) -> bool:
         active = self._sessions.pop(task_id, None)

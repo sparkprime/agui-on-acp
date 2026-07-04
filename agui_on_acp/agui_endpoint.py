@@ -48,6 +48,7 @@ class AgUiMessage(BaseModel):
     toolCalls: list[ToolCall] | None = None
     toolCallId: str | None = None
 
+
 class ResumeEntry(BaseModel):
     """AG-UI ResumeEntry (types.ts:203)."""
 
@@ -95,7 +96,9 @@ async def ag_ui_run(body: RunAgentInput, request: Request):
     # ── Resume path ──────────────────────────────────────────────────────
     if body.resume:
         try:
-            actual_run_id = await manager.resume_run(thread_id, [r.model_dump() for r in body.resume])
+            actual_run_id = await manager.resume_run(
+                thread_id, [r.model_dump() for r in body.resume]
+            )
         except KeyError:
             return StreamingResponse(
                 _error_stream(f"No active session for thread {thread_id}"),
@@ -195,8 +198,11 @@ async def ag_ui_run(body: RunAgentInput, request: Request):
     return _sse_response(queue, thread_id, manager)
 
 
-def _sse_response(queue: asyncio.Queue, thread_id: str, manager: Any) -> StreamingResponse:
+def _sse_response(
+    queue: asyncio.Queue, thread_id: str, manager: Any
+) -> StreamingResponse:
     """Build a StreamingResponse with the cancel-on-disconnect callback."""
+
     async def _on_disconnect() -> None:
         await manager.cancel_run(thread_id)
 
@@ -215,6 +221,7 @@ async def _error_stream(message: str):
     """Yield a single RUN_ERROR event."""
     import json
     import time
+
     error_event = {
         "type": "RUN_ERROR",
         "timestamp": time.time(),

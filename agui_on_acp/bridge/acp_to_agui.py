@@ -85,7 +85,9 @@ class AcpToAguiBridge:
         # request_permission awaits. Resolved by resume_run (AG-UI resume) or
         # cancel_run. Correlation invariant: the call_id equals the interrupt
         # id and the ACP permission tool callId — one key through the flow.
-        self._permission_futures: dict[str, asyncio.Future[acp.RequestPermissionResponse]] = {}
+        self._permission_futures: dict[
+            str, asyncio.Future[acp.RequestPermissionResponse]
+        ] = {}
         # Per-future TTL handles so we can cancel the expiry timer when a
         # resume/cancel resolves the future first.
         self._permission_timers: dict[str, asyncio.TimerHandle] = {}
@@ -130,7 +132,11 @@ class AcpToAguiBridge:
         self._close_open_message()
         self._close_all_tool_calls()
         if self._run_id:
-            self._emit(RunFinishedEvent(runId=self._run_id, taskId=self.task_id, threadId=self.task_id))
+            self._emit(
+                RunFinishedEvent(
+                    runId=self._run_id, taskId=self.task_id, threadId=self.task_id
+                )
+            )
         self._run_id = None
 
     def error_run(self, message: str, code: str | None = None) -> None:
@@ -216,7 +222,9 @@ class AcpToAguiBridge:
         ToolCallProgress, AvailableCommandsUpdate, CurrentModeUpdate, etc.)
         """
         if self._queue is None:
-            self._log.warning("session_update received but no active run (session=%s)", session_id)
+            self._log.warning(
+                "session_update received but no active run (session=%s)", session_id
+            )
             return
 
         # If the update is a dict (fallback), handle it the old way
@@ -258,7 +266,9 @@ class AcpToAguiBridge:
             elif hasattr(update, "__dict__"):
                 self._handle_session_update_dict(vars(update))
             else:
-                self._log.debug("Unhandled session_update type: %s", type(update).__name__)
+                self._log.debug(
+                    "Unhandled session_update type: %s", type(update).__name__
+                )
 
     async def request_permission(
         self, options: Any, session_id: str, tool_call: Any, **kwargs: Any
@@ -282,7 +292,11 @@ class AcpToAguiBridge:
             getattr(tool_call, "title", None)
             or getattr(tool_call, "tool_name", None)
             or getattr(tool_call, "toolName", None)
-            or (tool_call.get("title", tool_call.get("toolName", "unknown")) if isinstance(tool_call, dict) else "unknown")
+            or (
+                tool_call.get("title", tool_call.get("toolName", "unknown"))
+                if isinstance(tool_call, dict)
+                else "unknown"
+            )
         )
 
         # Extract options list for the client UI
@@ -309,6 +323,7 @@ class AcpToAguiBridge:
         # cleanup agree.
         loop = asyncio.get_event_loop()
         import datetime as _dt
+
         expires_at_iso = _dt.datetime.fromtimestamp(
             _dt.datetime.now().timestamp() + PERMISSION_TTL_SECONDS,
             tz=_dt.timezone.utc,
@@ -346,7 +361,11 @@ class AcpToAguiBridge:
         self._suspend_run(interrupt)
 
         response = await future
-        self._log.info("✓ permission resolved for %s → %s", tool_name, getattr(response, "outcome", "?"))
+        self._log.info(
+            "✓ permission resolved for %s → %s",
+            tool_name,
+            getattr(response, "outcome", "?"),
+        )
         return response
 
     def _expire_permission(self, call_id: str) -> None:
@@ -356,7 +375,9 @@ class AcpToAguiBridge:
         self._permission_timers.pop(call_id, None)
         if future is None or future.done():
             return
-        self._log.warning("permission future %s expired (no resume) → cancelled", call_id)
+        self._log.warning(
+            "permission future %s expired (no resume) → cancelled", call_id
+        )
         response = acp.RequestPermissionResponse(outcome={"outcome": "cancelled"})
         future.set_result(response)
 
@@ -368,7 +389,9 @@ class AcpToAguiBridge:
         if self._queue is None:
             # No active run — buffer for later
             if method.startswith("_kiro.dev/") or method == "_session/terminate":
-                self._log.debug("Buffering ext_notification (no active run): %s", method)
+                self._log.debug(
+                    "Buffering ext_notification (no active run): %s", method
+                )
                 self._pending_notifications.append((method, params))
             return
 
@@ -385,12 +408,19 @@ class AcpToAguiBridge:
     # ── acp.Client Protocol — File operations ────────────────────────────────
 
     async def read_text_file(
-        self, path: str, session_id: str, limit: int | None = None, line: int | None = None, **kwargs: Any
+        self,
+        path: str,
+        session_id: str,
+        limit: int | None = None,
+        line: int | None = None,
+        **kwargs: Any,
     ) -> acp.ReadTextFileResponse:
         """Read a text file on behalf of the agent."""
         self._log.debug("read_text_file: %s", path)
         try:
-            full_path = os.path.join(self._cwd, path) if not os.path.isabs(path) else path
+            full_path = (
+                os.path.join(self._cwd, path) if not os.path.isabs(path) else path
+            )
             with open(full_path, "r", encoding="utf-8", errors="replace") as f:
                 if line is not None:
                     lines = f.readlines()
@@ -412,7 +442,9 @@ class AcpToAguiBridge:
         """Write a text file on behalf of the agent."""
         self._log.debug("write_text_file: %s", path)
         try:
-            full_path = os.path.join(self._cwd, path) if not os.path.isabs(path) else path
+            full_path = (
+                os.path.join(self._cwd, path) if not os.path.isabs(path) else path
+            )
             os.makedirs(os.path.dirname(full_path), exist_ok=True)
             with open(full_path, "w", encoding="utf-8") as f:
                 f.write(content)
@@ -439,7 +471,9 @@ class AcpToAguiBridge:
         handled by the agent itself in most cases.
         """
         terminal_id = str(uuid.uuid4())
-        self._log.info("create_terminal: %s %s (id=%s)", command, args or [], terminal_id)
+        self._log.info(
+            "create_terminal: %s %s (id=%s)", command, args or [], terminal_id
+        )
         return acp.CreateTerminalResponse(terminalId=terminal_id)
 
     async def terminal_output(
@@ -468,7 +502,9 @@ class AcpToAguiBridge:
 
     # ── Permission resolution (called by SessionManager on resume/cancel) ────
 
-    def resolve_permission(self, call_id: str, approved: bool, option_id: str | None = None) -> bool:
+    def resolve_permission(
+        self, call_id: str, approved: bool, option_id: str | None = None
+    ) -> bool:
         """Resolve a pending permission future.
 
         Called by ``SessionManager.resume_run`` (AG-UI resume) or
@@ -536,7 +572,9 @@ class AcpToAguiBridge:
 
     # ── Typed SDK update handlers ────────────────────────────────────────────
 
-    def _handle_agent_message_chunk_typed(self, update: acp.schema.AgentMessageChunk) -> None:
+    def _handle_agent_message_chunk_typed(
+        self, update: acp.schema.AgentMessageChunk
+    ) -> None:
         """Handle AgentMessageChunk from the SDK."""
         content = getattr(update, "content", None)
         text = ""
@@ -562,9 +600,16 @@ class AcpToAguiBridge:
         """Handle ToolCallStart from the SDK."""
         self._close_open_message()
 
-        tool_call_id = str(getattr(update, "tool_call_id", None) or getattr(update, "toolCallId", str(uuid.uuid4())))
-        tool_name = getattr(update, "title", None) or getattr(update, "tool_name", "unknown")
-        raw_input = getattr(update, "raw_input", None) or getattr(update, "rawInput", {})
+        tool_call_id = str(
+            getattr(update, "tool_call_id", None)
+            or getattr(update, "toolCallId", str(uuid.uuid4()))
+        )
+        tool_name = getattr(update, "title", None) or getattr(
+            update, "tool_name", "unknown"
+        )
+        raw_input = getattr(update, "raw_input", None) or getattr(
+            update, "rawInput", {}
+        )
 
         if isinstance(raw_input, dict):
             raw_input.pop("__tool_use_purpose", None)
@@ -601,15 +646,21 @@ class AcpToAguiBridge:
         # Approval is driven solely by the ACP request_permission callback,
         # which emits an interrupt RUN_FINISHED — no policy gate here.
 
-    def _handle_tool_call_update_typed(self, update: acp.schema.ToolCallProgress) -> None:
+    def _handle_tool_call_update_typed(
+        self, update: acp.schema.ToolCallProgress
+    ) -> None:
         """Handle ToolCallProgress from the SDK."""
-        tool_call_id = str(getattr(update, "tool_call_id", None) or getattr(update, "toolCallId", ""))
+        tool_call_id = str(
+            getattr(update, "tool_call_id", None) or getattr(update, "toolCallId", "")
+        )
         status = getattr(update, "status", "")
         # ACP carries the tool result in `raw_output`, not `result`. The old
         # code read a nonexistent `result` attribute, so every TOOL_CALL_RESULT
         # arrived with empty content.
         raw_output = getattr(update, "raw_output", None)
-        result_obj = raw_output if raw_output is not None else getattr(update, "result", None)
+        result_obj = (
+            raw_output if raw_output is not None else getattr(update, "result", None)
+        )
 
         if status in ("completed", "failed"):
             if tool_call_id in self._open_tool_calls:
@@ -748,7 +799,9 @@ class AcpToAguiBridge:
             "_kiro.dev/commands/available": "agent:commands_available",
             "_session/terminate": "agent:subagent_terminated",
         }
-        event_name = name_map.get(method, f"agent:{method.replace('_kiro.dev/', '').replace('/', '_')}")
+        event_name = name_map.get(
+            method, f"agent:{method.replace('_kiro.dev/', '').replace('/', '_')}"
+        )
 
         self._emit(CustomEvent(name=event_name, value=params))
 
@@ -789,7 +842,9 @@ class AcpToAguiBridge:
                 self._content_chunk_count += 1
             else:
                 if self._content_chunk_count > 0:
-                    self._log.info("emit TEXT_MESSAGE_CONTENT ×%d", self._content_chunk_count)
+                    self._log.info(
+                        "emit TEXT_MESSAGE_CONTENT ×%d", self._content_chunk_count
+                    )
                     self._content_chunk_count = 0
                 self._log.info("emit %s", event_name)
         except asyncio.QueueFull:
