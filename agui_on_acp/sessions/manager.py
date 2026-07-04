@@ -10,12 +10,11 @@ import asyncio
 import logging
 import uuid
 from dataclasses import dataclass, field
-from typing import Any
-
-import acp
+from typing import Any, cast
 
 from agui_on_acp.agent.acp_protocol import AcpProtocol
 from agui_on_acp.agent.runner import AgentRunner
+from agui_on_acp.agui.events import AguiEvent
 from agui_on_acp.bridge.acp_to_agui import AcpToAguiBridge
 from agui_on_acp.sessions.store import SessionStore
 
@@ -30,7 +29,9 @@ class ActiveSession:
     runner: AgentRunner
     protocol: AcpProtocol
     bridge: AcpToAguiBridge
-    event_queues: dict[str, asyncio.Queue] = field(default_factory=dict)
+    event_queues: dict[str, asyncio.Queue[AguiEvent]] = field(
+        default_factory=dict[str, asyncio.Queue[AguiEvent]]
+    )
     current_run_id: str | None = None
     modes: list[dict[str, str]] | None = None
     models: list[dict[str, str]] | None = None
@@ -58,7 +59,7 @@ class SessionManager:
     ) -> ActiveSession:
         # Create the bridge (satisfies acp.Client Protocol) before spawning
         bridge = AcpToAguiBridge(task_id)
-        bridge._cwd = cwd
+        bridge.cwd = cwd
 
         # Spawn the agent using the SDK via our runner
         command = agent_command or self._agent_command
@@ -78,39 +79,50 @@ class SessionManager:
         modes: list[dict[str, str]] | None = None
         models: list[dict[str, str]] | None = None
         current_mode_id: str | None = None
+        agent_session_id: str = ""
 
         if resume_session_id:
             result = await protocol.load_session(resume_session_id, cwd, mcp_list)
             if isinstance(result, dict):
-                agent_session_id = result.get("sessionId", resume_session_id)
-                if "modes" in result and result["modes"]:
+                result_dict = cast(dict[str, Any], result)
+                agent_session_id = str(result_dict.get("sessionId", resume_session_id))
+                modes_obj = result_dict.get("modes")
+                if modes_obj:
                     modes = [
-                        {"id": m["id"], "name": m["name"]}
-                        for m in result["modes"].get("availableModes", [])
+                        {"id": str(m.get("id", "")), "name": str(m.get("name", ""))}
+                        for m in modes_obj.get("availableModes", [])
                     ]
-                    current_mode_id = result["modes"].get("currentModeId")
-                if "models" in result and result["models"]:
+                    current_mode_id = modes_obj.get("currentModeId")
+                models_obj = result_dict.get("models")
+                if models_obj:
                     models = [
-                        {"id": m.get("modelId", ""), "name": m.get("name", "")}
-                        for m in result["models"].get("availableModels", [])
+                        {
+                            "id": str(m.get("modelId", "")),
+                            "name": str(m.get("name", "")),
+                        }
+                        for m in models_obj.get("availableModels", [])
                     ]
             else:
-                agent_session_id = getattr(result, "session_id", None) or getattr(
-                    result, "sessionId", resume_session_id
+                agent_session_id = str(
+                    getattr(result, "session_id", None)
+                    or getattr(result, "sessionId", resume_session_id)
                 )
         else:
             result = await protocol.new_session(cwd, mcp_list)
             if isinstance(result, dict):
-                agent_session_id = result.get("sessionId", str(uuid.uuid4()))
-                if "modes" in result and result["modes"]:
+                result_dict = cast(dict[str, Any], result)
+                agent_session_id = str(result_dict.get("sessionId", str(uuid.uuid4())))
+                modes_obj = result_dict.get("modes")
+                if modes_obj:
                     modes = [
-                        {"id": m["id"], "name": m["name"]}
-                        for m in result["modes"].get("availableModes", [])
+                        {"id": str(m.get("id", "")), "name": str(m.get("name", ""))}
+                        for m in modes_obj.get("availableModes", [])
                     ]
-                    current_mode_id = result["modes"].get("currentModeId")
+                    current_mode_id = modes_obj.get("currentModeId")
             else:
-                agent_session_id = getattr(result, "session_id", None) or getattr(
-                    result, "sessionId", str(uuid.uuid4())
+                agent_session_id = str(
+                    getattr(result, "session_id", None)
+                    or getattr(result, "sessionId", str(uuid.uuid4()))
                 )
                 result_modes = getattr(result, "modes", None)
                 if result_modes:
@@ -118,7 +130,10 @@ class SessionManager:
                         result_modes, "available_modes", None
                     ) or getattr(result_modes, "availableModes", [])
                     modes = [
-                        {"id": getattr(m, "id", ""), "name": getattr(m, "name", "")}
+                        {
+                            "id": str(getattr(m, "id", "")),
+                            "name": str(getattr(m, "name", "")),
+                        }
                         for m in available
                     ]
                     current_mode_id = getattr(
@@ -167,7 +182,7 @@ class SessionManager:
         active = self._get_active(task_id)
         run_id = str(uuid.uuid4())
 
-        queue: asyncio.Queue = asyncio.Queue()
+        queue: asyncio.Queue[AguiEvent] = asyncio.Queue()
         active.event_queues[run_id] = queue
         active.current_run_id = run_id
 
@@ -228,7 +243,7 @@ class SessionManager:
             return
         try:
             await active.protocol.prompt(active.agent_session_id, prompt)
-            if active.bridge._run_id is not None:
+            if active.bridge.run_id is not None:
                 active.bridge.finish_run()
         except Exception as exc:
             logger.error("Run %s failed: %s", run_id, exc)
@@ -236,7 +251,9 @@ class SessionManager:
         finally:
             await self._store.update(active.task_id, status="idle")
 
-    def get_event_queue(self, task_id: str, run_id: str) -> asyncio.Queue | None:
+    def get_event_queue(
+        self, task_id: str, run_id: str
+    ) -> asyncio.Queue[AguiEvent] | None:
         active = self._sessions.get(task_id)
         if active is None:
             return None
@@ -258,7 +275,7 @@ class SessionManager:
         active = self._get_active(task_id)
         run_id = str(uuid.uuid4())
 
-        queue: asyncio.Queue = asyncio.Queue()
+        queue: asyncio.Queue[AguiEvent] = asyncio.Queue()
         active.event_queues[run_id] = queue
         active.current_run_id = run_id
 
@@ -272,8 +289,8 @@ class SessionManager:
 
         # Resolve each resume entry against its parked future.
         for entry in resume_entries:
-            interrupt_id = entry.get("interruptId", "")
-            status = entry.get("status", "")
+            interrupt_id = str(entry.get("interruptId", ""))
+            status = str(entry.get("status", ""))
             payload = entry.get("payload")
             if status == "cancelled":
                 active.bridge.resolve_permission(interrupt_id, approved=False)
@@ -281,9 +298,11 @@ class SessionManager:
                 # payload may be a string (optionId), a dict with optionId,
                 # or None (default to "once").
                 if isinstance(payload, str):
-                    option_id = payload
+                    option_id: str = payload
                 elif isinstance(payload, dict):
-                    option_id = payload.get("optionId", "once")
+                    option_id = str(
+                        cast(dict[str, Any], payload).get("optionId", "once")
+                    )
                 else:
                     option_id = "once"
                 active.bridge.resolve_permission(

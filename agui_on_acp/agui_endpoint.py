@@ -22,7 +22,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from agui_on_acp.agui.events import StateSnapshotEvent
+from agui_on_acp.agui.events import AguiEvent, StateSnapshotEvent
 from agui_on_acp.agui.sse import event_stream
 
 logger = logging.getLogger(__name__)
@@ -62,12 +62,12 @@ class RunAgentInput(BaseModel):
 
     threadId: str | None = None
     runId: str | None = None
-    state: dict[str, Any] = Field(default_factory=dict)
-    messages: list[AgUiMessage] = Field(default_factory=list)
-    tools: list[dict[str, Any]] = Field(default_factory=list)
-    context: list[Any] = Field(default_factory=list)
-    forwardedProps: dict[str, Any] = Field(default_factory=dict)
-    resume: list[ResumeEntry] = Field(default_factory=list)
+    state: dict[str, Any] = Field(default_factory=dict[str, Any])
+    messages: list[AgUiMessage] = Field(default_factory=list[AgUiMessage])
+    tools: list[dict[str, Any]] = Field(default_factory=list[dict[str, Any]])
+    context: list[Any] = Field(default_factory=list[Any])
+    forwardedProps: dict[str, Any] = Field(default_factory=dict[str, Any])
+    resume: list[ResumeEntry] = Field(default_factory=list[ResumeEntry])
 
 
 @router.post("/ag-ui")
@@ -91,7 +91,6 @@ async def ag_ui_run(body: RunAgentInput, request: Request):
         )
 
     thread_id = body.threadId or str(uuid.uuid4())
-    run_id = body.runId or str(uuid.uuid4())
 
     # ── Resume path ──────────────────────────────────────────────────────
     if body.resume:
@@ -199,7 +198,7 @@ async def ag_ui_run(body: RunAgentInput, request: Request):
 
 
 def _sse_response(
-    queue: asyncio.Queue, thread_id: str, manager: Any
+    queue: asyncio.Queue[AguiEvent], thread_id: str, manager: Any
 ) -> StreamingResponse:
     """Build a StreamingResponse with the cancel-on-disconnect callback."""
 

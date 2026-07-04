@@ -31,9 +31,15 @@ class AguiEventType(str, Enum):
 
 
 class BaseAguiEvent(BaseModel):
-    """Base AG-UI event with common fields."""
+    """Base AG-UI event with common fields.
 
-    type: AguiEventType
+    Each concrete subclass declares its own ``type`` field as a narrowed
+    ``Literal[AguiEventType.X]`` rather than overriding a base ``type``.
+    Narrowing a mutable pydantic field from ``AguiEventType`` to a single
+    literal would violate pyright's invariant-override check, so the base
+    intentionally omits ``type`` and leaves it to the subclasses.
+    """
+
     timestamp: float = Field(default_factory=time.time)
     rawEvent: dict[str, Any] | None = None  # optional original ACP data
 
@@ -165,7 +171,10 @@ class CustomEvent(BaseAguiEvent):
     value: dict[str, Any] = Field(default_factory=dict)
 
 
-# Union type for all events
+# Union type for all streamable AG-UI events. ``InterruptOutcome`` is
+# intentionally excluded: it is not emitted on the wire itself but nested
+# inside ``RunFinishedEvent.outcome``, and its ``type`` is a plain string
+# (not an ``AguiEventType`` member) so it does not expose ``.value``.
 AguiEvent = (
     RunStartedEvent
     | RunFinishedEvent
@@ -180,5 +189,4 @@ AguiEvent = (
     | StateUpdateEvent
     | StateSnapshotEvent
     | CustomEvent
-    | InterruptOutcome
 )

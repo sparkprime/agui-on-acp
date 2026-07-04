@@ -107,7 +107,7 @@ class SessionStore:
     async def update(self, task_id: str, **kwargs: str) -> TaskSummary:
         db = self._ensure_db()
         allowed = {"title", "status"}
-        fields = {k: v for k, v in kwargs.items() if k in allowed and v is not None}
+        fields = {k: v for k, v in kwargs.items() if k in allowed}
         if not fields:
             task = await self.get(task_id)
             if task is None:

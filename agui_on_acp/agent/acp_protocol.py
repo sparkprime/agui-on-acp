@@ -47,7 +47,9 @@ class AcpProtocol:
         self._log.info("connected → %s v%s", name, version)
         return result
 
-    async def new_session(self, cwd: str, mcp_servers: list | None = None) -> Any:
+    async def new_session(
+        self, cwd: str, mcp_servers: list[dict[str, Any]] | None = None
+    ) -> Any:
         self._log.info("new session (cwd=%s)", cwd)
         result = await self.conn.new_session(cwd=cwd, mcp_servers=mcp_servers or [])
         session_id = getattr(result, "session_id", result)
@@ -73,14 +75,14 @@ class AcpProtocol:
         self._log.debug("Sending prompt to session %s", session_id)
         from acp.schema import ImageContentBlock, TextContentBlock
 
-        content_blocks = []
+        content_blocks: list[Any] = []
         for item in prompt:
             if item.get("type") == "image":
                 content_blocks.append(
                     ImageContentBlock(
                         type="image",
                         data=item.get("data", ""),
-                        media_type=item.get("mimeType", "image/png"),
+                        mime_type=item.get("mimeType", "image/png"),
                     )
                 )
             else:

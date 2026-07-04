@@ -21,14 +21,13 @@ import json
 import logging
 import os
 import uuid
-from typing import Any
+from typing import Any, cast
 
 import acp
 import acp.schema
 
 from agui_on_acp.agui.events import (
-    AguiEventType,
-    BaseAguiEvent,
+    AguiEvent,
     CustomEvent,
     Interrupt,
     InterruptOutcome,
@@ -71,7 +70,7 @@ class AcpToAguiBridge:
 
         # Per-run state — reset on start_run()
         self._run_id: str | None = None
-        self._queue: asyncio.Queue | None = None
+        self._queue: asyncio.Queue[AguiEvent] | None = None
         self._current_message_id: str | None = None
         self._has_open_message: bool = False
         self._open_tool_calls: set[str] = set()
@@ -98,9 +97,23 @@ class AcpToAguiBridge:
         # Log collapsing for streaming chunks
         self._content_chunk_count: int = 0
 
+    @property
+    def cwd(self) -> str:
+        """Working directory used to resolve relative file paths."""
+        return self._cwd
+
+    @cwd.setter
+    def cwd(self, value: str) -> None:
+        self._cwd = value
+
+    @property
+    def run_id(self) -> str | None:
+        """The current run id, or None when no run is active."""
+        return self._run_id
+
     # ── Run lifecycle ────────────────────────────────────────────────────────
 
-    def start_run(self, run_id: str, queue: asyncio.Queue) -> None:
+    def start_run(self, run_id: str, queue: asyncio.Queue[AguiEvent]) -> None:
         """Begin a new run — reset state and emit RUN_STARTED."""
         self._run_id = run_id
         self._queue = queue
@@ -155,7 +168,7 @@ class AcpToAguiBridge:
             )
         self._run_id = None
 
-    def attach_resume_queue(self, run_id: str, queue: asyncio.Queue) -> None:
+    def attach_resume_queue(self, run_id: str, queue: asyncio.Queue[AguiEvent]) -> None:
         """Re-attach a new SSE stream to a prompt task suspended at a
         permission Future.
 
@@ -229,7 +242,7 @@ class AcpToAguiBridge:
 
         # If the update is a dict (fallback), handle it the old way
         if isinstance(update, dict):
-            self._handle_session_update_dict(update)
+            self._handle_session_update_dict(cast(dict[str, Any], update))
             return
 
         # Handle typed SDK objects
@@ -262,9 +275,11 @@ class AcpToAguiBridge:
         else:
             # Fallback: try to extract as dict
             if hasattr(update, "model_dump"):
-                self._handle_session_update_dict(update.model_dump(by_alias=True))
+                self._handle_session_update_dict(
+                    cast(dict[str, Any], update.model_dump(by_alias=True))
+                )
             elif hasattr(update, "__dict__"):
-                self._handle_session_update_dict(vars(update))
+                self._handle_session_update_dict(cast(dict[str, Any], vars(update)))
             else:
                 self._log.debug(
                     "Unhandled session_update type: %s", type(update).__name__
@@ -282,32 +297,40 @@ class AcpToAguiBridge:
         resolves the Future, unblocking the prompt task.
         """
         # Extract info from tool_call
-        tool_call_id = str(
-            getattr(tool_call, "tool_call_id", None)
-            or getattr(tool_call, "toolCallId", None)
-            or (tool_call.get("toolCallId") if isinstance(tool_call, dict) else None)
-            or str(uuid.uuid4())
-        )
-        tool_name = (
-            getattr(tool_call, "title", None)
-            or getattr(tool_call, "tool_name", None)
-            or getattr(tool_call, "toolName", None)
-            or (
-                tool_call.get("title", tool_call.get("toolName", "unknown"))
-                if isinstance(tool_call, dict)
-                else "unknown"
+        if isinstance(tool_call, dict):
+            tc_dict = cast(dict[str, Any], tool_call)
+            tool_call_id = str(
+                tc_dict.get("toolCallId") or tc_dict.get("tool_call_id") or uuid.uuid4()
             )
-        )
+            tool_name = str(
+                tc_dict.get("title")
+                or tc_dict.get("toolName")
+                or tc_dict.get("tool_name")
+                or "unknown"
+            )
+        else:
+            tool_call_id = str(
+                getattr(tool_call, "tool_call_id", None)
+                or getattr(tool_call, "toolCallId", None)
+                or uuid.uuid4()
+            )
+            tool_name = str(
+                getattr(tool_call, "title", None)
+                or getattr(tool_call, "tool_name", None)
+                or getattr(tool_call, "toolName", None)
+                or "unknown"
+            )
 
         # Extract options list for the client UI
+        options_list: list[Any]
         if isinstance(options, list):
-            options_list = options
+            options_list = cast(list[Any], options)
         elif hasattr(options, "__iter__"):
-            options_list = list(options)
+            options_list = [opt for opt in options]
         else:
             options_list = []
 
-        serialized_options = []
+        serialized_options: list[Any] = []
         for opt in options_list:
             if isinstance(opt, dict):
                 serialized_options.append(opt)
@@ -378,7 +401,9 @@ class AcpToAguiBridge:
         self._log.warning(
             "permission future %s expired (no resume) → cancelled", call_id
         )
-        response = acp.RequestPermissionResponse(outcome={"outcome": "cancelled"})
+        response = acp.RequestPermissionResponse(
+            outcome=acp.schema.DeniedOutcome(outcome="cancelled")
+        )
         future.set_result(response)
 
     async def ext_notification(self, method: str, params: dict[str, Any]) -> None:
@@ -474,7 +499,7 @@ class AcpToAguiBridge:
         self._log.info(
             "create_terminal: %s %s (id=%s)", command, args or [], terminal_id
         )
-        return acp.CreateTerminalResponse(terminalId=terminal_id)
+        return acp.CreateTerminalResponse(terminal_id=terminal_id)
 
     async def terminal_output(
         self, session_id: str, terminal_id: str, **kwargs: Any
@@ -492,7 +517,7 @@ class AcpToAguiBridge:
         self, session_id: str, terminal_id: str, **kwargs: Any
     ) -> acp.WaitForTerminalExitResponse:
         """Wait for a terminal to exit."""
-        return acp.WaitForTerminalExitResponse(exitCode=0)
+        return acp.WaitForTerminalExitResponse(exit_code=0)
 
     async def kill_terminal(
         self, session_id: str, terminal_id: str, **kwargs: Any
@@ -526,9 +551,13 @@ class AcpToAguiBridge:
 
         if approved:
             # OpenCode's option IDs are once/always/reject, NOT allow_once.
-            outcome = {"outcome": "selected", "optionId": option_id or "once"}
+            outcome: acp.schema.DeniedOutcome | acp.schema.AllowedOutcome = (
+                acp.schema.AllowedOutcome(
+                    option_id=option_id or "once", outcome="selected"
+                )
+            )
         else:
-            outcome = {"outcome": "cancelled"}
+            outcome = acp.schema.DeniedOutcome(outcome="cancelled")
 
         response = acp.RequestPermissionResponse(outcome=outcome)
         future.set_result(response)
@@ -612,7 +641,7 @@ class AcpToAguiBridge:
         )
 
         if isinstance(raw_input, dict):
-            raw_input.pop("__tool_use_purpose", None)
+            cast(dict[str, Any], raw_input).pop("__tool_use_purpose", None)
 
         self._emit(
             ToolCallStartEvent(
@@ -629,7 +658,9 @@ class AcpToAguiBridge:
         # the args delta with what IS available so the renderer isn't a
         # blank `{}`. When raw_input is populated (e.g. bash's {cwd}), it
         # passes through unchanged.
-        args_obj: dict[str, Any] = raw_input if isinstance(raw_input, dict) else {}
+        args_obj: dict[str, Any] = (
+            cast(dict[str, Any], raw_input) if isinstance(raw_input, dict) else {}
+        )
         kind = getattr(update, "kind", None)
         locations = getattr(update, "locations", None)
         if kind:
@@ -829,7 +860,7 @@ class AcpToAguiBridge:
             )
         self._open_tool_calls.clear()
 
-    def _emit(self, event: BaseAguiEvent) -> None:
+    def _emit(self, event: AguiEvent) -> None:
         """Put an event into the asyncio queue (non-blocking)."""
         if self._queue is None:
             self._log.warning("Cannot emit — no queue: %s", event.type)
@@ -872,15 +903,16 @@ class AcpToAguiBridge:
             except Exception:
                 pass
         if isinstance(result_obj, dict):
+            result_dict = cast(dict[str, Any], result_obj)
             # Prefer the ``output`` field when present (opencode populates this
             # for read/glob/bash results); fall back to the full dict so the
             # renderer still shows error/metadata payloads on failure.
-            if "output" in result_obj and isinstance(result_obj["output"], str):
-                return result_obj["output"]
+            if "output" in result_dict and isinstance(result_dict["output"], str):
+                return result_dict["output"]
             try:
-                return json.dumps(result_obj, default=str)
+                return json.dumps(result_dict, default=str)
             except Exception:
-                return str(result_obj)
+                return str(result_dict)
         try:
             return json.dumps(result_obj, default=str)
         except Exception:

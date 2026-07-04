@@ -38,12 +38,15 @@ async def lifespan(app: FastAPI):
     logger.info("Endpoints:")
     skip = {"/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc"}
     for route in app.routes:
-        if hasattr(route, "methods") and hasattr(route, "path"):
-            if route.path in skip:
-                continue
-            methods = ", ".join(sorted(route.methods - {"HEAD", "OPTIONS"}))
-            if methods:
-                logger.info(f"  {methods:6s} {route.path}")
+        path = getattr(route, "path", None)
+        methods = getattr(route, "methods", None)
+        if path is None or methods is None:
+            continue
+        if path in skip:
+            continue
+        joined = ", ".join(sorted(methods - {"HEAD", "OPTIONS"}))
+        if joined:
+            logger.info(f"  {joined:6s} {path}")
     logger.info("---")
 
     app.state.config = config

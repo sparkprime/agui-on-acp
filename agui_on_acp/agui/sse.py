@@ -4,18 +4,18 @@ import asyncio
 import logging
 from typing import Any, AsyncGenerator, Awaitable, Callable
 
-from agui_on_acp.agui.events import AguiEventType, BaseAguiEvent
+from agui_on_acp.agui.events import AguiEvent, AguiEventType
 
 logger = logging.getLogger(__name__)
 
 
-def encode_sse_event(event: BaseAguiEvent) -> str:
+def encode_sse_event(event: AguiEvent) -> str:
     json_str = event.model_dump_json(exclude_none=True)
     return f"event: {event.type.value}\ndata: {json_str}\n\n"
 
 
 async def event_stream(
-    queue: asyncio.Queue,
+    queue: asyncio.Queue[AguiEvent],
     task_id: str,
     timeout: float = 30.0,
     on_cancel: Callable[[], Awaitable[Any]] | None = None,
@@ -32,7 +32,7 @@ async def event_stream(
 
     while True:
         try:
-            event: BaseAguiEvent = await asyncio.wait_for(queue.get(), timeout=timeout)
+            event: AguiEvent = await asyncio.wait_for(queue.get(), timeout=timeout)
             yield encode_sse_event(event)
             if event.type in (AguiEventType.RUN_FINISHED, AguiEventType.RUN_ERROR):
                 logger.info(

@@ -8,7 +8,7 @@ is missing, empty, or malformed.
 import json
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from pydantic import BaseModel, Field
 
@@ -87,7 +87,7 @@ def load_config(config_path: str = "bridge.config.json") -> BridgeConfig:
         )
         return BridgeConfig()
 
-    snake_data = _camel_to_snake(raw_data)
+    snake_data = _camel_to_snake(cast(dict[str, Any], raw_data))
 
     try:
         return BridgeConfig(**snake_data)
