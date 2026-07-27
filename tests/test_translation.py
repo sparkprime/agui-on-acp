@@ -348,7 +348,9 @@ async def test_client_disconnect_triggers_acp_cancel(
 
 @pytest.mark.asyncio
 async def test_cancel_while_suspended_resolves_permission_cancelled(
-    fake_agent: FakeAcpAgent, http_client: httpx.AsyncClient
+    fake_agent: FakeAcpAgent,
+    session_manager: SessionManager,
+    http_client: httpx.AsyncClient,
 ):
     """Cancelling a run while it's suspended at a permission interrupt
     resolves the parked Future as cancelled and sends ``session/cancel``."""
@@ -359,9 +361,10 @@ async def test_cancel_while_suspended_resolves_permission_cancelled(
     async with http_client.stream("POST", "/ag-ui", json=_agui_body()) as resp:
         await read_until(resp, {"RUN_FINISHED"})
 
-    # Now cancel the suspended run directly via the /v2 cancel endpoint.
-    resp = await http_client.post("/v2/tasks/t1/cancel")
-    assert resp.status_code == 200
+    # Cancel the suspended run directly via the manager (the AG-UI surface
+    # has no separate cancel endpoint; clients either resume with
+    # status="cancelled" or let the permission TTL expire).
+    await session_manager.cancel_run("t1")
 
     await asyncio.wait_for(fake_agent.prompt_done.wait(), timeout=5.0)
     assert len(fake_agent.permission_replies) == 1

@@ -8,30 +8,23 @@
 │                        localhost:9001                                    │
 │                                                                         │
 │  ┌────────────────────────────────────────────────────────────────────┐ │
-│  │                    AG-UI + Task Routes                              │ │
-│  │  POST /ag-ui              — Standard AG-UI endpoint (fresh + resume)│ │
-│  │  POST /v2/tasks            — Create task (spawn agent)               │ │
-│  │  POST /v2/tasks/{id}/run  — Start run (send prompt)                 │ │
-│  │  GET  /v2/tasks/{id}/events — SSE event stream                     │ │
-│  │  POST /v2/tasks/{id}/cancel — Cancel run + resolve pending perms   │ │
+│  │                    AG-UI Endpoint                                   │ │
+│  │  POST /ag-ui              — Standard AG-UI run (fresh + resume)     │ │
+│  │  GET  /health             — Liveness probe                          │ │
 │  └───────────────────────────┬────────────────────────────────────────┘ │
 │                              │                                           │
 │  ┌───────────────────────────┼───────────────────────────────────────┐  │
 │  │                     SessionManager                                 │  │
-│  │  ┌─────────────┐  ┌──────┴──────┐  ┌──────────────────────────┐   │  │
-│  │  │ SessionStore │  │ AgentRunner │  │ AcpToAguiBridge          │   │  │
-│  │  │ (SQLite)    │  │ (ACP proc)  │  │ (event translator)       │   │  │
-│  │  └─────────────┘  └──────┬──────┘  └──────────────────────────┘   │  │
-│  │                          │                                        │  │
+│  │  ┌──────────────────────┐  ┌──────────────────────────────────┐   │  │
+│  │  │ AgentRunner          │  │ AcpToAguiBridge                  │   │  │
+│  │  │ (ACP proc)           │  │ (event translator)               │   │  │
+│  │  └──────┬───────────────┘  └──────────────────────────────────┘   │  │
+│  │         │                                                          │  │
 │  │               ┌──────────┴──────────┐                             │  │
 │  │               │ AcpProtocol         │                             │  │
 │  │               │ (JSON-RPC interface) │                             │  │
 │  │               └──────────┬──────────┘                             │  │
 │  └──────────────────────────┼────────────────────────────────────────┘  │
-│                             │                                            │
-│  ┌──────────────────────────┴───────────────────────────────────────┐   │
-│  │ Side-Channel APIs: /api/files │ /api/git                          │   │
-│  └───────────────────────────────────────────────────────────────────┘   │
 └──────────────────────────────┼──────────────────────────────────────────┘
                                │
                                │ stdin/stdout (JSON-RPC 2.0 / ndjson)
@@ -42,6 +35,10 @@
                     └──────────────────────┘
 ```
 
+All session state is held in memory by `SessionManager` — there is no
+database. Restarting the process loses active sessions; AG-UI clients
+should start a fresh `threadId` after a bridge restart.
+
 ## Core Components
 
 ### Backend
@@ -49,15 +46,13 @@
 | Module | Path | Description |
 |--------|------|-------------|
 | Main | `agui_on_acp/main.py` | FastAPI app, lifespan, router setup |
-| Config | `agui_on_acp/config.py` | Bridge config loader (`bridge.config.json`) |
+| Config | `agui_on_acp/config.py` | Bridge config loader (env var / `bridge.config.json`) |
 | Agent Runner | `agui_on_acp/agent/runner.py` | Subprocess management (parameterized command) |
 | ACP Protocol | `agui_on_acp/agent/acp_protocol.py` | Typed JSON-RPC interface |
 | Bridge | `agui_on_acp/bridge/acp_to_agui.py` | ACP notification → AG-UI event translator (interrupt/resume HITL) |
 | AG-UI Events | `agui_on_acp/agui/events.py` | Pydantic event type models (incl. Interrupt, InterruptOutcome) |
 | SSE Encoder | `agui_on_acp/agui/sse.py` | SSE stream encoding (cancel-on-disconnect) |
-| Session Manager | `agui_on_acp/sessions/manager.py` | Session lifecycle orchestration (start_run, resume_run, cancel_run) |
-| Session Store | `agui_on_acp/sessions/store.py` | SQLite-backed persistence |
-| Session Routes | `agui_on_acp/sessions/routes.py` | REST API endpoints (/v2/*) |
+| Session Manager | `agui_on_acp/sessions/manager.py` | In-memory session lifecycle (start_run, resume_run, cancel_run) |
 | AG-UI Endpoint | `agui_on_acp/agui_endpoint.py` | Standard POST /ag-ui (fresh + resume routing) |
 
 ## Data Flow

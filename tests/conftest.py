@@ -19,7 +19,6 @@ the OS subprocess — replaced by the in-process transport pair.
 from __future__ import annotations
 
 import asyncio
-import os
 import sys
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
@@ -41,7 +40,6 @@ from httpx import ASGITransport
 import agui_on_acp.bridge.acp_to_agui as _bridge_mod
 from agui_on_acp.main import app as fastapi_app
 from agui_on_acp.sessions.manager import SessionManager
-from agui_on_acp.sessions.store import SessionStore
 from tests.fake_agent import FakeAcpAgent
 from tests.transport import TransportPair, make_transport_pair
 
@@ -139,23 +137,12 @@ def _patch_runner_spawn(agent: FakeAcpAgent) -> None:
 
 @pytest_asyncio.fixture
 async def session_manager(fake_agent: FakeAcpAgent) -> AsyncIterator[SessionManager]:
-    # Use a temp on-disk sqlite path so parallel runs don't clash.
-    db_path = os.path.join("/tmp/opencode", f"test-{os.getpid()}-{id(fake_agent)}.db")
-    os.makedirs("/tmp/opencode", exist_ok=True)
-    store = SessionStore(db_path=db_path)
-    await store.initialize()
-
-    manager = SessionManager(store, agent_command=["fake"])
+    manager = SessionManager(agent_command=["fake"])
     _patch_runner_spawn(fake_agent)
     try:
         yield manager
     finally:
         await manager.shutdown()
-        await store.close()
-        try:
-            os.remove(db_path)
-        except OSError:
-            pass
 
 
 @pytest_asyncio.fixture
@@ -163,7 +150,6 @@ async def http_client(
     session_manager: SessionManager,
 ) -> AsyncIterator[httpx.AsyncClient]:
     fastapi_app.state.session_manager = session_manager
-    fastapi_app.state.session_store = session_manager.store
     transport = ASGITransport(app=fastapi_app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         yield client

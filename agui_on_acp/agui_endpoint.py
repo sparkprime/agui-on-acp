@@ -124,7 +124,6 @@ async def ag_ui_run(body: RunAgentInput, request: Request):
     if active is None:
         fp = body.forwardedProps
         cwd = fp.get("cwd", ".")
-        title = fp.get("title", "AG-UI Session")
         resume_session_id = fp.get("resumeSessionId")
         mode = fp.get("mode")
         model = fp.get("model")
@@ -133,7 +132,6 @@ async def ag_ui_run(body: RunAgentInput, request: Request):
             active = await manager.create_task(
                 task_id=thread_id,
                 cwd=cwd,
-                title=title,
                 resume_session_id=resume_session_id,
                 mode=mode,
                 model=model,

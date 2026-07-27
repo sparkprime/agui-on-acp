@@ -51,22 +51,15 @@ async def lifespan(app: FastAPI):
 
     app.state.config = config
 
-    from agui_on_acp.sessions.store import SessionStore
-
-    session_store = SessionStore(db_path=config.db_path)
-    await session_store.initialize()
-    app.state.session_store = session_store
-
     from agui_on_acp.sessions.manager import SessionManager
 
-    session_manager = SessionManager(session_store, agent_command=config.agent_command)
+    session_manager = SessionManager(agent_command=config.agent_command)
     app.state.session_manager = session_manager
 
     yield
 
     logger.info("Shutting down ACP → AG-UI Bridge")
     await session_manager.shutdown()
-    await session_store.close()
 
 
 app = FastAPI(
@@ -90,10 +83,6 @@ async def health_check() -> HealthResponse:
     """Health check endpoint."""
     return HealthResponse(status="ok", version=__version__, project=config.project_name)
 
-
-from agui_on_acp.sessions.routes import router as sessions_router
-
-app.include_router(sessions_router, tags=["sessions"])
 
 from agui_on_acp.agui_endpoint import router as agui_router
 

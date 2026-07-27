@@ -2,6 +2,10 @@
 
 Manages active sessions: spawns agent via acp.spawn_agent_process, initialises
 the connection, holds per-session state, and coordinates run/approval flows.
+
+All state is in-memory: the manager keeps no persistent store. Sessions are
+lost when the process restarts; AG-UI clients are expected to start a fresh
+threadId in that case.
 """
 
 from __future__ import annotations
@@ -16,7 +20,6 @@ from agui_on_acp.agent.acp_protocol import AcpProtocol
 from agui_on_acp.agent.runner import AgentRunner
 from agui_on_acp.agui.events import AguiEvent
 from agui_on_acp.bridge.acp_to_agui import AcpToAguiBridge
-from agui_on_acp.sessions.store import SessionStore
 
 logger = logging.getLogger(__name__)
 
@@ -39,22 +42,19 @@ class ActiveSession:
 
 
 class SessionManager:
-    def __init__(
-        self, store: SessionStore, agent_command: list[str] | None = None
-    ) -> None:
-        self._store = store
+    def __init__(self, agent_command: list[str] | None = None) -> None:
         self._sessions: dict[str, ActiveSession] = {}
         self._agent_command = agent_command or ["kiro-cli", "acp"]
 
     @property
-    def store(self) -> SessionStore:
-        return self._store
+    def sessions(self) -> dict[str, ActiveSession]:
+        """Read-only view of the active sessions (used by the AG-UI router)."""
+        return self._sessions
 
     async def create_task(
         self,
         task_id: str,
         cwd: str,
-        title: str = "New Task",
         resume_session_id: str | None = None,
         mode: str | None = None,
         model: str | None = None,
@@ -171,9 +171,6 @@ class SessionManager:
 
         self._sessions[task_id] = active
 
-        await self._store.create(
-            task_id=task_id, agent_session_id=agent_session_id, cwd=cwd, title=title
-        )
         logger.info("session ready → %s (agent=%s)", task_id, " ".join(command))
         return active
 
@@ -235,7 +232,6 @@ class SessionManager:
 
         active.bridge.start_run(run_id, queue)
 
-        await self._store.update(task_id, status="running")
         asyncio.create_task(self._run_prompt(active, run_id, prompt))
         return run_id
 
@@ -252,8 +248,6 @@ class SessionManager:
         except Exception as exc:
             logger.error("Run %s failed: %s", run_id, exc)
             active.bridge.error_run(str(exc))
-        finally:
-            await self._store.update(active.task_id, status="idle")
 
     def get_event_queue(
         self, task_id: str, run_id: str
@@ -313,7 +307,6 @@ class SessionManager:
                     interrupt_id, approved=True, option_id=option_id
                 )
 
-        await self._store.update(task_id, status="running")
         return run_id
 
     async def cancel_run(self, task_id: str) -> None:
@@ -323,7 +316,6 @@ class SessionManager:
         # hanging on a dead session.
         active.bridge.cancel_all_permissions()
         await active.protocol.cancel(active.agent_session_id)
-        await self._store.update(task_id, status="idle")
 
     async def set_mode(self, task_id: str, mode_id: str) -> Any:
         active = self._get_active(task_id)
