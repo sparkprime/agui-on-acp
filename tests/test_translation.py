@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from typing import Any
+from typing import Any, cast
 
 import httpx
 import pytest
@@ -941,10 +941,15 @@ async def test_forwarded_props_mcp_servers_are_passed_to_session(
     assert len(fake_agent.new_session_calls) == 1
     mcp = fake_agent.new_session_calls[0]["mcp_servers"]
     assert mcp, "expected mcp_servers to be forwarded to session/new"
-    assert any(
-        isinstance(s, dict)
-        and s.get("type") == "http"
-        or hasattr(s, "type")
-        and getattr(s, "type", None) == "http"
-        for s in mcp
-    )
+    servers = cast(list[Any], mcp)
+    found_http = False
+    for s in servers:
+        if isinstance(s, dict):
+            s_dict = cast(dict[str, Any], s)
+            stype: Any = s_dict.get("type")
+        else:
+            stype = getattr(s, "type", None)
+        if stype == "http":
+            found_http = True
+            break
+    assert found_http, "expected an http MCP server in session/new"

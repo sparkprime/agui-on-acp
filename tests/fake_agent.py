@@ -660,33 +660,34 @@ class FakeAcpAgent:
     def _build_config_option(self, opt: dict[str, Any]) -> Any:
         """Build a ``SessionConfigOptionSelect`` or ``SessionConfigOptionBoolean``
         from a plain dict (the shape tests pass in)."""
-        opt_type = opt.get("type", "select")
-        common = {
-            "id": opt["id"],
-            "name": opt["name"],
-            "description": opt.get("description"),
-            "category": opt.get("category"),
+        opt_dict = opt
+        opt_type = opt_dict.get("type", "select")
+        common: dict[str, Any] = {
+            "id": opt_dict["id"],
+            "name": opt_dict["name"],
+            "description": opt_dict.get("description"),
+            "category": opt_dict.get("category"),
         }
         if opt_type == "boolean":
             return schema.SessionConfigOptionBoolean(
                 type="boolean",
                 current_value=bool(
-                    opt.get("currentValue", opt.get("current_value", False))
+                    opt_dict.get("currentValue", opt_dict.get("current_value", False))
                 ),
                 **common,
             )
         # select
-        raw_options = opt.get("options", [])
+        raw_options = cast(list[dict[str, Any]], opt_dict.get("options", []))
         options: list[Any] = []
         for o in raw_options:
-            if isinstance(o, dict) and "options" in o and "group" in o:
+            if "options" in o and "group" in o:
                 options.append(
                     schema.SessionConfigSelectGroup(
                         group=o["group"],
                         name=o["name"],
                         options=[
                             schema.SessionConfigSelectOption(**oo)
-                            for oo in o["options"]
+                            for oo in cast(list[dict[str, Any]], o["options"])
                         ],
                     )
                 )
@@ -694,7 +695,9 @@ class FakeAcpAgent:
                 options.append(schema.SessionConfigSelectOption(**o))
         return schema.SessionConfigOptionSelect(
             type="select",
-            current_value=str(opt.get("currentValue", opt.get("current_value", ""))),
+            current_value=str(
+                opt_dict.get("currentValue", opt_dict.get("current_value", ""))
+            ),
             options=options,
             **common,
         )
@@ -754,7 +757,7 @@ class FakeAcpAgent:
             mode = schema.ElicitationUrlSessionMode(
                 session_id=session_id,
                 elicitation_id=step.elicitation_id or "elic-url-1",
-                url=step.url or "https://example.com/auth",
+                url=cast(Any, step.url or "https://example.com/auth"),
             )
         elif step.mode_kind == "form_request":
             mode = schema.ElicitationFormRequestMode(
@@ -773,7 +776,9 @@ class FakeAcpAgent:
             _ElicitationReply(
                 message=step.message,
                 action=action,
-                content=content if isinstance(content, dict) else None,
+                content=(
+                    cast(dict[str, Any], content) if isinstance(content, dict) else None
+                ),
             )
         )
 
@@ -783,18 +788,22 @@ class FakeAcpAgent:
         if schema_dict is None:
             return schema.ElicitationSchema(properties={})
         properties: dict[str, Any] = {}
-        for name, prop in (schema_dict.get("properties") or {}).items():
-            ptype = prop.get("type", "string")
+        raw_props = cast(dict[str, dict[str, Any]], schema_dict.get("properties") or {})
+        for name, prop in raw_props.items():
+            prop_dict = prop
+            ptype = prop_dict.get("type", "string")
             if ptype == "number":
-                properties[name] = schema.ElicitationNumberPropertySchema(**prop)
+                properties[name] = schema.ElicitationNumberPropertySchema(**prop_dict)
             elif ptype == "integer":
-                properties[name] = schema.ElicitationIntegerPropertySchema(**prop)
+                properties[name] = schema.ElicitationIntegerPropertySchema(**prop_dict)
             elif ptype == "boolean":
-                properties[name] = schema.ElicitationBooleanPropertySchema(**prop)
+                properties[name] = schema.ElicitationBooleanPropertySchema(**prop_dict)
             elif ptype == "array":
-                properties[name] = schema.ElicitationMultiSelectPropertySchema(**prop)
+                properties[name] = schema.ElicitationMultiSelectPropertySchema(
+                    **prop_dict
+                )
             else:
-                properties[name] = schema.ElicitationStringPropertySchema(**prop)
+                properties[name] = schema.ElicitationStringPropertySchema(**prop_dict)
         return schema.ElicitationSchema(
             title=schema_dict.get("title"),
             description=schema_dict.get("description"),

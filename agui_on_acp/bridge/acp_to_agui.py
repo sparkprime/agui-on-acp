@@ -948,16 +948,12 @@ class AcpToAguiBridge:
             )
         elif kind == "agent_thought_chunk":
             content = update.get("content", {})
-            self._emit(
-                CustomEvent(
-                    name="agent:thought",
-                    value={
-                        "delta": (
-                            content.get("text", "") if isinstance(content, dict) else ""
-                        )
-                    },
-                )
+            thought_text = (
+                cast(dict[str, Any], content).get("text", "")
+                if isinstance(content, dict)
+                else ""
             )
+            self._emit(CustomEvent(name="agent:thought", value={"delta": thought_text}))
         else:
             self._log.debug("Unhandled session/update kind: %s", kind)
 
@@ -1290,7 +1286,8 @@ def _model_to_dict(obj: Any) -> Any:
     if obj is None:
         return None
     if isinstance(obj, list):
-        return [_model_to_dict(item) for item in obj]
+        items = cast(list[Any], obj)
+        return [_model_to_dict(item) for item in items]
     if hasattr(obj, "model_dump"):
         try:
             return obj.model_dump(by_alias=True, mode="json", exclude_none=True)
@@ -1310,8 +1307,9 @@ def serialize_config_options(options: Any) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     if not options:
         return out
-    for opt in options:
-        raw = _model_to_dict(opt) or {}
+    opts_list = cast(list[Any], options)
+    for opt in opts_list:
+        raw = _model_to_dict(opt)
         if not isinstance(raw, dict):
             continue
         d: dict[str, Any] = cast(dict[str, Any], raw)
@@ -1321,11 +1319,12 @@ def serialize_config_options(options: Any) -> list[dict[str, Any]]:
         opts = d.get("options")
         if isinstance(opts, list):
             norm: list[dict[str, Any]] = []
-            for o in opts:
+            for o in cast(list[Any], opts):
                 if isinstance(o, dict):
-                    cast(dict[str, Any], o).pop("field_meta", None)
-                    cast(dict[str, Any], o).pop("_meta", None)
-                    norm.append(o)
+                    option_dict = cast(dict[str, Any], o)
+                    option_dict.pop("field_meta", None)
+                    option_dict.pop("_meta", None)
+                    norm.append(option_dict)
             d["options"] = norm
         out.append(d)
     return out

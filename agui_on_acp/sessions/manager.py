@@ -423,7 +423,7 @@ def _normalize_mcp_servers(
     for key, server in mcp_servers.items():
         if not isinstance(server, dict):
             continue
-        norm = dict(server)
+        norm: dict[str, Any] = dict(cast(dict[str, Any], server))
         norm.setdefault("name", key)
         # http/sse servers require a headers list.
         if norm.get("type") in ("http", "sse"):
