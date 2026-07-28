@@ -6,12 +6,79 @@ into an asyncio.Queue that the SSE endpoint drains.
 
 The bridge satisfies the acp.Client Protocol structurally:
     - session_update(session_id, update) — handles streaming updates
-    - request_permission(options, session_id, tool_call) — handles tool approval
+    - request_permission(session_id, tool_call, options) — handles tool approval
     - ext_notification(method, params) — handles _kiro.dev/* extensions
     - ext_method(method, params) — handles vendor extension methods
     - read_text_file, write_text_file — file operations for the agent
     - create_terminal, terminal_output, etc. — terminal operations
+    - create_elicitation, complete_elicitation — ACP 0.11 elicitation (stubbed)
     - on_connect(conn) — called when the connection is established
+
+Per-run state machine
+---------------------
+
+The bridge holds a small amount of per-run state so that ACP's frameless
+delta stream can be translated into AG-UI's framed START/CONTENT/END
+events. ``start_run()`` resets the state; ``attach_resume_queue()``
+resets the message slot but deliberately preserves ``_open_tool_calls``
+across the suspend/resume boundary (the tool call that triggered the
+permission is still open and continues after resume).
+
+::
+
+                start_run()
+                    │
+                    ▼
+          ┌─────────────────┐
+          │  No Open State  │
+          └────────┬────────┘
+                   │
+      agent_message_chunk
+                   │
+                   ▼
+          ┌─────────────────┐
+          │  Message Open   │──── agent_message_chunk ──→ (emit CONTENT)
+          └────────┬────────┘
+                   │
+              tool_call
+                   │
+  (close message: emit END)
+                   │
+                   ▼
+          ┌─────────────────┐
+          │  Tool Call Open │──── tool_call_update ──→ (emit ARGS/END)
+          └────────┬────────┘
+                   │
+              turn_end
+                   │
+  (close all: emit FINISHED)
+                   │
+                   ▼
+          ┌─────────────────┐
+          │    Run Done     │
+          └─────────────────┘
+
+Sequencing rules
+----------------
+
+1. **Only one text message can be open at a time.** If a ``tool_call``
+   arrives while a message is open, the bridge emits ``TEXT_MESSAGE_END``
+   first.
+2. **Multiple tool calls can be open simultaneously.** Each gets its own
+   ``TOOL_CALL_START`` and is tracked by id in ``_open_tool_calls`` until
+   ``TOOL_CALL_END``.
+3. **``turn_end`` closes everything.** Any open message gets
+   ``TEXT_MESSAGE_END``, all open tool calls get ``TOOL_CALL_END`` (plus
+   a synthesised empty ``TOOL_CALL_RESULT`` so CopilotKit's renderer can
+   flip orphaned calls to "complete"), then ``RUN_FINISHED`` is emitted.
+4. **Vendor extensions arriving before the first run are buffered** in
+   ``_pending_notifications`` and flushed as ``CUSTOM`` events when
+   ``start_run()`` / ``attach_resume_queue()`` is called — otherwise
+   session-init notifications would be lost (no SSE stream exists yet).
+
+For the full ACP ↔ AG-UI field mapping (including the interrupt/resume
+permission flow and every dropped ACP 0.11 variant) see
+``docs/agui-acp-mapping.md``.
 """
 
 from __future__ import annotations
@@ -286,7 +353,7 @@ class AcpToAguiBridge:
                 )
 
     async def request_permission(
-        self, options: Any, session_id: str, tool_call: Any, **kwargs: Any
+        self, session_id: str, tool_call: Any, options: Any, **kwargs: Any
     ) -> acp.RequestPermissionResponse:
         """Handle tool approval requests from the SDK.
 
@@ -434,10 +501,10 @@ class AcpToAguiBridge:
 
     async def read_text_file(
         self,
-        path: str,
         session_id: str,
-        limit: int | None = None,
+        path: str,
         line: int | None = None,
+        limit: int | None = None,
         **kwargs: Any,
     ) -> acp.ReadTextFileResponse:
         """Read a text file on behalf of the agent."""
@@ -462,7 +529,7 @@ class AcpToAguiBridge:
             return acp.ReadTextFileResponse(content=f"Error reading file: {exc}")
 
     async def write_text_file(
-        self, content: str, path: str, session_id: str, **kwargs: Any
+        self, session_id: str, path: str, content: str, **kwargs: Any
     ) -> acp.WriteTextFileResponse | None:
         """Write a text file on behalf of the agent."""
         self._log.debug("write_text_file: %s", path)
@@ -482,11 +549,11 @@ class AcpToAguiBridge:
 
     async def create_terminal(
         self,
-        command: str,
         session_id: str,
+        command: str,
         args: list[str] | None = None,
-        cwd: str | None = None,
         env: Any = None,
+        cwd: str | None = None,
         output_byte_limit: int | None = None,
         **kwargs: Any,
     ) -> acp.CreateTerminalResponse:
@@ -524,6 +591,25 @@ class AcpToAguiBridge:
     ) -> acp.KillTerminalResponse | None:
         """Kill a terminal."""
         return acp.KillTerminalResponse()
+
+    # ── acp.Client Protocol — Elicitation (ACP 0.11) ─────────────────────────
+    # The bridge doesn't surface elicitations to the AG-UI client, so we
+    # decline every request and treat completions as no-ops. Implementing
+    # these (even as stubs) is required to satisfy the acp.Client Protocol
+    # introduced in agent-client-protocol 0.11.
+
+    async def create_elicitation(
+        self, message: str, mode: Any, **kwargs: Any
+    ) -> Any:
+        """Decline every elicitation request from the agent."""
+        self._log.debug("create_elicitation (declined): %s", message)
+        return acp.DeclineElicitationResponse(action="decline")
+
+    async def complete_elicitation(
+        self, elicitation_id: str, **kwargs: Any
+    ) -> None:
+        """No-op: the bridge never started an elicitation."""
+        self._log.debug("complete_elicitation: %s", elicitation_id)
 
     # ── Permission resolution (called by SessionManager on resume/cancel) ────
 

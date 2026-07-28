@@ -46,8 +46,6 @@ class DemoFormatter(logging.Formatter):
             prefix = f"{GREEN}▶ AG-UI{RESET}"
         elif "manager" in name:
             prefix = f"{BOLD}  ◆    {RESET}"
-        elif "store" in name:
-            prefix = f"{DIM}  SYS  {RESET}"
         else:
             prefix = f"{DIM}  ...  {RESET}"
 

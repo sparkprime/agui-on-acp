@@ -349,11 +349,13 @@ class FakeAcpAgent:
         self.set_mode_calls.append((session_id, mode_id))
         return schema.SetSessionModeResponse()
 
-    async def set_session_model(
-        self, model_id: str, session_id: str, **kwargs: Any
-    ) -> schema.SetSessionModelResponse:
-        self.set_model_calls.append((session_id, model_id))
-        return schema.SetSessionModelResponse()
+    async def set_config_option(
+        self, config_id: str, session_id: str, value: str | bool, **kwargs: Any
+    ) -> schema.SetSessionConfigOptionResponse | None:
+        # In ACP 0.11+ the model is a config option with config_id == "model".
+        if config_id == "model":
+            self.set_model_calls.append((session_id, str(value)))
+        return None
 
     async def prompt(
         self,

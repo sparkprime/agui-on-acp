@@ -108,9 +108,14 @@ class AcpProtocol:
         return await self.conn.set_session_mode(mode_id=mode_id, session_id=session_id)
 
     async def set_model(self, session_id: str, model_id: str) -> Any:
+        """Set the agent's model for a session.
+
+        In ACP 0.11+ the model is a session config option (``session/set_config_option``)
+        selected via ``config_id="model"``, not its own JSON-RPC method.
+        """
         self._log.info("Setting model %s for session %s", model_id, session_id)
-        return await self.conn.set_session_model(
-            model_id=model_id, session_id=session_id
+        return await self.conn.set_config_option(
+            config_id="model", session_id=session_id, value=model_id
         )
 
     async def execute_command(

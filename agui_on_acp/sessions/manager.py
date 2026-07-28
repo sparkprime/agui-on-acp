@@ -44,7 +44,7 @@ class ActiveSession:
 class SessionManager:
     def __init__(self, agent_command: list[str] | None = None) -> None:
         self._sessions: dict[str, ActiveSession] = {}
-        self._agent_command = agent_command or ["kiro-cli", "acp"]
+        self._agent_command = agent_command or ["opencode", "acp"]
 
     @property
     def sessions(self) -> dict[str, ActiveSession]:
