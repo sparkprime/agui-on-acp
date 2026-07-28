@@ -39,6 +39,10 @@ class ActiveSession:
     modes: list[dict[str, str]] | None = None
     models: list[dict[str, str]] | None = None
     current_mode_id: str | None = None
+    # ACP 0.11 config options (carries the model list + arbitrary config).
+    # Stored as the wire-shaped dicts produced by the bridge serializer so
+    # the STATE_SNAPSHOT emitter can pass them straight through.
+    config_options: list[dict[str, Any]] | None = None
 
 
 class SessionManager:
@@ -60,6 +64,7 @@ class SessionManager:
         model: str | None = None,
         mcp_servers: dict[str, Any] | None = None,
         agent_command: list[str] | None = None,
+        config_options: dict[str, Any] | None = None,
     ) -> ActiveSession:
         # Create the bridge (satisfies acp.Client Protocol) before spawning
         bridge = AcpToAguiBridge(task_id)
@@ -79,10 +84,11 @@ class SessionManager:
         await protocol.initialize()
 
         # Create or load session
-        mcp_list = list(mcp_servers.values()) if mcp_servers else []
+        mcp_list = _normalize_mcp_servers(mcp_servers)
         modes: list[dict[str, str]] | None = None
         models: list[dict[str, str]] | None = None
         current_mode_id: str | None = None
+        config_opts: list[dict[str, Any]] | None = None
         agent_session_id: str = ""
 
         if resume_session_id:
@@ -106,10 +112,16 @@ class SessionManager:
                         }
                         for m in models_obj.get("availableModels", [])
                     ]
+                config_opts = _normalize_config_options(
+                    result_dict.get("configOptions")
+                )
             else:
                 agent_session_id = str(
                     getattr(result, "session_id", None)
                     or getattr(result, "sessionId", resume_session_id)
+                )
+                config_opts = _normalize_config_options(
+                    getattr(result, "config_options", None)
                 )
         else:
             result = await protocol.new_session(cwd, mcp_list)
@@ -123,6 +135,9 @@ class SessionManager:
                         for m in modes_obj.get("availableModes", [])
                     ]
                     current_mode_id = modes_obj.get("currentModeId")
+                config_opts = _normalize_config_options(
+                    result_dict.get("configOptions")
+                )
             else:
                 agent_session_id = str(
                     getattr(result, "session_id", None)
@@ -143,6 +158,9 @@ class SessionManager:
                     current_mode_id = getattr(
                         result_modes, "current_mode_id", None
                     ) or getattr(result_modes, "currentModeId", None)
+                config_opts = _normalize_config_options(
+                    getattr(result, "config_options", None)
+                )
 
         # Set mode/model if requested (skip generic "default" placeholder)
         if mode and mode != "default" and agent_session_id:
@@ -156,6 +174,19 @@ class SessionManager:
                 await protocol.set_model(agent_session_id, model)
             except Exception as exc:
                 logger.warning("Failed to set model %s: %s", model, exc)
+        # Apply any additional config options from forwardedProps.configOptions
+        # (the model is handled above for backward compat — applying it again
+        # via the generic path would be redundant but harmless; skip it here).
+        if config_options and agent_session_id:
+            for config_id, value in config_options.items():
+                if config_id == "model":
+                    continue
+                try:
+                    await protocol.set_config_option(agent_session_id, config_id, value)
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to set config option %s=%s: %s", config_id, value, exc
+                    )
 
         active = ActiveSession(
             task_id=task_id,
@@ -167,6 +198,7 @@ class SessionManager:
             modes=modes,
             models=models,
             current_mode_id=current_mode_id,
+            config_options=config_opts,
         )
 
         self._sessions[task_id] = active
@@ -285,27 +317,13 @@ class SessionManager:
         # the woken prompt task land in the new queue, not the nulled one.
         active.bridge.attach_resume_queue(run_id, queue)
 
-        # Resolve each resume entry against its parked future.
+        # Resolve each resume entry against its parked future. The bridge
+        # dispatches by id across both the permission and elicitation tables.
         for entry in resume_entries:
             interrupt_id = str(entry.get("interruptId", ""))
             status = str(entry.get("status", ""))
             payload = entry.get("payload")
-            if status == "cancelled":
-                active.bridge.resolve_permission(interrupt_id, approved=False)
-            else:
-                # payload may be a string (optionId), a dict with optionId,
-                # or None (default to "once").
-                if isinstance(payload, str):
-                    option_id: str = payload
-                elif isinstance(payload, dict):
-                    option_id = str(
-                        cast(dict[str, Any], payload).get("optionId", "once")
-                    )
-                else:
-                    option_id = "once"
-                active.bridge.resolve_permission(
-                    interrupt_id, approved=True, option_id=option_id
-                )
+            active.bridge.resolve_interrupt(interrupt_id, status, payload)
 
         return run_id
 
@@ -326,6 +344,14 @@ class SessionManager:
     async def set_model(self, task_id: str, model_id: str) -> None:
         active = self._get_active(task_id)
         await active.protocol.set_model(active.agent_session_id, model_id)
+
+    async def set_config_option(self, task_id: str, config_id: str, value: Any) -> None:
+        """Apply a single config option mid-session via
+        ``session/set_config_option`` (ACP 0.11)."""
+        active = self._get_active(task_id)
+        await active.protocol.set_config_option(
+            active.agent_session_id, config_id, value
+        )
 
     async def execute_command(
         self, task_id: str, command: str, args: dict[str, Any] | None = None
@@ -363,3 +389,44 @@ class SessionManager:
 
 # Backward-compatible alias
 TaskManager = SessionManager
+
+
+def _normalize_config_options(options: Any) -> list[dict[str, Any]] | None:
+    """Normalize the ``configOptions`` field of a NewSessionResponse /
+    LoadSessionResponse into the wire-shaped dicts advertised to the AG-UI
+    client. Accepts either a list of SDK models or a list of raw dicts (from
+    the dict response path). Returns ``None`` when no options were advertised
+    so the caller can distinguish "empty list" from "absent"."""
+    if not options:
+        return None
+    # Import lazily to avoid a cycle at import time.
+    from agui_on_acp.bridge.acp_to_agui import serialize_config_options
+
+    return serialize_config_options(options)
+
+
+def _normalize_mcp_servers(
+    mcp_servers: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Coerce the AG-UI ``forwardedProps.mcpServers`` shape into the ACP
+    ``McpServer`` schema expected by ``session/new`` / ``session/load``.
+
+    AG-UI clients (CopilotKit) pass a ``{name: {type, url?, command?, ...}}``
+    dict; ACP requires each server to carry a ``name`` and (for http/sse) a
+    ``headers`` list. This fills in the dict key as ``name`` and defaults
+    ``headers`` to ``[]`` so the SDK's strict validation passes. Anything
+    already conforming is passed through unchanged.
+    """
+    if not mcp_servers:
+        return []
+    out: list[dict[str, Any]] = []
+    for key, server in mcp_servers.items():
+        if not isinstance(server, dict):
+            continue
+        norm = dict(server)
+        norm.setdefault("name", key)
+        # http/sse servers require a headers list.
+        if norm.get("type") in ("http", "sse"):
+            norm.setdefault("headers", [])
+        out.append(norm)
+    return out

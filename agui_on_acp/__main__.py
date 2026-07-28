@@ -42,7 +42,7 @@ from agui_on_acp.config import (
     metavar="COMMAND",
     help=(
         "Command (and args) used to spawn the ACP agent, as a single "
-        "shell-style string, e.g. `--agent-command \"opencode acp\"`. "
+        'shell-style string, e.g. `--agent-command "opencode acp"`. '
         f"Default: {' '.join(agent_command())}."
     ),
 )

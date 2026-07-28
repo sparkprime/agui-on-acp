@@ -101,6 +101,7 @@ from agui_on_acp.agui.events import (
     RunErrorEvent,
     RunFinishedEvent,
     RunStartedEvent,
+    StateSnapshotEvent,
     TextMessageContentEvent,
     TextMessageEndEvent,
     TextMessageStartEvent,
@@ -157,6 +158,13 @@ class AcpToAguiBridge:
         # Per-future TTL handles so we can cancel the expiry timer when a
         # resume/cancel resolves the future first.
         self._permission_timers: dict[str, asyncio.TimerHandle] = {}
+
+        # Elicitation futures — same suspend/resume pattern as permissions,
+        # but for ACP 0.11 ``create_elicitation``. Keyed by the elicitation
+        # id (taken from the request for URL mode, or generated for form
+        # mode). The interrupt id surfaced to the AG-UI client === this key.
+        self._elicitation_futures: dict[str, asyncio.Future[Any]] = {}
+        self._elicitation_timers: dict[str, asyncio.TimerHandle] = {}
 
         # Working directory for file operations (set by session manager)
         self._cwd: str = ""
@@ -338,6 +346,62 @@ class AcpToAguiBridge:
                     name="agent:commands_available",
                     value={"commands": commands},
                 )
+            )
+        elif isinstance(update, acp.schema.ConfigOptionUpdate):
+            # ACP 0.11: the notification carries the full set of config
+            # options and their current values — emit a STATE_SNAPSHOT that
+            # replaces whatever the client previously held.
+            self._emit(
+                StateSnapshotEvent(
+                    snapshot={
+                        "configOptions": serialize_config_options(
+                            getattr(update, "config_options", [])
+                        )
+                    }
+                )
+            )
+        elif isinstance(update, acp.schema.UsageUpdate):
+            value: dict[str, Any] = {
+                "used": getattr(update, "used", 0),
+                "size": getattr(update, "size", 0),
+            }
+            cost = getattr(update, "cost", None)
+            if cost is not None:
+                value["cost"] = _model_to_dict(cost)
+            self._emit(CustomEvent(name="agent:usage", value=value))
+        elif isinstance(update, acp.schema.SessionInfoUpdate):
+            self._emit(
+                CustomEvent(
+                    name="agent:session_info",
+                    value=_model_to_dict(update),
+                )
+            )
+        elif isinstance(update, acp.schema.AgentPlanUpdate):
+            self._emit(
+                CustomEvent(
+                    name="agent:plan",
+                    value={"entries": _model_to_dict(getattr(update, "entries", []))},
+                )
+            )
+        elif isinstance(update, acp.schema.AgentPlanContentUpdate):
+            self._emit(
+                CustomEvent(
+                    name="agent:plan_update",
+                    value=_model_to_dict(getattr(update, "plan", None)),
+                )
+            )
+        elif isinstance(update, acp.schema.AgentPlanRemovedUpdate):
+            self._emit(
+                CustomEvent(
+                    name="agent:plan_removed",
+                    value={"id": getattr(update, "id", "")},
+                )
+            )
+        elif isinstance(update, acp.schema.AgentThoughtChunk):
+            content = getattr(update, "content", None)
+            thought_text = getattr(content, "text", "") if content else ""
+            self._emit(
+                CustomEvent(name="agent:thought", value={"delta": thought_text or ""})
             )
         else:
             # Fallback: try to extract as dict
@@ -593,23 +657,90 @@ class AcpToAguiBridge:
         return acp.KillTerminalResponse()
 
     # ── acp.Client Protocol — Elicitation (ACP 0.11) ─────────────────────────
-    # The bridge doesn't surface elicitations to the AG-UI client, so we
-    # decline every request and treat completions as no-ops. Implementing
-    # these (even as stubs) is required to satisfy the acp.Client Protocol
-    # introduced in agent-client-protocol 0.11.
+    # Elicitations are surfaced to the AG-UI client as interrupts with
+    # ``reason: "elicitation"``, reusing the same suspend/resume plumbing as
+    # ``request_permission``: park a Future, end the SSE stream with an
+    # interrupt outcome, and resolve the Future when the client resumes.
 
-    async def create_elicitation(
-        self, message: str, mode: Any, **kwargs: Any
-    ) -> Any:
-        """Decline every elicitation request from the agent."""
-        self._log.debug("create_elicitation (declined): %s", message)
-        return acp.DeclineElicitationResponse(action="decline")
+    async def create_elicitation(self, message: str, mode: Any, **kwargs: Any) -> Any:
+        """Surface an ACP elicitation as an AG-UI interrupt.
 
-    async def complete_elicitation(
-        self, elicitation_id: str, **kwargs: Any
-    ) -> None:
-        """No-op: the bridge never started an elicitation."""
-        self._log.debug("complete_elicitation: %s", elicitation_id)
+        Parks a Future keyed by the elicitation id (taken from ``mode`` for
+        URL elicitations, or generated for form elicitations which carry no
+        id in the protocol), emits ``RUN_FINISHED{outcome:interrupt}`` with
+        ``reason="elicitation"`` and a ``responseSchema`` derived from the
+        requested schema, then suspends until the client resumes.
+        """
+        elicitation_id = _elicitation_id_from_mode(mode) or str(uuid.uuid4())
+        requested_schema = _elicitation_schema_from_mode(mode)
+        mode_kind = _elicitation_mode_kind(mode)
+
+        # Build a JSON-Schema-shaped object the client can render a form from.
+        response_schema: dict[str, Any] | None = None
+        if requested_schema is not None:
+            response_schema = _model_to_dict(requested_schema)
+
+        import datetime as _dt
+
+        expires_at_iso = _dt.datetime.fromtimestamp(
+            _dt.datetime.now().timestamp() + PERMISSION_TTL_SECONDS,
+            tz=_dt.timezone.utc,
+        ).isoformat()
+
+        interrupt = Interrupt(
+            id=elicitation_id,
+            reason="elicitation",
+            message=message,
+            responseSchema=response_schema,
+            expiresAt=expires_at_iso,
+            metadata={
+                "mode": mode_kind,
+                "elicitationId": elicitation_id,
+            },
+        )
+
+        loop = asyncio.get_event_loop()
+        future: asyncio.Future[Any] = loop.create_future()
+        self._elicitation_futures[elicitation_id] = future
+        timer = loop.call_later(
+            PERMISSION_TTL_SECONDS, self._expire_elicitation, elicitation_id
+        )
+        self._elicitation_timers[elicitation_id] = timer
+
+        self._log.info(
+            "⏸ interrupting for elicitation %s (id=%s)", mode_kind, elicitation_id
+        )
+        self._suspend_run(interrupt)
+
+        response = await future
+        self._log.info(
+            "✓ elicitation resolved (id=%s) → %s",
+            elicitation_id,
+            getattr(response, "action", "?"),
+        )
+        return response
+
+    async def complete_elicitation(self, elicitation_id: str, **kwargs: Any) -> None:
+        """The agent notified that a previously-started elicitation completed
+        mid-stream. Surface it as a CUSTOM event so clients can react (rare;
+        usually the accept/decline reply closes the loop)."""
+        self._emit(
+            CustomEvent(
+                name="agent:elicitation_complete",
+                value={"elicitationId": elicitation_id},
+            )
+        )
+
+    def _expire_elicitation(self, elicitation_id: str) -> None:
+        """TTL callback — resolve a parked elicitation Future as cancelled."""
+        future = self._elicitation_futures.pop(elicitation_id, None)
+        self._elicitation_timers.pop(elicitation_id, None)
+        if future is None or future.done():
+            return
+        self._log.warning(
+            "elicitation future %s expired (no resume) → cancelled", elicitation_id
+        )
+        future.set_result(acp.CancelElicitationResponse(action="cancel"))
 
     # ── Permission resolution (called by SessionManager on resume/cancel) ────
 
@@ -650,17 +781,111 @@ class AcpToAguiBridge:
         return True
 
     def pending_interrupt_ids(self) -> list[str]:
-        """Return the call_ids of all parked (unresolved) permission futures."""
-        return [cid for cid, fut in self._permission_futures.items() if not fut.done()]
+        """Return the ids of all parked (unresolved) permission and
+        elicitation futures."""
+        return [
+            cid for cid, fut in self._permission_futures.items() if not fut.done()
+        ] + [cid for cid, fut in self._elicitation_futures.items() if not fut.done()]
 
     def cancel_all_permissions(self) -> None:
-        """Resolve every parked permission future as cancelled.
+        """Resolve every parked permission and elicitation future as cancelled.
 
-        Used by ``cancel_run`` so ``request_permission`` unblocks and the
-        prompt task unwinds instead of hanging on a dead session.
+        Used by ``cancel_run`` so ``request_permission`` / ``create_elicitation``
+        unblock and the prompt task unwinds instead of hanging on a dead
+        session.
         """
         for call_id in list(self._permission_futures.keys()):
             self.resolve_permission(call_id, approved=False)
+        for elicitation_id in list(self._elicitation_futures.keys()):
+            self.resolve_elicitation(elicitation_id, status="cancelled")
+
+    def resolve_interrupt(self, interrupt_id: str, status: str, payload: Any) -> bool:
+        """Resolve a parked interrupt (permission or elicitation) by id.
+
+        Dispatches to the right table based on which future the id belongs
+        to. Returns True if a pending future was found and resolved.
+        """
+        if interrupt_id in self._permission_futures:
+            if status == "cancelled":
+                return self.resolve_permission(interrupt_id, approved=False)
+            if isinstance(payload, str):
+                option_id: str = payload
+            elif isinstance(payload, dict):
+                option_id = str(cast(dict[str, Any], payload).get("optionId", "once"))
+            else:
+                option_id = "once"
+            return self.resolve_permission(
+                interrupt_id, approved=True, option_id=option_id
+            )
+        if interrupt_id in self._elicitation_futures:
+            return self.resolve_elicitation(
+                interrupt_id, status=status, payload=payload
+            )
+        self._log.warning("No pending interrupt future for id=%s", interrupt_id)
+        return False
+
+    def resolve_elicitation(
+        self, elicitation_id: str, status: str, payload: Any = None
+    ) -> bool:
+        """Resolve a parked elicitation future with the matching ACP response.
+
+        ``status`` is the AG-UI resume status: ``"resolved"`` (accepted),
+        ``"cancelled"``, or anything else mapped to declined. The payload for
+        an accepted elicitation is ``{"status": "accepted", "values": {...}}``
+        or simply the values dict.
+        """
+        future = self._elicitation_futures.pop(elicitation_id, None)
+        timer = self._elicitation_timers.pop(elicitation_id, None)
+        if timer is not None:
+            timer.cancel()
+        if future is None:
+            self._log.warning("No pending elicitation future for id=%s", elicitation_id)
+            return False
+        if future.done():
+            self._log.warning(
+                "Elicitation future for id=%s already done", elicitation_id
+            )
+            return False
+
+        if status == "cancelled":
+            response: Any = acp.CancelElicitationResponse(action="cancel")
+        else:
+            # Accepted (status == "resolved") or declined, based on payload.
+            values: dict[str, Any] | None = None
+            if isinstance(payload, dict):
+                payload_dict = cast(dict[str, Any], payload)
+                if "values" in payload_dict and isinstance(
+                    payload_dict["values"], dict
+                ):
+                    values = cast(dict[str, Any], payload_dict["values"])
+                elif "status" in payload_dict:
+                    # {"status": "accepted"/"declined"/"cancelled", "values"?}
+                    inner = str(payload_dict.get("status", ""))
+                    if inner == "declined":
+                        response = acp.DeclineElicitationResponse(action="decline")
+                        future.set_result(response)
+                        return True
+                    if inner == "cancelled":
+                        response = acp.CancelElicitationResponse(action="cancel")
+                        future.set_result(response)
+                        return True
+                    values = (
+                        cast(dict[str, Any], payload_dict.get("values"))
+                        if isinstance(payload_dict.get("values"), dict)
+                        else None
+                    )
+                else:
+                    # Treat the dict itself as the form values.
+                    values = payload_dict
+            if values is not None:
+                response = acp.AcceptElicitationResponse(
+                    action="accept", content=values
+                )
+            else:
+                # No values supplied — decline rather than fabricate content.
+                response = acp.DeclineElicitationResponse(action="decline")
+        future.set_result(response)
+        return True
 
     # ── Fallback dict-based session/update handling ──────────────────────────
 
@@ -680,6 +905,57 @@ class AcpToAguiBridge:
                 CustomEvent(
                     name="agent:mode_update",
                     value={"modeId": update.get("modeId", update.get("mode_id", ""))},
+                )
+            )
+        elif kind == "config_option_update":
+            self._emit(
+                StateSnapshotEvent(
+                    snapshot={
+                        "configOptions": serialize_config_options(
+                            update.get(
+                                "configOptions", update.get("config_options", [])
+                            )
+                        )
+                    }
+                )
+            )
+        elif kind == "usage_update":
+            value: dict[str, Any] = {
+                "used": update.get("used", 0),
+                "size": update.get("size", 0),
+            }
+            if update.get("cost") is not None:
+                value["cost"] = update.get("cost")
+            self._emit(CustomEvent(name="agent:usage", value=value))
+        elif kind == "session_info_update":
+            self._emit(CustomEvent(name="agent:session_info", value=update))
+        elif kind == "plan":
+            self._emit(
+                CustomEvent(
+                    name="agent:plan",
+                    value={"entries": update.get("entries", [])},
+                )
+            )
+        elif kind == "plan_update":
+            self._emit(
+                CustomEvent(name="agent:plan_update", value=update.get("plan", update))
+            )
+        elif kind == "plan_removed":
+            self._emit(
+                CustomEvent(
+                    name="agent:plan_removed", value={"id": update.get("id", "")}
+                )
+            )
+        elif kind == "agent_thought_chunk":
+            content = update.get("content", {})
+            self._emit(
+                CustomEvent(
+                    name="agent:thought",
+                    value={
+                        "delta": (
+                            content.get("text", "") if isinstance(content, dict) else ""
+                        )
+                    },
                 )
             )
         else:
@@ -1003,3 +1279,75 @@ class AcpToAguiBridge:
             return json.dumps(result_obj, default=str)
         except Exception:
             return str(result_obj)
+
+
+# ── Module-level helpers (serialization / elicitation mode introspection) ──
+
+
+def _model_to_dict(obj: Any) -> Any:
+    """Best-effort conversion of an SDK pydantic model (or list/dict of them)
+    into a plain JSON-able dict, using the wire aliases."""
+    if obj is None:
+        return None
+    if isinstance(obj, list):
+        return [_model_to_dict(item) for item in obj]
+    if hasattr(obj, "model_dump"):
+        try:
+            return obj.model_dump(by_alias=True, mode="json", exclude_none=True)
+        except Exception:
+            try:
+                return obj.model_dump(by_alias=True, exclude_none=True)
+            except Exception:
+                pass
+    return obj
+
+
+def serialize_config_options(options: Any) -> list[dict[str, Any]]:
+    """Normalize a list of ``SessionConfigOptionSelect`` /
+    ``SessionConfigOptionBoolean`` into the wire shape advertised to the
+    AG-UI client: ``{id, name, description?, category?, currentValue, type,
+    options?}``. ``_meta`` is dropped."""
+    out: list[dict[str, Any]] = []
+    if not options:
+        return out
+    for opt in options:
+        raw = _model_to_dict(opt) or {}
+        if not isinstance(raw, dict):
+            continue
+        d: dict[str, Any] = cast(dict[str, Any], raw)
+        d.pop("field_meta", None)
+        d.pop("_meta", None)
+        # Normalize select options: each option → {value, name, description?}.
+        opts = d.get("options")
+        if isinstance(opts, list):
+            norm: list[dict[str, Any]] = []
+            for o in opts:
+                if isinstance(o, dict):
+                    cast(dict[str, Any], o).pop("field_meta", None)
+                    cast(dict[str, Any], o).pop("_meta", None)
+                    norm.append(o)
+            d["options"] = norm
+        out.append(d)
+    return out
+
+
+def _elicitation_id_from_mode(mode: Any) -> str | None:
+    """Return the elicitation id carried by URL modes; form modes have none."""
+    return getattr(mode, "elicitation_id", None) or getattr(mode, "elicitationId", None)
+
+
+def _elicitation_schema_from_mode(mode: Any) -> Any:
+    """Return the requested ``ElicitationSchema`` for form modes, else None."""
+    return getattr(mode, "requested_schema", None) or getattr(
+        mode, "requestedSchema", None
+    )
+
+
+def _elicitation_mode_kind(mode: Any) -> str:
+    """A short string describing the elicitation mode (e.g. ``"form_session"``,
+    ``"url_request"``)."""
+    name = type(mode).__name__
+    # ElicitationFormSessionMode → form_session, etc.
+    if name.startswith("Elicitation"):
+        name = name[len("Elicitation") :]
+    return name

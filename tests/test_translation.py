@@ -29,14 +29,21 @@ import pytest
 from agui_on_acp.sessions.manager import SessionManager
 from tests.fake_agent import (
     FakeAcpAgent,
+    config_option_update,
+    elicitation,
     end_turn,
     ext_notification,
+    plan,
+    plan_removed,
     request_permission,
+    session_info,
     sleep,
     text,
+    thought,
     tool_end,
     tool_progress,
     tool_start,
+    usage,
 )
 from tests.sse_helpers import event_of_type, read_sse_events, read_until
 
@@ -493,3 +500,451 @@ async def test_prompt_exception_becomes_run_error(
     async with http_client.stream("POST", "/ag-ui", json=_agui_body()) as resp:
         events = await read_sse_events(resp)
     assert any(e["type"] == "RUN_ERROR" for e in events)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ACP 0.11 — config options read path (P0)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_state_snapshot_advertises_config_options(
+    fake_agent: FakeAcpAgent, http_client: httpx.AsyncClient
+):
+    """When the agent reports ``configOptions`` in new_session, the bridge
+    emits them in the post-start STATE_SNAPSHOT so the UI can populate the
+    config/model selector."""
+    fake_agent.config_options = [
+        {
+            "id": "model",
+            "name": "Model",
+            "type": "select",
+            "currentValue": "gpt-x",
+            "options": [
+                {"value": "gpt-x", "name": "GPT X"},
+                {"value": "claude-y", "name": "Claude Y"},
+            ],
+        },
+        {
+            "id": "verbose",
+            "name": "Verbose",
+            "type": "boolean",
+            "currentValue": False,
+        },
+    ]
+    fake_agent.script = [text("hi"), end_turn()]
+    async with http_client.stream("POST", "/ag-ui", json=_agui_body()) as resp:
+        events = await read_sse_events(resp)
+    snaps = [e for e in events if e["type"] == "STATE_SNAPSHOT"]
+    assert snaps, "expected a STATE_SNAPSHOT with configOptions"
+    opts = snaps[0]["data"]["snapshot"]["configOptions"]
+    by_id = {o["id"]: o for o in opts}
+    assert by_id["model"]["type"] == "select"
+    assert by_id["model"]["currentValue"] == "gpt-x"
+    assert by_id["model"]["options"] == [
+        {"value": "gpt-x", "name": "GPT X"},
+        {"value": "claude-y", "name": "Claude Y"},
+    ]
+    assert by_id["verbose"]["type"] == "boolean"
+    assert by_id["verbose"]["currentValue"] is False
+
+
+@pytest.mark.asyncio
+async def test_config_option_update_notification_emits_state_snapshot(
+    fake_agent: FakeAcpAgent, http_client: httpx.AsyncClient
+):
+    """A mid-turn ``ConfigOptionUpdate`` notification is surfaced as a fresh
+    STATE_SNAPSHOT carrying the updated ``configOptions`` (replace, not
+    patch)."""
+    fake_agent.script = [
+        config_option_update(
+            [
+                {
+                    "id": "model",
+                    "name": "Model",
+                    "type": "select",
+                    "currentValue": "claude-y",
+                    "options": [
+                        {"value": "claude-y", "name": "Claude Y"},
+                        {"value": "gpt-x", "name": "GPT X"},
+                    ],
+                }
+            ]
+        ),
+        end_turn(),
+    ]
+    async with http_client.stream("POST", "/ag-ui", json=_agui_body()) as resp:
+        events = await read_sse_events(resp)
+    snaps = [e for e in events if e["type"] == "STATE_SNAPSHOT"]
+    model_snap = [
+        s
+        for s in snaps
+        if "configOptions" in s["data"]["snapshot"]
+        and s["data"]["snapshot"]["configOptions"][0]["id"] == "model"
+    ]
+    assert model_snap, "expected a STATE_SNAPSHOT from the ConfigOptionUpdate"
+    assert model_snap[-1]["data"]["snapshot"]["configOptions"][0]["currentValue"] == (
+        "claude-y"
+    )
+
+
+@pytest.mark.asyncio
+async def test_forwarded_props_config_options_are_applied(
+    fake_agent: FakeAcpAgent, http_client: httpx.AsyncClient
+):
+    """``forwardedProps.configOptions`` (a ``{config_id: value}`` dict) is
+    applied via ``session/set_config_option`` at session-create time, in
+    addition to the legacy ``forwardedProps.model``."""
+    fake_agent.script = [text("hi"), end_turn()]
+    body = _agui_body(
+        forwarded_props={
+            "cwd": "/tmp/opencode",
+            "model": "gpt-x",
+            "configOptions": {"theme": "dark", "verbose": True},
+        }
+    )
+    async with http_client.stream("POST", "/ag-ui", json=body) as resp:
+        events = await read_sse_events(resp)
+    # The run must complete cleanly (no RUN_ERROR) — the config calls did not
+    # raise into the prompt path.
+    assert all(e["type"] != "RUN_ERROR" for e in events)
+    # The legacy "model" field was applied via set_model (config_id="model").
+    assert ("fake-session-1", "gpt-x") in fake_agent.set_model_calls
+    # The generic config options were applied via set_config_option. The
+    # "model" entry in configOptions is skipped (handled above), but "theme"
+    # and "verbose" are forwarded.
+    applied_ids = {cid for (_sid, cid, _val) in fake_agent.set_config_option_calls}
+    assert "theme" in applied_ids
+    assert "verbose" in applied_ids
+    assert "model" in applied_ids  # via the legacy field
+    # No duplicate "model" application from the configOptions dict.
+    model_calls = [
+        (cid, val)
+        for (_sid, cid, val) in fake_agent.set_config_option_calls
+        if cid == "model"
+    ]
+    assert model_calls == [("model", "gpt-x")]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ACP 0.11 — usage / session info / plans / thought (P1, P4)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_usage_update_becomes_custom_agent_usage(
+    fake_agent: FakeAcpAgent, http_client: httpx.AsyncClient
+):
+    fake_agent.script = [
+        usage(used=4200, size=200000, cost={"amount": 0.03, "currency": "USD"}),
+        end_turn(),
+    ]
+    async with http_client.stream("POST", "/ag-ui", json=_agui_body()) as resp:
+        events = await read_sse_events(resp)
+    customs = [
+        e
+        for e in events
+        if e["type"] == "CUSTOM" and e["data"]["name"] == "agent:usage"
+    ]
+    assert customs, "expected an agent:usage CUSTOM event"
+    val = customs[-1]["data"]["value"]
+    assert val["used"] == 4200
+    assert val["size"] == 200000
+    assert val["cost"]["amount"] == 0.03
+    assert val["cost"]["currency"] == "USD"
+
+
+@pytest.mark.asyncio
+async def test_session_info_update_becomes_custom(
+    fake_agent: FakeAcpAgent, http_client: httpx.AsyncClient
+):
+    fake_agent.script = [
+        session_info(title="My conversation", updated_at="2026-01-01T00:00:00Z"),
+        end_turn(),
+    ]
+    async with http_client.stream("POST", "/ag-ui", json=_agui_body()) as resp:
+        events = await read_sse_events(resp)
+    customs = [
+        e
+        for e in events
+        if e["type"] == "CUSTOM" and e["data"]["name"] == "agent:session_info"
+    ]
+    assert customs, "expected an agent:session_info CUSTOM event"
+    assert customs[-1]["data"]["value"]["title"] == "My conversation"
+
+
+@pytest.mark.asyncio
+async def test_plan_update_and_removed_become_custom(
+    fake_agent: FakeAcpAgent, http_client: httpx.AsyncClient
+):
+    fake_agent.script = [
+        plan(
+            entries=[
+                {"content": "do thing", "priority": "high", "status": "pending"},
+                {"content": "do other", "priority": "low", "status": "completed"},
+            ]
+        ),
+        plan_removed("plan-1"),
+        end_turn(),
+    ]
+    async with http_client.stream("POST", "/ag-ui", json=_agui_body()) as resp:
+        events = await read_sse_events(resp)
+    names = [e["data"]["name"] for e in events if e["type"] == "CUSTOM"]
+    assert "agent:plan" in names
+    assert "agent:plan_removed" in names
+    customs = [e for e in events if e["type"] == "CUSTOM"]
+    plan_evt = next(e for e in customs if e["data"]["name"] == "agent:plan")
+    assert len(plan_evt["data"]["value"]["entries"]) == 2
+    removed_evt = next(e for e in customs if e["data"]["name"] == "agent:plan_removed")
+    assert removed_evt["data"]["value"]["id"] == "plan-1"
+
+
+@pytest.mark.asyncio
+async def test_agent_thought_chunk_becomes_custom_agent_thought(
+    fake_agent: FakeAcpAgent, http_client: httpx.AsyncClient
+):
+    fake_agent.script = [thought("reasoning about the problem"), end_turn()]
+    async with http_client.stream("POST", "/ag-ui", json=_agui_body()) as resp:
+        events = await read_sse_events(resp)
+    customs = [
+        e
+        for e in events
+        if e["type"] == "CUSTOM" and e["data"]["name"] == "agent:thought"
+    ]
+    assert customs, "expected an agent:thought CUSTOM event"
+    assert customs[-1]["data"]["value"]["delta"] == "reasoning about the problem"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ACP 0.11 — elicitation as an interrupt (P2)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_elicitation_interrupts_run_then_resume_accepts(
+    fake_agent: FakeAcpAgent, http_client: httpx.AsyncClient
+):
+    """A ``create_elicitation`` mid-turn emits a
+    ``RUN_FINISHED{outcome:interrupt}`` with ``reason="elicitation"`` and a
+    ``responseSchema``, parks the prompt task, and a subsequent resume with
+    an accepted payload resolves the elicitation with the form values."""
+    fake_agent.script = [
+        text("before-elicitation"),
+        elicitation(
+            message="What is your name?",
+            mode_kind="form_session",
+            requested_schema={
+                "properties": {"name": {"type": "string", "title": "Name"}}
+            },
+        ),
+        text("after-elicitation"),
+        end_turn(),
+    ]
+
+    async with http_client.stream("POST", "/ag-ui", json=_agui_body()) as resp:
+        run1 = await read_until(resp, {"RUN_FINISHED"})
+
+    finished = event_of_type(run1, "RUN_FINISHED")
+    outcome = finished["data"]["outcome"]
+    assert outcome["type"] == "interrupt"
+    interrupt = outcome["interrupts"][0]
+    assert interrupt["reason"] == "elicitation"
+    assert interrupt["message"] == "What is your name?"
+    assert interrupt["responseSchema"] is not None
+    elicitation_id = interrupt["id"]
+
+    r1_text = "".join(
+        e["data"]["delta"] for e in run1 if e["type"] == "TEXT_MESSAGE_CONTENT"
+    )
+    assert r1_text == "before-elicitation"
+
+    resume_body = _agui_body(
+        resume=[
+            {
+                "interruptId": elicitation_id,
+                "status": "resolved",
+                "payload": {"status": "accepted", "values": {"name": "Ada"}},
+            }
+        ]
+    )
+    async with http_client.stream("POST", "/ag-ui", json=resume_body) as resp:
+        run2 = await read_sse_events(resp)
+
+    r2_text = "".join(
+        e["data"]["delta"] for e in run2 if e["type"] == "TEXT_MESSAGE_CONTENT"
+    )
+    assert r2_text == "after-elicitation"
+
+    assert len(fake_agent.elicitation_replies) == 1
+    reply = fake_agent.elicitation_replies[0]
+    assert reply.action == "accept"
+    assert reply.content == {"name": "Ada"}
+
+
+@pytest.mark.asyncio
+async def test_elicitation_resume_declined(
+    fake_agent: FakeAcpAgent, http_client: httpx.AsyncClient
+):
+    """A resume with a declined payload resolves the elicitation as
+    ``DeclineElicitationResponse``."""
+    fake_agent.script = [
+        elicitation(message="optional question"),
+        end_turn(),
+    ]
+    async with http_client.stream("POST", "/ag-ui", json=_agui_body()) as resp:
+        run1 = await read_until(resp, {"RUN_FINISHED"})
+    elicitation_id = event_of_type(run1, "RUN_FINISHED")["data"]["outcome"][
+        "interrupts"
+    ][0]["id"]
+
+    resume_body = _agui_body(
+        resume=[
+            {
+                "interruptId": elicitation_id,
+                "status": "resolved",
+                "payload": {"status": "declined"},
+            }
+        ]
+    )
+    async with http_client.stream("POST", "/ag-ui", json=resume_body) as resp:
+        await read_sse_events(resp)
+
+    assert len(fake_agent.elicitation_replies) == 1
+    assert fake_agent.elicitation_replies[0].action == "decline"
+
+
+@pytest.mark.asyncio
+async def test_elicitation_resume_cancelled(
+    fake_agent: FakeAcpAgent, http_client: httpx.AsyncClient
+):
+    """A resume with ``status="cancelled"`` resolves the elicitation as
+    ``CancelElicitationResponse``."""
+    fake_agent.script = [
+        elicitation(),
+        end_turn(),
+    ]
+    async with http_client.stream("POST", "/ag-ui", json=_agui_body()) as resp:
+        run1 = await read_until(resp, {"RUN_FINISHED"})
+    elicitation_id = event_of_type(run1, "RUN_FINISHED")["data"]["outcome"][
+        "interrupts"
+    ][0]["id"]
+
+    resume_body = _agui_body(
+        resume=[{"interruptId": elicitation_id, "status": "cancelled"}]
+    )
+    async with http_client.stream("POST", "/ag-ui", json=resume_body) as resp:
+        await read_sse_events(resp)
+
+    assert len(fake_agent.elicitation_replies) == 1
+    assert fake_agent.elicitation_replies[0].action == "cancel"
+
+
+@pytest.mark.asyncio
+async def test_cancel_while_suspended_at_elicitation_resolves_cancelled(
+    fake_agent: FakeAcpAgent,
+    session_manager: SessionManager,
+    http_client: httpx.AsyncClient,
+):
+    """Cancelling a run while it's suspended at an elicitation resolves the
+    parked Future as cancelled."""
+    fake_agent.script = [
+        elicitation(),
+        end_turn(),
+    ]
+    async with http_client.stream("POST", "/ag-ui", json=_agui_body()) as resp:
+        await read_until(resp, {"RUN_FINISHED"})
+
+    await session_manager.cancel_run("t1")
+    await asyncio.wait_for(fake_agent.prompt_done.wait(), timeout=5.0)
+    assert len(fake_agent.elicitation_replies) == 1
+    assert fake_agent.elicitation_replies[0].action == "cancel"
+
+
+@pytest.mark.asyncio
+async def test_elicitation_future_expires_when_no_resume_arrives(
+    fake_agent: FakeAcpAgent, http_client: httpx.AsyncClient
+):
+    """If no resume ever arrives, the parked elicitation Future expires (TTL)
+    and resolves with ``cancel`` so the prompt task unwinds."""
+    fake_agent.script = [
+        elicitation(),
+        end_turn(),
+    ]
+    async with http_client.stream("POST", "/ag-ui", json=_agui_body()) as resp:
+        await read_until(resp, {"RUN_FINISHED"})
+    await asyncio.wait_for(fake_agent.prompt_done.wait(), timeout=5.0)
+    assert len(fake_agent.elicitation_replies) == 1
+    assert fake_agent.elicitation_replies[0].action == "cancel"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Mid-session config change endpoint (P3)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_post_ag_ui_config_applies_config_options(
+    fake_agent: FakeAcpAgent, http_client: httpx.AsyncClient
+):
+    """``POST /ag-ui/config`` applies each supplied config option via
+    ``session/set_config_option`` without starting a new run."""
+    # Establish a session first.
+    fake_agent.script = [text("hi"), end_turn()]
+    async with http_client.stream("POST", "/ag-ui", json=_agui_body()) as resp:
+        await read_sse_events(resp)
+
+    resp = await http_client.post(
+        "/ag-ui/config",
+        json={"threadId": "t1", "configOptions": {"model": "claude-y"}},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["applied"] == ["model"]
+    assert ("fake-session-1", "claude-y") in fake_agent.set_model_calls
+
+
+@pytest.mark.asyncio
+async def test_post_ag_ui_config_unknown_session(
+    http_client: httpx.AsyncClient,
+):
+    resp = await http_client.post(
+        "/ag-ui/config",
+        json={"threadId": "nope", "configOptions": {"model": "x"}},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["ok"] is False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MCP servers via forwardedProps (P5)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_forwarded_props_mcp_servers_are_passed_to_session(
+    fake_agent: FakeAcpAgent, http_client: httpx.AsyncClient
+):
+    """``forwardedProps.mcpServers`` is plumbed through to the ACP
+    ``session/new`` call."""
+    fake_agent.script = [text("hi"), end_turn()]
+    body = _agui_body(
+        forwarded_props={
+            "cwd": "/tmp/opencode",
+            "mcpServers": {
+                "github": {"type": "http", "url": "https://example/mcp"},
+            },
+        }
+    )
+    async with http_client.stream("POST", "/ag-ui", json=body) as resp:
+        await read_sse_events(resp)
+    assert len(fake_agent.new_session_calls) == 1
+    mcp = fake_agent.new_session_calls[0]["mcp_servers"]
+    assert mcp, "expected mcp_servers to be forwarded to session/new"
+    assert any(
+        isinstance(s, dict)
+        and s.get("type") == "http"
+        or hasattr(s, "type")
+        and getattr(s, "type", None) == "http"
+        for s in mcp
+    )

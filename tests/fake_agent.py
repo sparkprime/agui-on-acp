@@ -132,6 +132,66 @@ class SleepStep:
     seconds: float
 
 
+@dataclass
+class ConfigOptionUpdateStep:
+    """Emit a ``ConfigOptionUpdate`` notification (ACP 0.11)."""
+
+    config_options: list[dict[str, Any]]
+
+
+@dataclass
+class UsageStep:
+    """Emit a ``UsageUpdate`` notification."""
+
+    used: int
+    size: int
+    cost: dict[str, Any] | None = None
+
+
+@dataclass
+class SessionInfoStep:
+    """Emit a ``SessionInfoUpdate`` notification."""
+
+    title: str | None = None
+    updated_at: str | None = None
+
+
+@dataclass
+class PlanStep:
+    """Emit an ``AgentPlanUpdate`` (full plan replace)."""
+
+    entries: list[dict[str, Any]]
+
+
+@dataclass
+class PlanRemovedStep:
+    """Emit an ``AgentPlanRemovedUpdate``."""
+
+    plan_id: str
+
+
+@dataclass
+class ThoughtStep:
+    """Emit an ``AgentThoughtChunk`` reasoning delta."""
+
+    text: str
+
+
+@dataclass
+class ElicitationStep:
+    """Fire ``conn.create_elicitation`` and await the bridge's response.
+
+    This is the suspend point that maps to an AG-UI interrupt with
+    ``reason="elicitation"``.
+    """
+
+    message: str = "Please provide input"
+    mode_kind: str = "form_session"
+    requested_schema: dict[str, Any] | None = None
+    elicitation_id: str | None = None
+    url: str | None = None
+
+
 ScriptStep = Union[
     TextStep,
     ToolStartStep,
@@ -141,6 +201,13 @@ ScriptStep = Union[
     ExtNotificationStep,
     EndTurnStep,
     SleepStep,
+    ConfigOptionUpdateStep,
+    UsageStep,
+    SessionInfoStep,
+    PlanStep,
+    PlanRemovedStep,
+    ThoughtStep,
+    ElicitationStep,
 ]
 Script = list[ScriptStep]
 
@@ -180,6 +247,34 @@ def sleep(seconds: float) -> SleepStep:
     return SleepStep(seconds)
 
 
+def config_option_update(options: list[dict[str, Any]]) -> ConfigOptionUpdateStep:
+    return ConfigOptionUpdateStep(config_options=options)
+
+
+def usage(used: int, size: int, **kw: Any) -> UsageStep:
+    return UsageStep(used=used, size=size, **kw)
+
+
+def session_info(**kw: Any) -> SessionInfoStep:
+    return SessionInfoStep(**kw)
+
+
+def plan(entries: list[dict[str, Any]]) -> PlanStep:
+    return PlanStep(entries=entries)
+
+
+def plan_removed(plan_id: str) -> PlanRemovedStep:
+    return PlanRemovedStep(plan_id=plan_id)
+
+
+def thought(text: str) -> ThoughtStep:
+    return ThoughtStep(text=text)
+
+
+def elicitation(**kw: Any) -> ElicitationStep:
+    return ElicitationStep(**kw)
+
+
 # ── The fake agent ─────────────────────────────────────────────────────────
 
 
@@ -198,6 +293,15 @@ class _PermissionReply:
 
     tool_call_id: str
     outcome: dict[str, Any]
+
+
+@dataclass
+class _ElicitationReply:
+    """Record of an elicitation response received from the bridge."""
+
+    message: str
+    action: str  # "accept" | "decline" | "cancel"
+    content: dict[str, Any] | None = None
 
 
 class FakeAcpAgent:
@@ -223,17 +327,23 @@ class FakeAcpAgent:
         self.prompt_calls: list[_PromptCall] = []
         self.set_mode_calls: list[tuple[str, str]] = []
         self.set_model_calls: list[tuple[str, str]] = []
+        self.set_config_option_calls: list[tuple[str, str, Any]] = []
         self.cancel_calls: list[str] = []
         self.ext_method_calls: list[tuple[str, dict[str, Any]]] = []
         self.ext_notification_calls: list[tuple[str, dict[str, Any]]] = []
 
         # Permission replies the bridge sent back (collected as they arrive).
         self.permission_replies: list[_PermissionReply] = []
+        # Elicitation replies the bridge sent back.
+        self.elicitation_replies: list[_ElicitationReply] = []
 
         # Per-session state we expose to the bridge's new_session response.
         self._session_id = "fake-session-1"
         self.modes: list[dict[str, Any]] | None = None
         self._models: list[dict[str, Any]] | None = None
+        # ACP 0.11 config options advertised in new_session. Each entry is a
+        # dict ready to be turned into a SessionConfigOptionSelect/Boolean.
+        self.config_options: list[dict[str, Any]] | None = None
 
         # The currently-running prompt task, so tests can await it.
         self._prompt_task: asyncio.Task[Any] | None = None
@@ -322,6 +432,10 @@ class FakeAcpAgent:
                 ],
                 current_mode_id=str(modes[0]["id"]) if modes else "",
             )
+        if self.config_options is not None:
+            resp_kwargs["config_options"] = [
+                self._build_config_option(opt) for opt in self.config_options
+            ]
         return schema.NewSessionResponse(**resp_kwargs)
 
     async def load_session(
@@ -351,11 +465,15 @@ class FakeAcpAgent:
 
     async def set_config_option(
         self, config_id: str, session_id: str, value: str | bool, **kwargs: Any
-    ) -> schema.SetSessionConfigOptionResponse | None:
+    ) -> schema.SetSessionConfigOptionResponse:
         # In ACP 0.11+ the model is a config option with config_id == "model".
+        self.set_config_option_calls.append((session_id, config_id, value))
         if config_id == "model":
             self.set_model_calls.append((session_id, str(value)))
-        return None
+        # Echo the advertised config options (with the new value applied) so
+        # the SDK's response validation passes.
+        opts = [self._build_config_option(o) for o in (self.config_options or [])]
+        return schema.SetSessionConfigOptionResponse(config_options=opts)
 
     async def prompt(
         self,
@@ -461,6 +579,60 @@ class FakeAcpAgent:
                 await self._do_request_permission(session_id, step)
             elif isinstance(step, ExtNotificationStep):
                 await self.conn.ext_notification(step.method, step.params)
+            elif isinstance(step, ConfigOptionUpdateStep):
+                await self.conn.session_update(
+                    session_id,
+                    schema.ConfigOptionUpdate(
+                        session_update="config_option_update",
+                        config_options=[
+                            self._build_config_option(o) for o in step.config_options
+                        ],
+                    ),
+                )
+            elif isinstance(step, UsageStep):
+                cost_obj = None
+                if step.cost is not None:
+                    cost_obj = schema.Cost(
+                        amount=float(step.cost.get("amount", 0.0)),
+                        currency=str(step.cost.get("currency", "USD")),
+                    )
+                await self.conn.session_update(
+                    session_id,
+                    schema.UsageUpdate(
+                        session_update="usage_update",
+                        used=step.used,
+                        size=step.size,
+                        cost=cost_obj,
+                    ),
+                )
+            elif isinstance(step, SessionInfoStep):
+                await self.conn.session_update(
+                    session_id,
+                    schema.SessionInfoUpdate(
+                        session_update="session_info_update",
+                        title=step.title,
+                        updated_at=step.updated_at,
+                    ),
+                )
+            elif isinstance(step, PlanStep):
+                await self.conn.session_update(
+                    session_id,
+                    acp.update_plan([schema.PlanEntry(**e) for e in step.entries]),
+                )
+            elif isinstance(step, PlanRemovedStep):
+                await self.conn.session_update(
+                    session_id,
+                    schema.AgentPlanRemovedUpdate(
+                        session_update="plan_removed", id=step.plan_id
+                    ),
+                )
+            elif isinstance(step, ThoughtStep):
+                await self.conn.session_update(
+                    session_id,
+                    acp.update_agent_thought_text(step.text),
+                )
+            elif isinstance(step, ElicitationStep):
+                await self._do_elicitation(session_id, step)
             elif isinstance(step, EndTurnStep):
                 stop_reason = step.stop_reason
                 break
@@ -484,6 +656,48 @@ class FakeAcpAgent:
                 schema.ToolCallLocation(**loc) for loc in step.locations
             ]
         return acp.start_tool_call(**kwargs)
+
+    def _build_config_option(self, opt: dict[str, Any]) -> Any:
+        """Build a ``SessionConfigOptionSelect`` or ``SessionConfigOptionBoolean``
+        from a plain dict (the shape tests pass in)."""
+        opt_type = opt.get("type", "select")
+        common = {
+            "id": opt["id"],
+            "name": opt["name"],
+            "description": opt.get("description"),
+            "category": opt.get("category"),
+        }
+        if opt_type == "boolean":
+            return schema.SessionConfigOptionBoolean(
+                type="boolean",
+                current_value=bool(
+                    opt.get("currentValue", opt.get("current_value", False))
+                ),
+                **common,
+            )
+        # select
+        raw_options = opt.get("options", [])
+        options: list[Any] = []
+        for o in raw_options:
+            if isinstance(o, dict) and "options" in o and "group" in o:
+                options.append(
+                    schema.SessionConfigSelectGroup(
+                        group=o["group"],
+                        name=o["name"],
+                        options=[
+                            schema.SessionConfigSelectOption(**oo)
+                            for oo in o["options"]
+                        ],
+                    )
+                )
+            else:
+                options.append(schema.SessionConfigSelectOption(**o))
+        return schema.SessionConfigOptionSelect(
+            type="select",
+            current_value=str(opt.get("currentValue", opt.get("current_value", ""))),
+            options=options,
+            **common,
+        )
 
     def _build_tool_call_progress(
         self,
@@ -531,4 +745,59 @@ class FakeAcpAgent:
                 tool_call_id=step.tool_call_id,
                 outcome=outcome_dict,
             )
+        )
+
+    async def _do_elicitation(self, session_id: str, step: ElicitationStep) -> None:
+        assert self.conn is not None
+        mode: Any
+        if step.mode_kind == "url_session":
+            mode = schema.ElicitationUrlSessionMode(
+                session_id=session_id,
+                elicitation_id=step.elicitation_id or "elic-url-1",
+                url=step.url or "https://example.com/auth",
+            )
+        elif step.mode_kind == "form_request":
+            mode = schema.ElicitationFormRequestMode(
+                request_id="req-1",
+                requested_schema=self._build_elicitation_schema(step.requested_schema),
+            )
+        else:  # "form_session" (default)
+            mode = schema.ElicitationFormSessionMode(
+                session_id=session_id,
+                requested_schema=self._build_elicitation_schema(step.requested_schema),
+            )
+        resp = await self.conn.create_elicitation(message=step.message, mode=mode)
+        action = getattr(resp, "action", "?")
+        content = getattr(resp, "content", None)
+        self.elicitation_replies.append(
+            _ElicitationReply(
+                message=step.message,
+                action=action,
+                content=content if isinstance(content, dict) else None,
+            )
+        )
+
+    def _build_elicitation_schema(
+        self, schema_dict: dict[str, Any] | None
+    ) -> schema.ElicitationSchema:
+        if schema_dict is None:
+            return schema.ElicitationSchema(properties={})
+        properties: dict[str, Any] = {}
+        for name, prop in (schema_dict.get("properties") or {}).items():
+            ptype = prop.get("type", "string")
+            if ptype == "number":
+                properties[name] = schema.ElicitationNumberPropertySchema(**prop)
+            elif ptype == "integer":
+                properties[name] = schema.ElicitationIntegerPropertySchema(**prop)
+            elif ptype == "boolean":
+                properties[name] = schema.ElicitationBooleanPropertySchema(**prop)
+            elif ptype == "array":
+                properties[name] = schema.ElicitationMultiSelectPropertySchema(**prop)
+            else:
+                properties[name] = schema.ElicitationStringPropertySchema(**prop)
+        return schema.ElicitationSchema(
+            title=schema_dict.get("title"),
+            description=schema_dict.get("description"),
+            required=schema_dict.get("required"),
+            properties=properties,
         )

@@ -128,6 +128,8 @@ async def ag_ui_run(body: RunAgentInput, request: Request):
         mode = fp.get("mode")
         model = fp.get("model")
         agent_command = fp.get("agentCommand")
+        mcp_servers = fp.get("mcpServers")
+        config_options = fp.get("configOptions")
         try:
             active = await manager.create_task(
                 task_id=thread_id,
@@ -135,7 +137,9 @@ async def ag_ui_run(body: RunAgentInput, request: Request):
                 resume_session_id=resume_session_id,
                 mode=mode,
                 model=model,
+                mcp_servers=mcp_servers,
                 agent_command=agent_command,
+                config_options=config_options,
             )
         except Exception as exc:
             logger.error("Failed to create session for AG-UI: %s", exc)
@@ -180,6 +184,8 @@ async def ag_ui_run(body: RunAgentInput, request: Request):
         snapshot["modes"] = active.modes
     if active.models:
         snapshot["models"] = active.models
+    if active.config_options:
+        snapshot["configOptions"] = active.config_options
     if active.current_mode_id:
         snapshot["currentModeId"] = active.current_mode_id
     if snapshot:
@@ -193,6 +199,46 @@ async def ag_ui_run(body: RunAgentInput, request: Request):
         )
 
     return _sse_response(queue, thread_id, manager)
+
+
+class ConfigUpdateRequest(BaseModel):
+    """Body for ``POST /ag-ui/config`` — a mid-session config change."""
+
+    threadId: str
+    configOptions: dict[str, Any] = Field(default_factory=dict[str, Any])
+
+
+class ConfigUpdateResponse(BaseModel):
+    ok: bool = True
+    applied: list[str] = Field(default_factory=list[str])
+
+
+@router.post("/ag-ui/config")
+async def ag_ui_set_config(body: ConfigUpdateRequest, request: Request):
+    """Bridge extension: apply mid-session config options without starting a
+    new AG-UI run.
+
+    AG-UI's ``POST /ag-ui`` is always either a fresh run or a resume; there is
+    no "change config" request type. This endpoint fills that gap by calling
+    ``session/set_config_option`` (ACP 0.11) for each supplied option. Not
+    part of the AG-UI standard — clients must opt in.
+    """
+    manager = getattr(request.app.state, "session_manager", None)
+    if manager is None:
+        return {"ok": False, "error": "Session manager not initialized"}
+    applied: list[str] = []
+    for config_id, value in body.configOptions.items():
+        try:
+            await manager.set_config_option(body.threadId, config_id, value)
+            applied.append(config_id)
+        except KeyError:
+            return {
+                "ok": False,
+                "error": f"No active session for thread {body.threadId}",
+            }
+        except Exception as exc:
+            logger.warning("set_config_option %s failed: %s", config_id, exc)
+    return ConfigUpdateResponse(applied=applied)
 
 
 def _sse_response(

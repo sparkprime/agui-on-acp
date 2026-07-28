@@ -108,7 +108,13 @@ def _patch_runner_spawn(agent: FakeAcpAgent) -> None:
         # requests into client_writer (which feeds the agent's reader) and
         # READS responses from client_reader (which the agent's writer feeds).
         conn = ClientSideConnection(
-            client, agent.transport.client_writer, agent.transport.client_reader
+            client,
+            agent.transport.client_writer,
+            agent.transport.client_reader,
+            # Match the real runner: enable the unstable protocol so ACP 0.11
+            # routes (elicitation_create, etc.) are accepted, not rejected
+            # with method_not_found.
+            use_unstable_protocol=True,
         )
         self.conn = conn
 

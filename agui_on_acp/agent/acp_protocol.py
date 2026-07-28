@@ -118,6 +118,22 @@ class AcpProtocol:
             config_id="model", session_id=session_id, value=model_id
         )
 
+    async def set_config_option(
+        self, session_id: str, config_id: str, value: Any
+    ) -> Any:
+        """Set an arbitrary session config option (ACP 0.11
+        ``session/set_config_option``).
+
+        ``value`` is a string for select options (e.g. ``"model"``) or a
+        bool for boolean options; the SDK accepts ``str | bool``.
+        """
+        self._log.info(
+            "Setting config option %s=%s for session %s", config_id, value, session_id
+        )
+        return await self.conn.set_config_option(
+            config_id=config_id, session_id=session_id, value=value
+        )
+
     async def execute_command(
         self, session_id: str, command: str, args: str | None = None
     ) -> Any:

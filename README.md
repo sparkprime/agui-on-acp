@@ -51,6 +51,7 @@ The bridge is now serving:
 |---|---|---|
 | `/health` | GET | Health check |
 | `/ag-ui` | POST | Standard AG-UI run endpoint (SSE response) |
+| `/ag-ui/config` | POST | Bridge extension: apply mid-session config options (`{threadId, configOptions}`) without starting a run |
 | `/docs` | GET | Interactive OpenAPI UI |
 
 ### 4. Point an AG-UI client at it

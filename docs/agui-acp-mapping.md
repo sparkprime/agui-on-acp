@@ -49,7 +49,7 @@ for places where the translation is **not 1:1** and where the bridge must
 | `forwardedProps.mode` | `session/set_mode` (`modeId`) | Issued once, after `session/new`/`load`, before the first prompt. Skipped if the value is the placeholder `"default"`. |
 | `forwardedProps.model` | **ACP 0.11:** `session/set_config_option` (`config_id="model"`) | Renamed in 0.11: the model is no longer its own method (`session/set_model` was removed); it is now one config option among many. The bridge hard-codes `config_id="model"`. |
 | `forwardedProps.agentCommand` | `AgentRunner` spawn args | Per-request override of the binary spawned (default from `--agent-command`). Only honoured on the *first* run for a thread (the subprocess is already running afterwards). |
-| `forwardedProps.mcpServers` | (not wired) | `SessionManager.create_task` accepts `mcp_servers`, but the `/ag-ui` endpoint never reads it from `forwardedProps`. **Gap.** |
+| `forwardedProps.mcpServers` | `session/new` / `session/load` `mcp_servers` | The AG-UI `{name: {type, url?, command?, …}}` dict is coerced into ACP's `McpServer` schema: the dict key fills `name`, and `headers` defaults to `[]` for http/sse servers (ACP requires both). Anything already conforming passes through unchanged. |
 | `resume[].interruptId` | resolves parked Future keyed by the same id | The id is `=== ACP tool_call_id === AG-UI toolCallId`. One correlation key, three names. |
 | `resume[].status="resolved"` + `payload` | `AllowedOutcome{optionId: payload, outcome:"selected"}` | The `payload` may be a string, a `{optionId}` dict, or null (defaults to `"once"`). **Not 1:1:** the AG-UI payload is normalised to ACP's `optionId` field. |
 | `resume[].status="cancelled"` | `DeniedOutcome{outcome:"cancelled"}` | AG-UI "cancelled" → ACP "cancelled". |
@@ -70,12 +70,12 @@ for places where the translation is **not 1:1** and where the bridge must
 | `AvailableCommandsUpdate` | `CUSTOM` (`name="agent:commands_available"`) | Renamed. |
 | `NewSessionResponse.modes` / `LoadSessionResponse.modes` | `STATE_SNAPSHOT` (`{modes, currentModeId}`) emitted once after `start_run` | **State held:** the modes are read out of the session-create response and stashed on `ActiveSession.modes`, then emitted as a snapshot *after* the run's queue is attached (emitting earlier drops them). |
 | `NewSessionResponse.models` (legacy) / `.availableModels` | `STATE_SNAPSHOT` (`{models}`) | Same deferred-snapshot pattern. |
-| **ACP 0.11:** `NewSessionResponse.configOptions` | (not wired) | The 0.11 field that supersedes `models`. **Gap** — see [§ Config & model discovery](#config--model-discovery). |
-| **ACP 0.11:** `ConfigOptionUpdate` | (dropped) | Falls through to the dict fallback which logs "Unhandled session/update kind: config_option_update". **Gap.** |
-| **ACP 0.11:** `UsageUpdate` | (dropped) | Token usage / cost not surfaced. **Gap.** |
-| **ACP 0.11:** `SessionInfoUpdate` | (dropped) | Title / `updatedAt` not surfaced. **Gap.** |
-| **ACP 0.11:** `AgentPlanUpdate` / `…ContentUpdate` / `…RemovedUpdate` | (dropped) | Plan/todo list not surfaced. **Gap.** |
-| `AgentThoughtChunk` | (dropped) | Agent reasoning text not surfaced (no native AG-UI event). **Gap.** |
+| **ACP 0.11:** `NewSessionResponse.configOptions` | `STATE_SNAPSHOT` (`{configOptions}`) | Read out of the session-create response and stashed on `ActiveSession.config_options`, then emitted in the same post-`start_run` snapshot as `modes`/`models`. Each option is serialised to `{id, name, description?, category?, currentValue, type, options?}` (select options carry `{value, name, description?}`); `_meta` is dropped. |
+| **ACP 0.11:** `ConfigOptionUpdate` | `STATE_SNAPSHOT` (`{configOptions}`) | The notification carries the full set, so this is a replace not a patch — a fresh `STATE_SNAPSHOT` is emitted on every update. |
+| **ACP 0.11:** `UsageUpdate` | `CUSTOM` (`name="agent:usage"`, `value={used, size, cost?}`) | `cost` (when present) is `{amount, currency}`. Clients render a token/cost meter; dedupe upstream. |
+| **ACP 0.11:** `SessionInfoUpdate` | `CUSTOM` (`name="agent:session_info"`, `value={title?, updatedAt?}`) | Carries `title` and `updatedAt`; useful for titling the conversation thread. |
+| **ACP 0.11:** `AgentPlanUpdate` / `AgentPlanContentUpdate` / `AgentPlanRemovedUpdate` | `CUSTOM` (`agent:plan` / `agent:plan_update` / `agent:plan_removed`) | Each variant maps to a `CUSTOM` whose `value` is the plan payload verbatim (`{entries}` / the discriminated plan content / `{id}`). Clients that don't render plans ignore them. |
+| **ACP 0.11:** `AgentThoughtChunk` | `CUSTOM` (`name="agent:thought"`, `value={delta}`) | Agent reasoning streamed as thought deltas; the text message stream is kept clean so clients decide whether to surface reasoning. |
 | `UserMessageChunk` | (dropped) | Echo of the user's own message; not needed (AG-UI client already has it). |
 
 ### Permission flow (the big impedance mismatch)
@@ -94,8 +94,9 @@ for places where the translation is **not 1:1** and where the bridge must
 | `ext_notification` with `_kiro.dev/*` or `_session/terminate` | `CUSTOM` (`name` from a hardcoded rename table) | **Renames:** `_kiro.dev/metadata` → `agent:metadata`, `_kiro.dev/mcp/server_initialized` → `agent:mcp_initialized`, `_kiro.dev/compaction/status` → `agent:compaction`, `_kiro.dev/commands/available` → `agent:commands_available`, `_session/terminate` → `agent:subagent_terminated`. Unknown `_*.dev/*` methods get a synthesised `agent:<tail>` name. |
 | `ext_notification` arriving **before any run** | buffered, flushed as `CUSTOM` on the first `start_run` / `attach_resume_queue` | **State held:** `_pending_notifications: list[(method, params)]`. Without this, session-init notifications (e.g. `_kiro.dev/mcp/server_initialized` during startup) would be lost — there is no SSE stream to emit them on yet. |
 | `ext_method` (vendor request/response) | `{}` (empty dict) | The bridge returns an empty result for every vendor extension *request*; only *notifications* are surfaced. |
-| **ACP 0.11:** `create_elicitation` | `DeclineElicitationResponse` (stub) | Elicitations are silently declined — the user never sees them. **Gap** (could be surfaced as another `interrupt` `reason`). |
-| **ACP 0.11:** `complete_elicitation` | no-op | Since `create_elicitation` always declines, completions are unreachable. |
+| **ACP 0.11:** `create_elicitation` | `RUN_FINISHED{outcome:{type:"interrupt", interrupts:[{reason:"elicitation", responseSchema, metadata:{mode, elicitationId}}]}}` then SSE stream **closes** | Reuses the same suspend/resume plumbing as `request_permission`: a Future keyed by elicitation id (taken from the request for URL mode, or bridge-generated for form mode) is parked, the run ends with an interrupt, and the client resumes with a payload describing accept/decline/cancel. The `Interrupt.responseSchema` carries the ACP `ElicitationSchema` so the client can render a form. |
+| **ACP 0.11:** `complete_elicitation` | `CUSTOM` (`name="agent:elicitation_complete"`, `value={elicitationId}`) | Mid-stream completion notification; rare (usually the accept/decline reply closes the loop). |
+| **ACP 0.11:** `resume[].payload` for an elicitation | `AcceptElicitationResponse` / `DeclineElicitationResponse` / `CancelElicitationResponse` | `resolve_interrupt` dispatches by id across both the permission and elicitation Future tables. Payload shapes: `{status:"accepted", values:{…}}` → accept with content; `{status:"declined"}` → decline; resume `status="cancelled"` → cancel. |
 
 ### File / terminal callbacks (agent → bridge)
 
@@ -109,8 +110,9 @@ for places where the translation is **not 1:1** and where the bridge must
 
 | Direction | Mechanism | Status |
 |---|---|---|
-| Server → client (advertise options) | `STATE_SNAPSHOT` with `modes` / `models` / `currentModeId` | Works for the **legacy** `NewSessionResponse.modes`/`.models` fields. **ACP 0.11 gap:** the new `NewSessionResponse.configOptions` field (which carries the model list now) is not read, and `ConfigOptionUpdate` notifications are dropped. Agents that only use `configOptions` will produce an empty model selector in the UI. |
-| Client → server (select option) | `forwardedProps.model` → `session/set_config_option(config_id="model")` | Works at session-create time. **Gap:** mid-session model changes have no AG-UI surface (every `POST /ag-ui` is either a fresh run or a resume; there's no "config-only" request). |
+| Server → client (advertise options) | `STATE_SNAPSHOT` with `modes` / `models` / `currentModeId` / `configOptions` | Works for both the legacy `NewSessionResponse.modes`/`.models` fields and the ACP 0.11 `configOptions` field (read at session-create and re-emitted on `ConfigOptionUpdate` notifications). |
+| Client → server (select option) | `forwardedProps.model` → `session/set_config_option(config_id="model")`; `forwardedProps.configOptions` (a `{config_id: value}` dict) → `set_config_option` for each at session-create time | Works at session-create time. |
+| Mid-session config change | `POST /ag-ui/config` (bridge extension) → `session/set_config_option` per option | AG-UI's `POST /ag-ui` is always a fresh run or a resume; the bridge exposes a separate `POST /ag-ui/config` endpoint (`{threadId, configOptions}`) so clients can switch models / toggle options mid-session without contorting the run contract. Not part of the AG-UI standard. |
 
 ---
 
@@ -153,16 +155,37 @@ for places where the translation is **not 1:1** and where the bridge must
 | Streaming tool args | ✅ `TOOL_CALL_ARGS` (delta string) | ✅ `ToolCallStart.raw_input` | maps (one-shot in ACP, chunked in AG-UI) |
 | Tool result | ✅ `TOOL_CALL_RESULT` | ✅ `ToolCallProgress.raw_output` | maps (renamed field) |
 | Tool progress (in-flight output) | ❌ (repurposes `TOOL_CALL_ARGS`) | ✅ `ToolCallProgress` w/ `status=running` | **not 1:1** |
-| Agent reasoning / "thought" | ❌ | ✅ `AgentThoughtChunk` | **dropped** |
-| Plans / todos | ❌ | ✅ `AgentPlanUpdate` etc. | **dropped** |
-| Token usage / cost | ❌ | ✅ `UsageUpdate` | **dropped** |
-| Session title / metadata | ❌ | ✅ `SessionInfoUpdate` | **dropped** |
-| Structured user prompts (elicitation) | ⚠️ `interrupt` could carry it | ✅ `create_elicitation` (0.11) | **declined** by the bridge today |
+| Agent reasoning / "thought" | `CUSTOM agent:thought` | ✅ `AgentThoughtChunk` | maps (via `CUSTOM` with `{delta}`) |
+| Plans / todos | `CUSTOM agent:plan[_update|_removed]` | ✅ `AgentPlanUpdate` / `…ContentUpdate` / `…RemovedUpdate` | maps (each variant → a `CUSTOM` with the plan payload) |
+| Token usage / cost | `CUSTOM agent:usage` | ✅ `UsageUpdate` | maps (with `{used, size, cost?}`) |
+| Session title / metadata | `CUSTOM agent:session_info` | ✅ `SessionInfoUpdate` | maps |
+| Structured user prompts (elicitation) | ✅ `interrupt{reason:"elicitation"}` | ✅ `create_elicitation` (0.11) | maps (reuses the permission suspend/resume plumbing) |
 | Tool approval (HITL) | ✅ `RUN_FINISHED{interrupt}` + `resume` | ✅ `request_permission` | maps (with state held — the hard part) |
 | Modes | ✅ `STATE_SNAPSHOT.modes` | ✅ `NewSessionResponse.modes` / `CurrentModeUpdate` | maps |
-| Models / config options | ✅ `STATE_SNAPSHOT.models` | ✅ `configOptions` (0.11) | **partially mapped** (legacy only) |
-| Mid-session config change | ❌ (no surface) | ✅ `set_config_option` | **no AG-UI surface** |
+| Models / config options | ✅ `STATE_SNAPSHOT.models` / `.configOptions` | ✅ `configOptions` (0.11) | maps (legacy `models` + 0.11 `configOptions`) |
+| Mid-session config change | ✅ `POST /ag-ui/config` (bridge ext) | ✅ `set_config_option` | maps (bridge extension endpoint) |
 | Cancel | ⚠️ client disconnect | ✅ `session/cancel` | maps via disconnect detection |
-| Multiple sessions per agent process | ❌ | ✅ `list`/`fork`/`resume`/`close` | **not exposed** |
+| Multiple sessions per agent process | ❌ | ✅ `list`/`fork`/`resume`/`close` | **not exposed** (see [§ Multi-session surface](#multi-session-surface)) |
 | File reads/writes by agent | (invisible to client) | ✅ `read_text_file` etc. | bridge handles server-side |
 | Terminals | (invisible to client) | ✅ terminal methods | bridge fabricates ids |
+
+---
+
+## Out of scope: editor-grade features
+
+ACP 0.11 carries a full editor-integration surface — document sync
+(`document/*`), next-edit-suggestions (`nes/*`), and provider/auth
+management (`providers/*`, `authenticate`, `logout`). These assume a
+long-lived editor session with open documents, and the AG-UI client (a chat
+UI) has nothing to do with them. The bridge's `ext_method` returns `{}`
+for unknown methods and the SDK marks `document_*` / `nes_*` as optional
+routes, so no code change is needed here — this is an explicit non-goal.
+
+## Multi-session surface
+
+ACP lets one agent process hold many sessions; AG-UI's contract is strictly
+one `threadId` ↔ one bridge-side `ActiveSession` ↔ one ACP `session_id`.
+The additional ACP session ops (`session/fork`, `session/resume`,
+`session/list`, `session/close`) are **not exposed** through AG-UI today —
+they are documented in [`new_acp.md`](new_acp.md) § P6 as a deferred,
+larger surface-area expansion.

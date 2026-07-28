@@ -145,6 +145,10 @@ class AgentRunner:
             transport_kwargs={
                 "limit": 16 * 1024 * 1024
             },  # 16 MB buffer for large responses
+            # Elicitation (create_elicitation / complete_elicitation) and
+            # other 0.11 routes are flagged "unstable" by the SDK; enabling
+            # the unstable protocol accepts them without a per-call warning.
+            use_unstable_protocol=True,
         )
         conn, process = await self._context_manager.__aenter__()
 
