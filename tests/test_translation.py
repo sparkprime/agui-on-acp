@@ -46,11 +46,12 @@ from tests.fake_agent import (
     usage,
 )
 from tests.sse_helpers import event_of_type, read_sse_events, read_until
+from tests.conftest import make_stack, teardown_stack
 
 
 def _agui_body(
     *,
-    thread_id: str = "t1",
+    thread_id: str = "fake-session-1",
     content: str = "hello",
     forwarded_props: dict[str, Any] | None = None,
     resume: list[dict[str, Any]] | None = None,
@@ -100,7 +101,7 @@ async def test_text_turn_streams_start_content_end_then_finished(
 
     finished = event_of_type(events, "RUN_FINISHED")
     assert finished["data"].get("outcome") is None
-    assert finished["data"]["threadId"] == "t1"
+    assert finished["data"]["threadId"] == "fake-session-1"
 
     content = "".join(
         e["data"]["delta"] for e in events if e["type"] == "TEXT_MESSAGE_CONTENT"
@@ -303,6 +304,7 @@ async def test_permission_future_expires_when_no_resume_arrives(
 async def test_client_disconnect_triggers_acp_cancel(
     fake_agent: FakeAcpAgent,
     session_manager: SessionManager,
+    precreated_session_id: str,
     http_client: httpx.AsyncClient,
 ):
     """When the AG-UI client disconnects mid-run (CancelledError on the SSE
@@ -322,21 +324,21 @@ async def test_client_disconnect_triggers_acp_cancel(
         sleep(10.0),  # hold the turn open so we can disconnect mid-stream
         end_turn(),
     ]
-    # Create the session + run via the manager (same path the endpoint takes).
-    await session_manager.create_task(task_id="t1", cwd="/tmp/opencode")
+    sid = precreated_session_id
+    # Start a run on the pre-created session via the manager.
     run_id = await session_manager.start_run(
-        "t1", {"messages": [{"role": "user", "content": "hi"}]}
+        sid, {"messages": [{"role": "user", "content": "hi"}]}
     )
-    queue = session_manager.get_event_queue("t1", run_id)
+    queue = session_manager.get_event_queue(sid, run_id)
     assert queue is not None
 
     async def _consume() -> list[str]:
         chunks: list[str] = []
         async for chunk in event_stream(
             queue,
-            "t1",
+            sid,
             timeout=2.0,
-            on_cancel=lambda: session_manager.cancel_run("t1"),
+            on_cancel=lambda: session_manager.cancel_run(sid),
         ):
             chunks.append(chunk)
         return chunks
@@ -350,13 +352,14 @@ async def test_client_disconnect_triggers_acp_cancel(
 
     # The on_cancel callback ran cancel_run → session/cancel to the agent.
     await asyncio.sleep(0.2)
-    assert "fake-session-1" in fake_agent.cancel_calls
+    assert sid in fake_agent.cancel_calls
 
 
 @pytest.mark.asyncio
 async def test_cancel_while_suspended_resolves_permission_cancelled(
     fake_agent: FakeAcpAgent,
     session_manager: SessionManager,
+    precreated_session_id: str,
     http_client: httpx.AsyncClient,
 ):
     """Cancelling a run while it's suspended at a permission interrupt
@@ -371,12 +374,12 @@ async def test_cancel_while_suspended_resolves_permission_cancelled(
     # Cancel the suspended run directly via the manager (the AG-UI surface
     # has no separate cancel endpoint; clients either resume with
     # status="cancelled" or let the permission TTL expire).
-    await session_manager.cancel_run("t1")
+    await session_manager.cancel_run(precreated_session_id)
 
     await asyncio.wait_for(fake_agent.prompt_done.wait(), timeout=5.0)
     assert len(fake_agent.permission_replies) == 1
     assert fake_agent.permission_replies[0].outcome["outcome"] == "cancelled"
-    assert "fake-session-1" in fake_agent.cancel_calls
+    assert precreated_session_id in fake_agent.cancel_calls
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -429,41 +432,48 @@ async def test_pre_run_notification_is_buffered_then_flushed(
 
 
 @pytest.mark.asyncio
-async def test_state_snapshot_advertises_modes(
-    fake_agent: FakeAcpAgent, http_client: httpx.AsyncClient
-):
+async def test_state_snapshot_advertises_modes():
     """When the agent reports modes in new_session, the bridge emits a
     STATE_SNAPSHOT carrying them so the UI can populate selectors."""
-    fake_agent.modes = [
-        {"id": "build", "name": "Build"},
-        {"id": "plan", "name": "Plan"},
-    ]
-    fake_agent.script = [text("hi"), end_turn()]
-    async with http_client.stream("POST", "/ag-ui", json=_agui_body()) as resp:
-        events = await read_sse_events(resp)
-    snaps = [e for e in events if e["type"] == "STATE_SNAPSHOT"]
-    assert snaps, "expected a STATE_SNAPSHOT with modes"
-    assert snaps[0]["data"]["snapshot"]["modes"] == [
-        {"id": "build", "name": "Build"},
-        {"id": "plan", "name": "Plan"},
-    ]
+    fake, manager, client = await make_stack()
+    try:
+        fake.modes = [
+            {"id": "build", "name": "Build"},
+            {"id": "plan", "name": "Plan"},
+        ]
+        fake.script = [text("hi"), end_turn()]
+        active = await manager.create_session(cwd="/tmp/opencode")
+        body = _agui_body(thread_id=active.session_id)
+        async with client.stream("POST", "/ag-ui", json=body) as resp:
+            events = await read_sse_events(resp)
+        snaps = [e for e in events if e["type"] == "STATE_SNAPSHOT"]
+        assert snaps, "expected a STATE_SNAPSHOT with modes"
+        assert snaps[0]["data"]["snapshot"]["modes"] == [
+            {"id": "build", "name": "Build"},
+            {"id": "plan", "name": "Plan"},
+        ]
+    finally:
+        await teardown_stack(fake, manager, client)
 
 
 @pytest.mark.asyncio
-async def test_forwarded_props_mode_and_model_are_applied(
-    fake_agent: FakeAcpAgent, http_client: httpx.AsyncClient
-):
-    """``forwardedProps.mode`` / ``forwardedProps.model`` from the AG-UI
-    client are translated to ACP ``session/set_mode`` / ``session/set_model``
-    before the prompt runs."""
-    fake_agent.script = [text("hi"), end_turn()]
-    body = _agui_body(
-        forwarded_props={"cwd": "/tmp/opencode", "mode": "plan", "model": "gpt-x"}
-    )
-    async with http_client.stream("POST", "/ag-ui", json=body) as resp:
-        await read_sse_events(resp)
-    assert ("fake-session-1", "plan") in fake_agent.set_mode_calls
-    assert ("fake-session-1", "gpt-x") in fake_agent.set_model_calls
+async def test_create_session_applies_mode_and_model():
+    """``POST /ag-ui/sessions`` with ``mode`` / ``model`` translates to ACP
+    ``session/set_mode`` / ``session/set_model`` at create time (the prompt
+    path no longer applies them — moved to the Create endpoint)."""
+    fake, manager, client = await make_stack()
+    try:
+        fake.script = [text("hi"), end_turn()]
+        resp = await client.post(
+            "/ag-ui/sessions",
+            json={"cwd": "/tmp/opencode", "mode": "plan", "model": "gpt-x"},
+        )
+        assert resp.status_code == 201
+        sid = resp.json()["sessionId"]
+        assert (sid, "plan") in fake.set_mode_calls
+        assert (sid, "gpt-x") in fake.set_model_calls
+    finally:
+        await teardown_stack(fake, manager, client)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -478,7 +488,7 @@ async def test_no_user_message_yields_run_error(
     """A RunAgentInput with no user message surfaces a RUN_ERROR stream
     instead of starting a turn."""
     body = {
-        "threadId": "t1",
+        "threadId": "fake-session-1",
         "runId": "r1",
         "messages": [{"role": "assistant", "content": "no user here"}],
         "forwardedProps": {"cwd": "/tmp/opencode"},
@@ -508,45 +518,49 @@ async def test_prompt_exception_becomes_run_error(
 
 
 @pytest.mark.asyncio
-async def test_state_snapshot_advertises_config_options(
-    fake_agent: FakeAcpAgent, http_client: httpx.AsyncClient
-):
+async def test_state_snapshot_advertises_config_options():
     """When the agent reports ``configOptions`` in new_session, the bridge
     emits them in the post-start STATE_SNAPSHOT so the UI can populate the
     config/model selector."""
-    fake_agent.config_options = [
-        {
-            "id": "model",
-            "name": "Model",
-            "type": "select",
-            "currentValue": "gpt-x",
-            "options": [
-                {"value": "gpt-x", "name": "GPT X"},
-                {"value": "claude-y", "name": "Claude Y"},
-            ],
-        },
-        {
-            "id": "verbose",
-            "name": "Verbose",
-            "type": "boolean",
-            "currentValue": False,
-        },
-    ]
-    fake_agent.script = [text("hi"), end_turn()]
-    async with http_client.stream("POST", "/ag-ui", json=_agui_body()) as resp:
-        events = await read_sse_events(resp)
-    snaps = [e for e in events if e["type"] == "STATE_SNAPSHOT"]
-    assert snaps, "expected a STATE_SNAPSHOT with configOptions"
-    opts = snaps[0]["data"]["snapshot"]["configOptions"]
-    by_id = {o["id"]: o for o in opts}
-    assert by_id["model"]["type"] == "select"
-    assert by_id["model"]["currentValue"] == "gpt-x"
-    assert by_id["model"]["options"] == [
-        {"value": "gpt-x", "name": "GPT X"},
-        {"value": "claude-y", "name": "Claude Y"},
-    ]
-    assert by_id["verbose"]["type"] == "boolean"
-    assert by_id["verbose"]["currentValue"] is False
+    fake, manager, client = await make_stack()
+    try:
+        fake.config_options = [
+            {
+                "id": "model",
+                "name": "Model",
+                "type": "select",
+                "currentValue": "gpt-x",
+                "options": [
+                    {"value": "gpt-x", "name": "GPT X"},
+                    {"value": "claude-y", "name": "Claude Y"},
+                ],
+            },
+            {
+                "id": "verbose",
+                "name": "Verbose",
+                "type": "boolean",
+                "currentValue": False,
+            },
+        ]
+        fake.script = [text("hi"), end_turn()]
+        active = await manager.create_session(cwd="/tmp/opencode")
+        body = _agui_body(thread_id=active.session_id)
+        async with client.stream("POST", "/ag-ui", json=body) as resp:
+            events = await read_sse_events(resp)
+        snaps = [e for e in events if e["type"] == "STATE_SNAPSHOT"]
+        assert snaps, "expected a STATE_SNAPSHOT with configOptions"
+        opts = snaps[0]["data"]["snapshot"]["configOptions"]
+        by_id = {o["id"]: o for o in opts}
+        assert by_id["model"]["type"] == "select"
+        assert by_id["model"]["currentValue"] == "gpt-x"
+        assert by_id["model"]["options"] == [
+            {"value": "gpt-x", "name": "GPT X"},
+            {"value": "claude-y", "name": "Claude Y"},
+        ]
+        assert by_id["verbose"]["type"] == "boolean"
+        assert by_id["verbose"]["currentValue"] is False
+    finally:
+        await teardown_stack(fake, manager, client)
 
 
 @pytest.mark.asyncio
@@ -589,41 +603,41 @@ async def test_config_option_update_notification_emits_state_snapshot(
 
 
 @pytest.mark.asyncio
-async def test_forwarded_props_config_options_are_applied(
-    fake_agent: FakeAcpAgent, http_client: httpx.AsyncClient
-):
-    """``forwardedProps.configOptions`` (a ``{config_id: value}`` dict) is
-    applied via ``session/set_config_option`` at session-create time, in
-    addition to the legacy ``forwardedProps.model``."""
-    fake_agent.script = [text("hi"), end_turn()]
-    body = _agui_body(
-        forwarded_props={
-            "cwd": "/tmp/opencode",
-            "model": "gpt-x",
-            "configOptions": {"theme": "dark", "verbose": True},
-        }
-    )
-    async with http_client.stream("POST", "/ag-ui", json=body) as resp:
-        events = await read_sse_events(resp)
-    # The run must complete cleanly (no RUN_ERROR) — the config calls did not
-    # raise into the prompt path.
-    assert all(e["type"] != "RUN_ERROR" for e in events)
-    # The legacy "model" field was applied via set_model (config_id="model").
-    assert ("fake-session-1", "gpt-x") in fake_agent.set_model_calls
-    # The generic config options were applied via set_config_option. The
-    # "model" entry in configOptions is skipped (handled above), but "theme"
-    # and "verbose" are forwarded.
-    applied_ids = {cid for (_sid, cid, _val) in fake_agent.set_config_option_calls}
-    assert "theme" in applied_ids
-    assert "verbose" in applied_ids
-    assert "model" in applied_ids  # via the legacy field
-    # No duplicate "model" application from the configOptions dict.
-    model_calls = [
-        (cid, val)
-        for (_sid, cid, val) in fake_agent.set_config_option_calls
-        if cid == "model"
-    ]
-    assert model_calls == [("model", "gpt-x")]
+async def test_create_session_applies_config_options():
+    """``POST /ag-ui/sessions`` with ``configOptions`` applies each via
+    ``session/set_config_option`` at create time (the prompt path no longer
+    applies them — moved to the Create endpoint)."""
+    fake, manager, client = await make_stack()
+    try:
+        fake.script = [text("hi"), end_turn()]
+        resp = await client.post(
+            "/ag-ui/sessions",
+            json={
+                "cwd": "/tmp/opencode",
+                "model": "gpt-x",
+                "configOptions": {"theme": "dark", "verbose": True},
+            },
+        )
+        assert resp.status_code == 201
+        sid = resp.json()["sessionId"]
+        # The legacy "model" field was applied via set_model (config_id="model").
+        assert (sid, "gpt-x") in fake.set_model_calls
+        # The generic config options were applied via set_config_option. The
+        # "model" entry in configOptions is skipped (handled above), but
+        # "theme" and "verbose" are forwarded.
+        applied_ids = {cid for (_sid, cid, _val) in fake.set_config_option_calls}
+        assert "theme" in applied_ids
+        assert "verbose" in applied_ids
+        assert "model" in applied_ids  # via the legacy field
+        # No duplicate "model" application from the configOptions dict.
+        model_calls = [
+            (cid, val)
+            for (_sid, cid, val) in fake.set_config_option_calls
+            if cid == "model"
+        ]
+        assert model_calls == [("model", "gpt-x")]
+    finally:
+        await teardown_stack(fake, manager, client)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -843,6 +857,7 @@ async def test_elicitation_resume_cancelled(
 async def test_cancel_while_suspended_at_elicitation_resolves_cancelled(
     fake_agent: FakeAcpAgent,
     session_manager: SessionManager,
+    precreated_session_id: str,
     http_client: httpx.AsyncClient,
 ):
     """Cancelling a run while it's suspended at an elicitation resolves the
@@ -854,7 +869,7 @@ async def test_cancel_while_suspended_at_elicitation_resolves_cancelled(
     async with http_client.stream("POST", "/ag-ui", json=_agui_body()) as resp:
         await read_until(resp, {"RUN_FINISHED"})
 
-    await session_manager.cancel_run("t1")
+    await session_manager.cancel_run(precreated_session_id)
     await asyncio.wait_for(fake_agent.prompt_done.wait(), timeout=5.0)
     assert len(fake_agent.elicitation_replies) == 1
     assert fake_agent.elicitation_replies[0].action == "cancel"
@@ -895,7 +910,7 @@ async def test_post_ag_ui_config_applies_config_options(
 
     resp = await http_client.post(
         "/ag-ui/config",
-        json={"threadId": "t1", "configOptions": {"model": "claude-y"}},
+        json={"threadId": "fake-session-1", "configOptions": {"model": "claude-y"}},
     )
     assert resp.status_code == 200
     body = resp.json()
@@ -922,34 +937,36 @@ async def test_post_ag_ui_config_unknown_session(
 
 
 @pytest.mark.asyncio
-async def test_forwarded_props_mcp_servers_are_passed_to_session(
-    fake_agent: FakeAcpAgent, http_client: httpx.AsyncClient
-):
-    """``forwardedProps.mcpServers`` is plumbed through to the ACP
-    ``session/new`` call."""
-    fake_agent.script = [text("hi"), end_turn()]
-    body = _agui_body(
-        forwarded_props={
-            "cwd": "/tmp/opencode",
-            "mcpServers": {
-                "github": {"type": "http", "url": "https://example/mcp"},
+async def test_create_session_passes_mcp_servers():
+    """``POST /ag-ui/sessions`` with ``mcpServers`` plumbs them through to
+    the ACP ``session/new`` call."""
+    fake, manager, client = await make_stack()
+    try:
+        fake.script = [text("hi"), end_turn()]
+        resp = await client.post(
+            "/ag-ui/sessions",
+            json={
+                "cwd": "/tmp/opencode",
+                "mcpServers": {
+                    "github": {"type": "http", "url": "https://example/mcp"},
+                },
             },
-        }
-    )
-    async with http_client.stream("POST", "/ag-ui", json=body) as resp:
-        await read_sse_events(resp)
-    assert len(fake_agent.new_session_calls) == 1
-    mcp = fake_agent.new_session_calls[0]["mcp_servers"]
-    assert mcp, "expected mcp_servers to be forwarded to session/new"
-    servers = cast(list[Any], mcp)
-    found_http = False
-    for s in servers:
-        if isinstance(s, dict):
-            s_dict = cast(dict[str, Any], s)
-            stype: Any = s_dict.get("type")
-        else:
-            stype = getattr(s, "type", None)
-        if stype == "http":
-            found_http = True
-            break
-    assert found_http, "expected an http MCP server in session/new"
+        )
+        assert resp.status_code == 201
+        assert len(fake.new_session_calls) == 1
+        mcp = fake.new_session_calls[0]["mcp_servers"]
+        assert mcp, "expected mcp_servers to be forwarded to session/new"
+        servers = cast(list[Any], mcp)
+        found_http = False
+        for s in servers:
+            if isinstance(s, dict):
+                s_dict = cast(dict[str, Any], s)
+                stype: Any = s_dict.get("type")
+            else:
+                stype = getattr(s, "type", None)
+            if stype == "http":
+                found_http = True
+                break
+        assert found_http, "expected an http MCP server in session/new"
+    finally:
+        await teardown_stack(fake, manager, client)

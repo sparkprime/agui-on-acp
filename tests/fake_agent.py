@@ -39,7 +39,7 @@ import asyncio
 import logging
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Union, cast
+from typing import Any, Literal, Union, cast
 
 import acp
 import acp.schema as schema
@@ -48,7 +48,89 @@ from tests.transport import TransportPair
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["FakeAcpAgent", "ScriptStep", "Script"]
+__all__ = [
+    "FakeAcpAgent",
+    "FakeSessionStore",
+    "StoredSession",
+    "ScriptStep",
+    "Script",
+    "capabilities",
+    "text",
+    "user_text",
+    "tool_start",
+    "tool_progress",
+    "tool_end",
+    "request_permission",
+    "ext_notification",
+    "end_turn",
+    "sleep",
+    "config_option_update",
+    "usage",
+    "session_info",
+    "plan",
+    "plan_removed",
+    "thought",
+    "elicitation",
+]
+
+
+# ── Backing store (shared across fake-agent instances for restart tests) ────
+
+
+@dataclass
+class StoredSession:
+    """One persisted conversation in the fake's backing store."""
+
+    session_id: str
+    cwd: str
+    transcript: list[Any] = field(default_factory=list[Any])  # Script for replay
+    deleted: bool = False
+
+
+class FakeSessionStore:
+    """A minimal in-memory session store shared across fake-agent instances.
+
+    Outliving any single ``FakeAcpAgent``/transport/manager triple is what
+    models "the agent's persistence survived a bridge restart" — the same
+    store is passed into a second ``FakeAcpAgent`` constructed after the
+    first manager is discarded.
+    """
+
+    def __init__(self) -> None:
+        self.sessions: dict[str, StoredSession] = {}
+
+    def create(self, cwd: str) -> StoredSession:
+        sid = f"fake-session-{len(self.sessions) + 1}"
+        s = StoredSession(session_id=sid, cwd=cwd)
+        self.sessions[sid] = s
+        return s
+
+    def get(self, session_id: str) -> StoredSession:
+        s = self.sessions.get(session_id)
+        if s is None or s.deleted:
+            raise acp.RequestError.resource_not_found(session_id)
+        return s
+
+
+# ── Capability helper ──────────────────────────────────────────────────────
+
+
+def capabilities(
+    *,
+    load_session: bool = False,
+    resume: bool = False,
+    list_: bool = False,
+    delete: bool = False,
+) -> schema.AgentCapabilities:
+    """Build an ``AgentCapabilities`` advertising the requested bits."""
+    sc: schema.SessionCapabilities | None = None
+    if resume or list_ or delete:
+        sc = schema.SessionCapabilities(
+            resume=schema.SessionResumeCapabilities() if resume else None,
+            list=schema.SessionListCapabilities() if list_ else None,
+            delete=schema.SessionDeleteCapabilities() if delete else None,
+        )
+    return schema.AgentCapabilities(load_session=load_session, session_capabilities=sc)
 
 
 # ── Script step types ──────────────────────────────────────────────────────
@@ -56,9 +138,15 @@ __all__ = ["FakeAcpAgent", "ScriptStep", "Script"]
 
 @dataclass
 class TextStep:
-    """Emit a single agent text delta."""
+    """Emit a single text delta.
+
+    ``role="agent"`` (default) emits an ``AgentMessageChunk``;
+    ``role="user"`` emits a ``UserMessageChunk`` (used for replay scripts
+    that include the user's turns).
+    """
 
     text: str
+    role: Literal["agent", "user"] = "agent"
 
 
 @dataclass
@@ -219,6 +307,11 @@ def text(s: str) -> TextStep:
     return TextStep(s)
 
 
+def user_text(s: str) -> TextStep:
+    """Emit a user-role text delta (a ``UserMessageChunk``)."""
+    return TextStep(s, role="user")
+
+
 def tool_start(tid: str, title: str = "tool", **kw: Any) -> ToolStartStep:
     return ToolStartStep(tool_call_id=tid, title=title, **kw)
 
@@ -315,15 +408,26 @@ class FakeAcpAgent:
     drove.
     """
 
-    def __init__(self, transport: TransportPair, script: Script | None = None) -> None:
+    def __init__(
+        self,
+        transport: TransportPair,
+        script: Script | None = None,
+        capabilities: schema.AgentCapabilities | None = None,
+        store: FakeSessionStore | None = None,
+    ) -> None:
         self.transport = transport
         self.script: Script = list(script or [])
         self.conn: acp.AgentSideConnection | None = None
+        self.capabilities = capabilities
+        self.store = store if store is not None else FakeSessionStore()
 
         # Recorded calls
         self.initialize_calls: list[dict[str, Any]] = []
         self.new_session_calls: list[dict[str, Any]] = []
         self.load_session_calls: list[dict[str, Any]] = []
+        self.resume_session_calls: list[dict[str, Any]] = []
+        self.close_session_calls: list[str] = []
+        self.delete_session_calls: list[str] = []
         self.prompt_calls: list[_PromptCall] = []
         self.set_mode_calls: list[tuple[str, str]] = []
         self.set_model_calls: list[tuple[str, str]] = []
@@ -338,7 +442,6 @@ class FakeAcpAgent:
         self.elicitation_replies: list[_ElicitationReply] = []
 
         # Per-session state we expose to the bridge's new_session response.
-        self._session_id = "fake-session-1"
         self.modes: list[dict[str, Any]] | None = None
         self._models: list[dict[str, Any]] | None = None
         # ACP 0.11 config options advertised in new_session. Each entry is a
@@ -375,6 +478,26 @@ class FakeAcpAgent:
             self.transport.agent_reader,
             use_unstable_protocol=True,
         )
+        # The installed agent-side router (0.11.x) does not yet route
+        # ``session/delete`` even though DeleteSessionRequest/Response and
+        # AGENT_METHODS["session_delete"] exist. A real newer agent would
+        # route it; register the route here so the fake models that. This
+        # is a test-only reach-past-the-SDK; delete once the SDK grows the
+        # route upstream.
+        from acp.meta import AGENT_METHODS
+
+        raw_conn = getattr(self.conn, "_conn", None)
+        router = getattr(raw_conn, "_handler", None)
+        if router is not None and hasattr(router, "route_request"):
+            from acp.utils import normalize_result
+
+            router.route_request(
+                AGENT_METHODS["session_delete"],
+                schema.DeleteSessionRequest,
+                self,
+                "delete_session",
+                adapt_result=normalize_result,
+            )
         return self.conn
 
     async def aclose(self) -> None:
@@ -406,6 +529,7 @@ class FakeAcpAgent:
         return schema.InitializeResponse(
             protocol_version=protocol_version,
             agent_info=schema.Implementation(name="fake-acp", version="0.1.0"),
+            agent_capabilities=self.capabilities,
         )
 
     async def new_session(
@@ -423,7 +547,8 @@ class FakeAcpAgent:
                 "kwargs": kwargs,
             }
         )
-        resp_kwargs: dict[str, Any] = {"session_id": self._session_id}
+        stored = self.store.create(cwd)
+        resp_kwargs: dict[str, Any] = {"session_id": stored.session_id}
         if self.modes is not None:
             modes = self.modes
             resp_kwargs["modes"] = schema.SessionModeState(
@@ -455,6 +580,12 @@ class FakeAcpAgent:
                 "kwargs": kwargs,
             }
         )
+        stored = self.store.get(session_id)  # raises resource_not_found
+        # Replay the scripted transcript as session/update notifications
+        # arriving synchronously during this call — exactly what a real
+        # agent's session/load delivers.
+        if stored.transcript:
+            await self._run_script(session_id, script=stored.transcript)
         return schema.LoadSessionResponse()
 
     async def set_session_mode(
@@ -512,18 +643,55 @@ class FakeAcpAgent:
     # Other Agent methods the router may route — provide minimal stubs so
     # an unexpected client request doesn't crash the test; they record too.
     async def list_sessions(self, **kwargs: Any) -> schema.ListSessionsResponse:
-        return schema.ListSessionsResponse(sessions=[])
+        cwd = kwargs.get("cwd")
+        sessions: list[schema.SessionInfo] = []
+        for s in self.store.sessions.values():
+            if s.deleted:
+                continue
+            if cwd is not None and s.cwd != cwd:
+                continue
+            sessions.append(
+                schema.SessionInfo(session_id=s.session_id, cwd=s.cwd)
+            )
+        return schema.ListSessionsResponse(sessions=sessions)
 
     async def close_session(
         self, session_id: str, **kwargs: Any
     ) -> schema.CloseSessionResponse:
+        self.close_session_calls.append(session_id)
         return schema.CloseSessionResponse()
 
     async def fork_session(self, **kwargs: Any) -> schema.ForkSessionResponse:
         return schema.ForkSessionResponse(session_id=str(uuid.uuid4()))
 
-    async def resume_session(self, **kwargs: Any) -> schema.ResumeSessionResponse:
+    async def resume_session(
+        self,
+        session_id: str,
+        cwd: str,
+        additional_directories: list[str] | None = None,
+        mcp_servers: list[Any] | None = None,
+        **kwargs: Any,
+    ) -> schema.ResumeSessionResponse:
+        self.resume_session_calls.append(
+            {
+                "session_id": session_id,
+                "cwd": cwd,
+                "additional_directories": additional_directories,
+                "mcp_servers": mcp_servers,
+                "kwargs": kwargs,
+            }
+        )
+        # Validate the id against the store — a missing/deleted id raises
+        # resource_not_found, matching a real agent's resume failure.
+        self.store.get(session_id)
         return schema.ResumeSessionResponse()
+
+    async def delete_session(self, session_id: str, **kwargs: Any) -> schema.DeleteSessionResponse:
+        self.delete_session_calls.append(session_id)
+        s = self.store.sessions.get(session_id)
+        if s is not None:
+            s.deleted = True
+        return schema.DeleteSessionResponse()
 
     async def authenticate(
         self, method_id: str, **kwargs: Any
@@ -532,16 +700,21 @@ class FakeAcpAgent:
 
     # ── Script runner ───────────────────────────────────────────────────
 
-    async def _run_script(self, session_id: str) -> schema.StopReason:
+    async def _run_script(
+        self, session_id: str, *, script: Script | None = None
+    ) -> schema.StopReason:
         """Walk the script, emitting each step through the AgentSideConnection."""
         assert self.conn is not None, "FakeAcpAgent.attach() not called"
+        steps = script if script is not None else self.script
         stop_reason: schema.StopReason = "end_turn"
-        for step in self.script:
+        for step in steps:
             if isinstance(step, TextStep):
-                await self.conn.session_update(
-                    session_id,
-                    acp.update_agent_message_text(step.text),
+                update = (
+                    acp.update_agent_message_text(step.text)
+                    if step.role == "agent"
+                    else acp.update_user_message_text(step.text)
                 )
+                await self.conn.session_update(session_id, update)
             elif isinstance(step, ToolStartStep):
                 await self.conn.session_update(
                     session_id,

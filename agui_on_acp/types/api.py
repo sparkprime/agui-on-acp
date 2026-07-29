@@ -10,4 +10,4 @@ class HealthResponse(BaseModel):
 
     status: Literal["ok"] = "ok"
     version: str
-    project: str = "acp-to-agui"
+    project: str

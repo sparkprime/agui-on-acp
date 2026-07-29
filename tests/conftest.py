@@ -22,6 +22,7 @@ import asyncio
 import sys
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 import pytest_asyncio
@@ -40,7 +41,7 @@ from httpx import ASGITransport
 import agui_on_acp.bridge.acp_to_agui as _bridge_mod
 from agui_on_acp.main import app as fastapi_app
 from agui_on_acp.sessions.manager import SessionManager
-from tests.fake_agent import FakeAcpAgent
+from tests.fake_agent import FakeAcpAgent, FakeSessionStore
 from tests.transport import TransportPair, make_transport_pair
 
 
@@ -53,6 +54,14 @@ def short_permission_ttl() -> Iterator[None]:
         yield
     finally:
         _bridge_mod.PERMISSION_TTL_SECONDS = original
+
+
+@pytest.fixture(autouse=True)
+def permissive_cwd_allowlist(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Allow any cwd in tests (the security lockdown is exercised
+    separately via direct ``is_cwd_allowed`` calls)."""
+    monkeypatch.setenv("AGUI_ON_ACP_ALLOWED_CWD_PREFIXES", "/")
+    yield
 
 
 @pytest.fixture
@@ -152,10 +161,70 @@ async def session_manager(fake_agent: FakeAcpAgent) -> AsyncIterator[SessionMana
 
 
 @pytest_asyncio.fixture
+async def precreated_session_id(
+    session_manager: SessionManager,
+    fake_agent: FakeAcpAgent,
+) -> AsyncIterator[str]:
+    """Pre-create one live session for translation tests.
+
+    Under the attach-only ``POST /ag-ui`` contract the caller must already
+    have a session; the translation tests aren't exercising Create/Connect,
+    so this fixture front-loads a single ``create_session`` (which the fake
+    mints as ``fake-session-1``) and yields the id for tests to use as
+    ``threadId``. The new session-lifecycle tests build their own stacks
+    instead of depending on this fixture.
+    """
+    active = await session_manager.create_session(cwd="/tmp/opencode")
+    yield active.session_id
+
+
+@pytest_asyncio.fixture
 async def http_client(
     session_manager: SessionManager,
+    precreated_session_id: str,
 ) -> AsyncIterator[httpx.AsyncClient]:
     fastapi_app.state.session_manager = session_manager
     transport = ASGITransport(app=fastapi_app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         yield client
+
+
+# ── Stack-builder for capability / restart tests ────────────────────────────
+
+
+async def make_stack(
+    *,
+    capabilities_opts: acp.schema.AgentCapabilities | None = None,
+    store: FakeSessionStore | None = None,
+    script: list[Any] | None = None,
+) -> tuple[FakeAcpAgent, SessionManager, httpx.AsyncClient]:
+    """Construct a fresh fake-agent + transport + manager + httpx client.
+
+    Used by the session-lifecycle / restart tests that need to configure
+    capabilities or share a store across two fake instances. Each call
+    re-patches ``AgentRunner.spawn`` to the most recently built agent (so
+    a second call for a "restart" test rewires the manager to agent2 —
+    fine, since manager1 is discarded by then).
+    """
+    tp = make_transport_pair()
+    agent = FakeAcpAgent(
+        tp, script=script or [], capabilities=capabilities_opts, store=store
+    )
+    agent.attach()
+    _patch_runner_spawn(agent)
+    manager = SessionManager(agent_command=["fake"])
+    fastapi_app.state.session_manager = manager
+    transport = ASGITransport(app=fastapi_app)
+    client = httpx.AsyncClient(transport=transport, base_url="http://test")
+    await client.__aenter__()
+    return agent, manager, client
+
+
+async def teardown_stack(
+    agent: FakeAcpAgent, manager: SessionManager, client: httpx.AsyncClient
+) -> None:
+    await client.aclose()
+    await manager.shutdown()
+    await agent.aclose()
+    agent.transport.client_writer.close()
+    agent.transport.agent_writer.close()

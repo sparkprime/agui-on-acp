@@ -98,9 +98,11 @@ from agui_on_acp.agui.events import (
     CustomEvent,
     Interrupt,
     InterruptOutcome,
+    MessagesSnapshotEvent,
     RunErrorEvent,
     RunFinishedEvent,
     RunStartedEvent,
+    SnapshotMessage,
     StateSnapshotEvent,
     TextMessageContentEvent,
     TextMessageEndEvent,
@@ -142,6 +144,19 @@ class AcpToAguiBridge:
         self._current_message_id: str | None = None
         self._has_open_message: bool = False
         self._open_tool_calls: set[str] = set()
+
+        # Replay-mode state — set by start_replay() / cleared by end_replay().
+        # During replay (session/load), the ACP agent re-emits the historical
+        # session/update stream; instead of translating to delta events the
+        # bridge coalesces the chunks back into whole messages and emits a
+        # single MESSAGES_SNAPSHOT. See ``docs/agui-acp-mapping.md`` and
+        # ``agui_on_acp_changes.md`` §5.1 (Option B).
+        self._replay_mode: bool = False
+        self._replay_messages: list[SnapshotMessage] = []
+        # Map an open tool call id → (assistant-message index in
+        # _replay_messages, tool-call index in that message's toolCalls) so
+        # ToolCallProgress (the result) can close it and mint a tool message.
+        self._replay_open_tools: dict[str, tuple[int, int]] = {}
 
         # Session-level notification buffer — holds _kiro.dev/* notifications
         # that arrive before any run starts (e.g. during session init).
@@ -274,6 +289,44 @@ class AcpToAguiBridge:
                 self._handle_agent_extension(method, params)
             self._pending_notifications.clear()
 
+    def start_replay(self, queue: asyncio.Queue[AguiEvent]) -> None:
+        """Begin a replay run — coalesce the historical session/update
+        stream delivered during ``session/load`` into a single
+        ``MESSAGES_SNAPSHOT`` instead of delta events.
+
+        Emits a synthetic ``RUN_STARTED`` so the SSE stream has normal
+        start framing; ``end_replay`` emits the snapshot + ``RUN_FINISHED``.
+        """
+        self._replay_mode = True
+        self._replay_messages = []
+        self._replay_open_tools = {}
+        self._run_id = str(uuid.uuid4())
+        self._queue = queue
+        self._emit(
+            RunStartedEvent(
+                runId=self._run_id, taskId=self.task_id, threadId=self.task_id
+            )
+        )
+
+    def end_replay(self) -> None:
+        """Finish a replay: emit the coalesced ``MESSAGES_SNAPSHOT`` and a
+        closing ``RUN_FINISHED``."""
+        if not self._replay_mode:
+            return
+        self._close_replay_assistant()
+        self._emit(MessagesSnapshotEvent(messages=list(self._replay_messages)))
+        if self._run_id:
+            self._emit(
+                RunFinishedEvent(
+                    runId=self._run_id, taskId=self.task_id, threadId=self.task_id
+                )
+            )
+        self._replay_mode = False
+        self._replay_messages = []
+        self._replay_open_tools = {}
+        self._run_id = None
+        self._queue = None
+
     def _suspend_run(self, interrupt: Interrupt) -> None:
         """End the current SSE stream with an interrupt outcome, WITHOUT
         closing tool calls or going through ``finish_run`` (which would emit a
@@ -322,11 +375,13 @@ class AcpToAguiBridge:
 
         # Handle typed SDK objects
         update_type = type(update).__name__
-        if not isinstance(update, acp.schema.AgentMessageChunk):
+        if not isinstance(update, (acp.schema.AgentMessageChunk, acp.schema.UserMessageChunk)):
             self._log.info("recv %s", update_type)
 
         if isinstance(update, acp.schema.AgentMessageChunk):
             self._handle_agent_message_chunk_typed(update)
+        elif isinstance(update, acp.schema.UserMessageChunk):
+            self._handle_user_message_chunk_typed(update)
         elif isinstance(update, acp.schema.ToolCallStart):
             self._handle_tool_call_typed(update)
         elif isinstance(update, acp.schema.ToolCallProgress):
@@ -892,6 +947,37 @@ class AcpToAguiBridge:
     def _handle_session_update_dict(self, update: dict[str, Any]) -> None:
         """Handle session/update when received as a raw dict (fallback)."""
         kind = update.get("sessionUpdate") or update.get("session_update")
+        if self._replay_mode and kind in (
+            "agent_message_chunk",
+            "user_message_chunk",
+            "tool_call",
+            "tool_call_update",
+            "turn_end",
+        ):
+            # Redirect to the replay coalescer so a dict-delivered replay
+            # also produces a single MESSAGES_SNAPSHOT (typed path is the
+            # norm; this keeps the legacy fallback consistent).
+            if kind == "agent_message_chunk":
+                content = update.get("content", {})
+                text = (
+                    cast(dict[str, Any], content).get("text", "")
+                    if isinstance(content, dict)
+                    else ""
+                )
+                if text:
+                    self._append_replay_text("assistant", text)
+            elif kind == "user_message_chunk":
+                content = update.get("content", {})
+                text = (
+                    cast(dict[str, Any], content).get("text", "")
+                    if isinstance(content, dict)
+                    else ""
+                )
+                if text:
+                    self._append_replay_text("user", text)
+            elif kind == "turn_end":
+                pass  # end_replay closes everything; no per-turn action
+            return
         if kind == "agent_message_chunk":
             self._handle_agent_message_chunk_dict(update)
         elif kind == "tool_call":
@@ -970,6 +1056,10 @@ class AcpToAguiBridge:
         if not text:
             return
 
+        if self._replay_mode:
+            self._append_replay_text("assistant", text)
+            return
+
         if not self._has_open_message:
             msg_id = str(uuid.uuid4())
             self._current_message_id = msg_id
@@ -983,8 +1073,32 @@ class AcpToAguiBridge:
             )
         )
 
+    def _handle_user_message_chunk_typed(
+        self, update: acp.schema.UserMessageChunk
+    ) -> None:
+        """Handle ``UserMessageChunk`` (a replayed user turn from
+        ``session/load``).
+
+        During replay: coalesce into a ``SnapshotMessage(role="user")`` so
+        the client's transcript is hydrated with what the user said, not just
+        the agent's replies. Outside replay: dropped — the live AG-UI client
+        already holds its own user message.
+        """
+        if not self._replay_mode:
+            return
+        content = getattr(update, "content", None)
+        text = ""
+        if content:
+            text = getattr(content, "text", "") or ""
+        if not text:
+            return
+        self._append_replay_text("user", text)
+
     def _handle_tool_call_typed(self, update: acp.schema.ToolCallStart) -> None:
         """Handle ToolCallStart from the SDK."""
+        if self._replay_mode:
+            self._append_replay_tool_start(update)
+            return
         self._close_open_message()
 
         tool_call_id = str(
@@ -1050,6 +1164,12 @@ class AcpToAguiBridge:
         result_obj = (
             raw_output if raw_output is not None else getattr(update, "result", None)
         )
+
+        if self._replay_mode:
+            if status in ("completed", "failed") and tool_call_id:
+                result_str = self._serialize_tool_result(result_obj)
+                self._append_replay_tool_result(tool_call_id, result_str)
+            return
 
         if status in ("completed", "failed"):
             if tool_call_id in self._open_tool_calls:
@@ -1173,6 +1293,11 @@ class AcpToAguiBridge:
 
     def _handle_turn_end(self) -> None:
         """Translate turn_end to close open message/tools + RUN_FINISHED."""
+        if self._replay_mode:
+            # Replay history is closed by end_replay(), not by turn_end — a
+            # historical turn boundary just closes the open assistant message.
+            self._close_replay_assistant()
+            return
         self.finish_run()
 
     # ── Agent extension notifications to CUSTOM ──────────────────────────────
@@ -1217,6 +1342,92 @@ class AcpToAguiBridge:
                 )
             )
         self._open_tool_calls.clear()
+
+    # ── Replay coalescing ──────────────────────────────────────────────────
+    #
+    # During ``session/load`` the agent re-emits the historical session/update
+    # stream. Instead of re-streaming AG-UI deltas we coalesce the chunks
+    # back into whole ``SnapshotMessage`` objects and emit ONE
+    # ``MESSAGES_SNAPSHOT`` from ``end_replay``. The state machine mirrors
+    # the delta-emitting one (close open message on tool_call, multiple open
+    # tool calls, turn_end closes everything) but redirects output to the
+    # ``_replay_messages`` list instead of the SSE queue.
+
+    def _append_replay_text(self, role: str, text: str) -> None:
+        """Append a text delta to the current message of ``role``, starting a
+        new message if the last one is a different role (or, for assistant
+        messages, already carries tool calls — text after tools opens a fresh
+        assistant message)."""
+        last = self._replay_messages[-1] if self._replay_messages else None
+        if last is not None and last.role == role:
+            if role == "assistant" and last.toolCalls:
+                # Text following tool calls → new assistant message.
+                last = None
+            else:
+                last.content = (last.content or "") + text
+                return
+        msg = SnapshotMessage(
+            id=str(uuid.uuid4()), role=role, content=text  # type: ignore[arg-type]
+        )
+        self._replay_messages.append(msg)
+
+    def _close_replay_assistant(self) -> None:
+        """Close any open tool calls on the current assistant message so
+        subsequent text opens a fresh message."""
+        # Nothing to "close" structurally — _append_replay_text handles the
+        # transition via the toolCalls check. Drop open tool-call handles
+        # whose results never arrived so they don't leak across turns.
+        self._replay_open_tools.clear()
+
+    def _append_replay_tool_start(self, update: acp.schema.ToolCallStart) -> None:
+        """Attach a tool call to the current assistant message (creating one
+        if needed) and remember its position so the result can close it."""
+        tool_call_id = str(
+            getattr(update, "tool_call_id", None)
+            or getattr(update, "toolCallId", str(uuid.uuid4()))
+        )
+        tool_name = getattr(update, "title", None) or "unknown"
+        raw_input: Any = getattr(update, "raw_input", None) or {}
+        if isinstance(raw_input, dict):
+            cast(dict[str, Any], raw_input).pop("__tool_use_purpose", None)
+        kind = getattr(update, "kind", None)
+        locations = getattr(update, "locations", None)
+        args_obj: dict[str, Any] = (
+            cast(dict[str, Any], raw_input) if isinstance(raw_input, dict) else {}
+        )
+        if kind:
+            args_obj.setdefault("kind", kind)
+        if locations:
+            args_obj.setdefault("locations", locations)
+
+        last = self._replay_messages[-1] if self._replay_messages else None
+        if last is None or last.role != "assistant":
+            last = SnapshotMessage(id=str(uuid.uuid4()), role="assistant")
+            self._replay_messages.append(last)
+        if last.toolCalls is None:
+            last.toolCalls = []
+        from agui_on_acp.agui.events import AssistantToolCall
+
+        call = AssistantToolCall(
+            id=tool_call_id,
+            function={"name": tool_name, "arguments": json.dumps(args_obj)},
+        )
+        last.toolCalls.append(call)
+        idx = len(last.toolCalls) - 1
+        self._replay_open_tools[tool_call_id] = (len(self._replay_messages) - 1, idx)
+
+    def _append_replay_tool_result(self, tool_call_id: str, result_str: str) -> None:
+        """Mint a ``role="tool"`` message carrying the tool's result."""
+        # Drop the open-tool handle; the result closes it.
+        self._replay_open_tools.pop(tool_call_id, None)
+        self._replay_messages.append(
+            SnapshotMessage(
+                id=f"{tool_call_id}-result",
+                role="tool",
+                content=result_str,
+                toolCallId=tool_call_id,
+            )
+        )
 
     def _emit(self, event: AguiEvent) -> None:
         """Put an event into the asyncio queue (non-blocking)."""

@@ -24,6 +24,11 @@ from pydantic import BaseModel, Field
 
 from agui_on_acp.agui.events import AguiEvent, StateSnapshotEvent
 from agui_on_acp.agui.sse import event_stream
+from agui_on_acp.config import is_cwd_allowed
+from agui_on_acp.sessions.manager import (
+    ResumeUnsupportedError,
+    SessionResumeFailedError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -74,9 +79,13 @@ class RunAgentInput(BaseModel):
 async def ag_ui_run(body: RunAgentInput, request: Request):
     """AG-UI standard run endpoint.
 
-    Accepts RunAgentInput, creates/reuses a session, sends the prompt,
-    and streams back AG-UI events over SSE. This makes the bridge
-    compatible with any AG-UI client (CopilotKit, HttpAgent, etc.).
+    Attach-only: the caller MUST have created a session first via
+    ``POST /ag-ui/sessions`` (or resumed an existing one). This endpoint
+    never creates a session inline and never falls back to ``session/new``
+    or ``session/load`` — ``attach_for_prompt`` reuses a live
+    ``ActiveSession`` when one exists for ``threadId`` and otherwise calls
+    ``session/resume`` (raising a hard error if resume is unsupported or
+    the id is dead, rather than minting a fresh session).
 
     If ``body.resume`` is non-empty, this is a resume run: the prompt task
     is already suspended at a permission interrupt, so we re-attach a new
@@ -85,12 +94,13 @@ async def ag_ui_run(body: RunAgentInput, request: Request):
     """
     manager = getattr(request.app.state, "session_manager", None)
     if manager is None:
-        return StreamingResponse(
-            _error_stream("Session manager not initialized"),
-            media_type="text/event-stream",
-        )
+        return _error_stream("Session manager not initialized")
 
-    thread_id = body.threadId or str(uuid.uuid4())
+    thread_id = body.threadId
+    if not thread_id:
+        return _error_stream(
+            "threadId is required — create a session first via POST /ag-ui/sessions"
+        )
 
     # ── Resume path ──────────────────────────────────────────────────────
     if body.resume:
@@ -99,54 +109,37 @@ async def ag_ui_run(body: RunAgentInput, request: Request):
                 thread_id, [r.model_dump() for r in body.resume]
             )
         except KeyError:
-            return StreamingResponse(
-                _error_stream(f"No active session for thread {thread_id}"),
-                media_type="text/event-stream",
+            return _error_stream(
+                f"No active session for thread {thread_id} — that action expired, please try again"
             )
         except ValueError as exc:
             # No pending interrupt to resume — surface as RUN_ERROR instead
             # of a hanging empty stream.
-            return StreamingResponse(
-                _error_stream(str(exc)),
-                media_type="text/event-stream",
-            )
+            return _error_stream(str(exc))
 
         queue = manager.get_event_queue(thread_id, actual_run_id)
         if queue is None:
-            return StreamingResponse(
-                _error_stream("No event queue for resume run"),
-                media_type="text/event-stream",
-            )
+            return _error_stream("No event queue for resume run")
         return _sse_response(queue, thread_id, manager)
 
-    # ── Fresh run path ───────────────────────────────────────────────────
-    active = manager._sessions.get(thread_id)
-    if active is None:
-        fp = body.forwardedProps
-        cwd = fp.get("cwd", ".")
-        resume_session_id = fp.get("resumeSessionId")
-        mode = fp.get("mode")
-        model = fp.get("model")
-        agent_command = fp.get("agentCommand")
-        mcp_servers = fp.get("mcpServers")
-        config_options = fp.get("configOptions")
-        try:
-            active = await manager.create_task(
-                task_id=thread_id,
-                cwd=cwd,
-                resume_session_id=resume_session_id,
-                mode=mode,
-                model=model,
-                mcp_servers=mcp_servers,
-                agent_command=agent_command,
-                config_options=config_options,
-            )
-        except Exception as exc:
-            logger.error("Failed to create session for AG-UI: %s", exc)
-            return StreamingResponse(
-                _error_stream(str(exc)),
-                media_type="text/event-stream",
-            )
+    # ── Fresh prompt on an existing/resumed session ─────────────────────────
+    fp = body.forwardedProps
+    cwd = fp.get("cwd")
+    if not cwd or not is_cwd_allowed(cwd):
+        return _error_stream("cwd missing or not allowed")
+
+    try:
+        active = await manager.attach_for_prompt(thread_id, cwd, fp.get("mcpServers"))
+    except ResumeUnsupportedError:
+        return _error_stream(
+            f"No active session for thread {thread_id} and this agent does not support session/resume",
+            status_code=409,
+        )
+    except SessionResumeFailedError:
+        return _error_stream(
+            f"Could not resume session {thread_id} — the conversation may have expired",
+            status_code=404,
+        )
 
     # Extract the last user message
     user_message = ""
@@ -157,10 +150,7 @@ async def ag_ui_run(body: RunAgentInput, request: Request):
                 break
 
     if not user_message:
-        return StreamingResponse(
-            _error_stream("No user message provided"),
-            media_type="text/event-stream",
-        )
+        return _error_stream("No user message provided")
 
     # Start a run
     try:
@@ -170,10 +160,7 @@ async def ag_ui_run(body: RunAgentInput, request: Request):
         )
     except Exception as exc:
         logger.error("Failed to start run: %s", exc)
-        return StreamingResponse(
-            _error_stream(str(exc)),
-            media_type="text/event-stream",
-        )
+        return _error_stream(str(exc))
 
     # Emit a STATE_SNAPSHOT with available modes/models AFTER start_run has
     # attached the bridge to the run's queue — emitting it before
@@ -193,10 +180,7 @@ async def ag_ui_run(body: RunAgentInput, request: Request):
 
     queue = manager.get_event_queue(thread_id, actual_run_id)
     if queue is None:
-        return StreamingResponse(
-            _error_stream("No event queue for run"),
-            media_type="text/event-stream",
-        )
+        return _error_stream("No event queue for run")
 
     return _sse_response(queue, thread_id, manager)
 
@@ -260,8 +244,8 @@ def _sse_response(
     )
 
 
-async def _error_stream(message: str):
-    """Yield a single RUN_ERROR event."""
+def _error_stream(message: str, *, status_code: int = 200):
+    """Yield a single ``RUN_ERROR`` event (optionally with a non-200 status)."""
     import json
     import time
 
@@ -272,4 +256,17 @@ async def _error_stream(message: str):
         "runId": str(uuid.uuid4()),
         "taskId": "error",
     }
-    yield f"event: RUN_ERROR\ndata: {json.dumps(error_event)}\n\n"
+
+    async def _gen():
+        yield f"event: RUN_ERROR\ndata: {json.dumps(error_event)}\n\n"
+
+    return StreamingResponse(
+        _gen(),
+        media_type="text/event-stream",
+        status_code=status_code,
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )

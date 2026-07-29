@@ -1,20 +1,38 @@
 """SessionManager — orchestrates session lifecycle using the official ACP SDK.
 
-Manages active sessions: spawns agent via acp.spawn_agent_process, initialises
-the connection, holds per-session state, and coordinates run/approval flows.
+Manages active sessions: spawns an agent via acp.spawn_agent_process,
+initialises the connection, holds per-session state, and coordinates
+run/approval flows.
 
-All state is in-memory: the manager keeps no persistent store. Sessions are
-lost when the process restarts; AG-UI clients are expected to start a fresh
-threadId in that case.
+The three entry points are the PLAN3 Create / Connect / Prompt split:
+
+  * ``create_session``  — spawn subprocess, ``initialize``, ``session/new``
+  * ``connect_session`` — spawn subprocess, ``initialize``, ``session/load``
+    (replays history as a ``MESSAGES_SNAPSHOT``)
+  * ``attach_for_prompt`` — reuse a live ``ActiveSession`` if present, else
+    spawn subprocess, ``initialize``, ``session/resume``. NEVER falls back
+    to ``session/new`` or ``session/load``.
+
+A conversation's id never changes silently: the AG-UI ``threadId`` IS the
+ACP ``session_id`` (``ActiveSession.session_id``). The old two-id split
+(``task_id`` vs ``agent_session_id``) is gone.
+
+All session state is in-memory: the manager keeps no persistent store. If
+the bridge process restarts, an AG-UI client must ``session/resume`` its
+previously-known ``threadId`` against a fresh ``attach_for_prompt`` call —
+the ACP agent's own backing store is what gives the id continuity.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, cast
+from typing import Any, Awaitable, Callable, cast
+
+import acp
 
 from agui_on_acp.agent.acp_protocol import AcpProtocol
 from agui_on_acp.agent.runner import AgentRunner
@@ -24,10 +42,67 @@ from agui_on_acp.bridge.acp_to_agui import AcpToAguiBridge
 logger = logging.getLogger(__name__)
 
 
+# ── Exceptions ─────────────────────────────────────────────────────────────
+
+
+class SessionManagerError(Exception):
+    """Base class for SessionManager-raised errors."""
+
+
+class LoadSessionUnsupportedError(SessionManagerError):
+    """The agent does not advertise ``loadSession`` (connect unsupported)."""
+
+    def __init__(self, session_id: str) -> None:
+        super().__init__(f"session/load not supported (session={session_id})")
+        self.session_id = session_id
+
+
+class SessionNotFoundError(SessionManagerError):
+    """The ACP agent returned ``-32002 resource_not_found`` for the id."""
+
+    def __init__(self, session_id: str) -> None:
+        super().__init__(f"session not found: {session_id}")
+        self.session_id = session_id
+
+
+class ResumeUnsupportedError(SessionManagerError):
+    """The agent does not advertise ``sessionCapabilities.resume``."""
+
+    def __init__(self, session_id: str) -> None:
+        super().__init__(f"session/resume not supported (session={session_id})")
+        self.session_id = session_id
+
+
+class SessionResumeFailedError(SessionManagerError):
+    """``session/resume`` itself failed (e.g. dead/unknown id)."""
+
+    def __init__(self, session_id: str) -> None:
+        super().__init__(f"session/resume failed: {session_id}")
+        self.session_id = session_id
+
+
+class ListUnsupportedError(SessionManagerError):
+    """The agent does not advertise ``sessionCapabilities.list``."""
+
+
+class DeleteUnsupportedError(SessionManagerError):
+    """The agent does not advertise ``sessionCapabilities.delete``."""
+
+
+# ── ActiveSession ──────────────────────────────────────────────────────────
+
+
 @dataclass
 class ActiveSession:
-    task_id: str
-    agent_session_id: str
+    """One live conversation.
+
+    ``session_id`` is the single id for the conversation: it is both the
+    AG-UI ``threadId`` and the ACP ``session_id`` (the old separate
+    ``agent_session_id`` field is gone — collapsing the two ids is the
+    point of this layer).
+    """
+
+    session_id: str
     cwd: str
     runner: AgentRunner
     protocol: AcpProtocol
@@ -43,154 +118,109 @@ class ActiveSession:
     # Stored as the wire-shaped dicts produced by the bridge serializer so
     # the STATE_SNAPSHOT emitter can pass them straight through.
     config_options: list[dict[str, Any]] | None = None
+    last_active_at: float = field(default_factory=time.monotonic)
+
+    def touch(self) -> None:
+        """Mark the session as recently active (idle-TTL reaper)."""
+        self.last_active_at = time.monotonic()
+
+
+# ── SessionManager ─────────────────────────────────────────────────────────
 
 
 class SessionManager:
     def __init__(self, agent_command: list[str] | None = None) -> None:
         self._sessions: dict[str, ActiveSession] = {}
         self._agent_command = agent_command or ["opencode", "acp"]
+        self._capabilities: acp.schema.AgentCapabilities | None = None
+        self._capabilities_lock = asyncio.Lock()
 
     @property
     def sessions(self) -> dict[str, ActiveSession]:
         """Read-only view of the active sessions (used by the AG-UI router)."""
         return self._sessions
 
-    async def create_task(
+    # ── Capability cache ──────────────────────────────────────────────────
+
+    async def get_capabilities(self) -> acp.schema.AgentCapabilities:
+        """Return cached ``agentCapabilities``, probing a throwaway subprocess
+        on first call if no real session has cached them yet."""
+        if self._capabilities is not None:
+            return self._capabilities
+        async with self._capabilities_lock:
+            if self._capabilities is not None:  # another task won the race
+                return self._capabilities
+            probe_bridge = AcpToAguiBridge("capability-probe")
+            runner = AgentRunner("capability-probe", command=self._agent_command)
+            try:
+                conn = await runner.spawn(client=probe_bridge)
+                protocol = AcpProtocol("capability-probe")
+                protocol.conn = conn
+                result = await protocol.initialize()
+                self._capabilities = result.agent_capabilities
+            finally:
+                await runner.kill()
+            # Empty AgentCapabilities() when the agent advertised nothing.
+            if self._capabilities is None:
+                self._capabilities = acp.schema.AgentCapabilities()
+            return self._capabilities
+
+    async def _probe_call(self, fn: Callable[[AcpProtocol], Awaitable[Any]]) -> Any:
+        """Spawn a short-lived subprocess, call ``fn(protocol)`` on it, kill.
+
+        Used by ``list_sessions`` / ``delete_session`` when no live
+        ``ActiveSession`` owns the target — mirrors ``get_capabilities``'
+        probe pattern, factored out for reuse.
+        """
+        probe_bridge = AcpToAguiBridge("probe")
+        runner = AgentRunner("probe", command=self._agent_command)
+        try:
+            conn = await runner.spawn(client=probe_bridge)
+            protocol = AcpProtocol("probe")
+            protocol.conn = conn
+            await protocol.initialize()
+            return await fn(protocol)
+        finally:
+            await runner.kill()
+
+    # ── Create / Connect / Attach ──────────────────────────────────────────
+
+    async def create_session(
         self,
-        task_id: str,
         cwd: str,
-        resume_session_id: str | None = None,
         mode: str | None = None,
         model: str | None = None,
         mcp_servers: dict[str, Any] | None = None,
-        agent_command: list[str] | None = None,
         config_options: dict[str, Any] | None = None,
     ) -> ActiveSession:
-        # Create the bridge (satisfies acp.Client Protocol) before spawning
-        bridge = AcpToAguiBridge(task_id)
+        """Create a fresh session: ``session/new``."""
+        bridge = AcpToAguiBridge("<pending>")
         bridge.cwd = cwd
-
-        # Spawn the agent using the SDK via our runner
-        command = agent_command or self._agent_command
-        logger.info("agent command: %s", " ".join(command))
-        runner = AgentRunner(task_id, command=command)
+        runner = AgentRunner("<pending>", command=self._agent_command)
         conn = await runner.spawn(client=bridge)
-
-        # Wrap connection in our protocol layer for logging
-        protocol = AcpProtocol(task_id)
+        protocol = AcpProtocol("<pending>")
         protocol.conn = conn
 
-        # Initialize the ACP connection
-        await protocol.initialize()
+        init_result = await protocol.initialize()
+        self._capabilities = init_result.agent_capabilities or acp.schema.AgentCapabilities()
 
-        # Create or load session
         mcp_list = _normalize_mcp_servers(mcp_servers)
-        modes: list[dict[str, str]] | None = None
-        models: list[dict[str, str]] | None = None
-        current_mode_id: str | None = None
-        config_opts: list[dict[str, Any]] | None = None
-        agent_session_id: str = ""
+        result = await protocol.new_session(cwd, mcp_list)
+        session_id = str(result.session_id)
 
-        if resume_session_id:
-            result = await protocol.load_session(resume_session_id, cwd, mcp_list)
-            if isinstance(result, dict):
-                result_dict = cast(dict[str, Any], result)
-                agent_session_id = str(result_dict.get("sessionId", resume_session_id))
-                modes_obj = result_dict.get("modes")
-                if modes_obj:
-                    modes = [
-                        {"id": str(m.get("id", "")), "name": str(m.get("name", ""))}
-                        for m in modes_obj.get("availableModes", [])
-                    ]
-                    current_mode_id = modes_obj.get("currentModeId")
-                models_obj = result_dict.get("models")
-                if models_obj:
-                    models = [
-                        {
-                            "id": str(m.get("modelId", "")),
-                            "name": str(m.get("name", "")),
-                        }
-                        for m in models_obj.get("availableModels", [])
-                    ]
-                config_opts = _normalize_config_options(
-                    result_dict.get("configOptions")
-                )
-            else:
-                agent_session_id = str(
-                    getattr(result, "session_id", None)
-                    or getattr(result, "sessionId", resume_session_id)
-                )
-                config_opts = _normalize_config_options(
-                    getattr(result, "config_options", None)
-                )
-        else:
-            result = await protocol.new_session(cwd, mcp_list)
-            if isinstance(result, dict):
-                result_dict = cast(dict[str, Any], result)
-                agent_session_id = str(result_dict.get("sessionId", str(uuid.uuid4())))
-                modes_obj = result_dict.get("modes")
-                if modes_obj:
-                    modes = [
-                        {"id": str(m.get("id", "")), "name": str(m.get("name", ""))}
-                        for m in modes_obj.get("availableModes", [])
-                    ]
-                    current_mode_id = modes_obj.get("currentModeId")
-                config_opts = _normalize_config_options(
-                    result_dict.get("configOptions")
-                )
-            else:
-                agent_session_id = str(
-                    getattr(result, "session_id", None)
-                    or getattr(result, "sessionId", str(uuid.uuid4()))
-                )
-                result_modes = getattr(result, "modes", None)
-                if result_modes:
-                    available = getattr(
-                        result_modes, "available_modes", None
-                    ) or getattr(result_modes, "availableModes", [])
-                    modes = [
-                        {
-                            "id": str(getattr(m, "id", "")),
-                            "name": str(getattr(m, "name", "")),
-                        }
-                        for m in available
-                    ]
-                    current_mode_id = getattr(
-                        result_modes, "current_mode_id", None
-                    ) or getattr(result_modes, "currentModeId", None)
-                config_opts = _normalize_config_options(
-                    getattr(result, "config_options", None)
-                )
+        # Relabel the placeholders with the real id now that we know it.
+        bridge.task_id = session_id
+        runner.task_id = session_id
 
-        # Set mode/model if requested (skip generic "default" placeholder)
-        if mode and mode != "default" and agent_session_id:
-            try:
-                await protocol.set_mode(agent_session_id, mode)
-                current_mode_id = mode
-            except Exception as exc:
-                logger.warning("Failed to set mode %s: %s", mode, exc)
-        if model and agent_session_id:
-            try:
-                await protocol.set_model(agent_session_id, model)
-            except Exception as exc:
-                logger.warning("Failed to set model %s: %s", model, exc)
-        # Apply any additional config options from forwardedProps.configOptions
-        # (the model is handled above for backward compat — applying it again
-        # via the generic path would be redundant but harmless; skip it here).
-        if config_options and agent_session_id:
-            for config_id, value in config_options.items():
-                if config_id == "model":
-                    continue
-                try:
-                    await protocol.set_config_option(agent_session_id, config_id, value)
-                except Exception as exc:
-                    logger.warning(
-                        "Failed to set config option %s=%s: %s", config_id, value, exc
-                    )
+        modes, models, current_mode_id, config_opts = _extract_session_meta(result)
+        await _apply_session_options(
+            protocol, session_id, mode, model, config_options
+        )
+        if mode and mode != "default":
+            current_mode_id = mode
 
         active = ActiveSession(
-            task_id=task_id,
-            agent_session_id=agent_session_id,
+            session_id=session_id,
             cwd=cwd,
             runner=runner,
             protocol=protocol,
@@ -200,11 +230,182 @@ class SessionManager:
             current_mode_id=current_mode_id,
             config_options=config_opts,
         )
-
-        self._sessions[task_id] = active
-
-        logger.info("session ready → %s (agent=%s)", task_id, " ".join(command))
+        self._sessions[session_id] = active
+        logger.info("session ready → %s", session_id)
         return active
+
+    async def connect_session(
+        self, session_id: str, cwd: str, mcp_servers: dict[str, Any] | None = None
+    ) -> tuple[ActiveSession, asyncio.Queue[AguiEvent]]:
+        """Connect to (replay) an existing session: ``session/load``.
+
+        Returns the new ``ActiveSession`` plus the replay queue the bridge
+        filled during ``session/load`` — the endpoint streams the latter as
+        the SSE body.
+        """
+        caps = await self.get_capabilities()
+        if not caps.load_session:
+            raise LoadSessionUnsupportedError(session_id)
+
+        # If a live ActiveSession already owns this id (e.g. the client
+        # ``POST /ag-ui/sessions`` created it moments ago and is now
+        # ``connect``-ing to replay the initial transcript), kill its
+        # subprocess BEFORE spawning a fresh one for the replay. Without
+        # this, the unconditional ``self._sessions[session_id] = active``
+        # below would orphan the old subprocess — it stays running,
+        # unreferenced, until ``sweep_idle`` eventually reaps it (up to
+        # ``IDLE_TTL_SECONDS``). Re-issuing ``session/load`` on the
+        # existing live connection instead is unsafe (it would duplicate
+        # history into a live stream — the same reason
+        # ``attach_for_prompt`` never calls ``session/load``), so a fresh
+        # subprocess is unavoidable and the old one must be killed.
+        existing = self._sessions.pop(session_id, None)
+        if existing is not None:
+            await existing.runner.kill()
+
+        bridge = AcpToAguiBridge(session_id)
+        bridge.cwd = cwd
+        runner = AgentRunner(session_id, command=self._agent_command)
+        conn = await runner.spawn(client=bridge)
+        protocol = AcpProtocol(session_id)
+        protocol.conn = conn
+        init_result = await protocol.initialize()
+        self._capabilities = init_result.agent_capabilities or self._capabilities
+
+        # ORDERING FIX: attach the replay queue BEFORE calling load_session.
+        # session/load delivers the replay as session/update notifications
+        # arriving *during* this await, and bridge._emit() drops events when
+        # self._queue is None.
+        replay_queue: asyncio.Queue[AguiEvent] = asyncio.Queue()
+        bridge.start_replay(replay_queue)
+
+        try:
+            await protocol.load_session(
+                session_id, cwd, _normalize_mcp_servers(mcp_servers)
+            )
+        except acp.RequestError as exc:
+            await runner.kill()
+            if exc.code == -32002:  # resource_not_found
+                raise SessionNotFoundError(session_id) from exc
+            raise
+
+        bridge.end_replay()
+
+        active = ActiveSession(
+            session_id=session_id,
+            cwd=cwd,
+            runner=runner,
+            protocol=protocol,
+            bridge=bridge,
+        )
+        self._sessions[session_id] = active
+        logger.info("session connected (replayed) → %s", session_id)
+        return active, replay_queue
+
+    async def attach_for_prompt(
+        self, session_id: str, cwd: str, mcp_servers: dict[str, Any] | None = None
+    ) -> ActiveSession:
+        """Attach to a session for a new prompt turn.
+
+        If a live ``ActiveSession`` already exists for ``session_id``,
+        return it (no ACP call). Otherwise spawn a subprocess and call
+        ``session/resume`` — NEVER ``session/new`` or ``session/load``.
+        """
+        existing = self._sessions.get(session_id)
+        if existing is not None:
+            existing.touch()
+            return existing
+
+        caps = await self.get_capabilities()
+        sc = caps.session_capabilities
+        if sc is None or not sc.resume:
+            raise ResumeUnsupportedError(session_id)
+
+        bridge = AcpToAguiBridge(session_id)
+        bridge.cwd = cwd
+        runner = AgentRunner(session_id, command=self._agent_command)
+        conn = await runner.spawn(client=bridge)
+        protocol = AcpProtocol(session_id)
+        protocol.conn = conn
+        init_result = await protocol.initialize()
+        # Opportunistic refresh — but don't clobber a richer cached set.
+        if init_caps := init_result.agent_capabilities:
+            self._capabilities = init_caps
+
+        try:
+            await protocol.resume_session(
+                session_id, cwd, _normalize_mcp_servers(mcp_servers)
+            )
+        except acp.RequestError as exc:
+            await runner.kill()
+            raise SessionResumeFailedError(session_id) from exc
+
+        active = ActiveSession(
+            session_id=session_id,
+            cwd=cwd,
+            runner=runner,
+            protocol=protocol,
+            bridge=bridge,
+        )
+        self._sessions[session_id] = active
+        logger.info("session resumed for prompt → %s", session_id)
+        return active
+
+    # ── Session management endpoints ───────────────────────────────────────
+
+    async def list_sessions(
+        self, cwd: str | None = None, cursor: str | None = None
+    ) -> acp.schema.ListSessionsResponse:
+        caps = await self.get_capabilities()
+        sc = caps.session_capabilities
+        if sc is None or not sc.list:
+            raise ListUnsupportedError()
+        # Prefer a live subprocess for this cwd if one exists (avoids a spawn)
+        active = next((a for a in self._sessions.values() if a.cwd == cwd), None) if cwd else None
+        if active is not None:
+            return await active.protocol.list_sessions(cwd=cwd, cursor=cursor)
+        return await self._probe_call(lambda p: p.list_sessions(cwd=cwd, cursor=cursor))
+
+    async def delete_session(self, session_id: str) -> None:
+        caps = await self.get_capabilities()
+        sc = caps.session_capabilities
+        if sc is None or not sc.delete:
+            raise DeleteUnsupportedError()
+        active = self._sessions.pop(session_id, None)
+        if active is not None:
+            # Kill the live subprocess's resources first, THEN delete the
+            # persisted record — mirrors opencode's close-before-delete
+            # rationale (opencode_acp_extensions.md Extension C).
+            try:
+                await active.protocol.delete_session(session_id)
+            finally:
+                await active.runner.kill()
+            return
+        await self._probe_call(lambda p: p.delete_session(session_id))
+
+    # ── Idle TTL reaper ───────────────────────────────────────────────────
+
+    async def sweep_idle(self, ttl_seconds: float) -> list[str]:
+        """Destroy every ``ActiveSession`` untouched for > ``ttl_seconds``.
+
+        Sessions with a pending permission/elicitation interrupt are exempt
+        — a user mid-approval-dialog shouldn't have their subprocess killed
+        by an unrelated timer. Returns the ids destroyed, for logging/testing.
+        """
+        now = time.monotonic()
+        stale: list[str] = []
+        for sid, a in list(self._sessions.items()):
+            if now - a.last_active_at <= ttl_seconds:
+                continue
+            if a.bridge.pending_interrupt_ids():
+                # Exempt — a suspended interrupt counts as activity.
+                continue
+            stale.append(sid)
+        for sid in stale:
+            await self.destroy(sid)
+        return stale
+
+    # ── Run lifecycle (unchanged shape, session_id instead of agent_session_id)
 
     async def start_run(
         self,
@@ -213,6 +414,7 @@ class SessionManager:
         config: dict[str, Any] | None = None,
     ) -> str:
         active = self._get_active(task_id)
+        active.touch()
         run_id = str(uuid.uuid4())
 
         queue: asyncio.Queue[AguiEvent] = asyncio.Queue()
@@ -274,7 +476,7 @@ class SessionManager:
         if queue is None:
             return
         try:
-            await active.protocol.prompt(active.agent_session_id, prompt)
+            await active.protocol.prompt(active.session_id, prompt)
             if active.bridge.run_id is not None:
                 active.bridge.finish_run()
         except Exception as exc:
@@ -303,6 +505,7 @@ class SessionManager:
         or ``ValueError`` if there are no pending interrupts to resume.
         """
         active = self._get_active(task_id)
+        active.touch()
         run_id = str(uuid.uuid4())
 
         queue: asyncio.Queue[AguiEvent] = asyncio.Queue()
@@ -333,24 +536,24 @@ class SessionManager:
         # request_permission unblocks and the prompt task unwinds instead of
         # hanging on a dead session.
         active.bridge.cancel_all_permissions()
-        await active.protocol.cancel(active.agent_session_id)
+        await active.protocol.cancel(active.session_id)
 
     async def set_mode(self, task_id: str, mode_id: str) -> Any:
         active = self._get_active(task_id)
-        result = await active.protocol.set_mode(active.agent_session_id, mode_id)
+        result = await active.protocol.set_mode(active.session_id, mode_id)
         active.current_mode_id = mode_id
         return result
 
     async def set_model(self, task_id: str, model_id: str) -> None:
         active = self._get_active(task_id)
-        await active.protocol.set_model(active.agent_session_id, model_id)
+        await active.protocol.set_model(active.session_id, model_id)
 
     async def set_config_option(self, task_id: str, config_id: str, value: Any) -> None:
         """Apply a single config option mid-session via
         ``session/set_config_option`` (ACP 0.11)."""
         active = self._get_active(task_id)
         await active.protocol.set_config_option(
-            active.agent_session_id, config_id, value
+            active.session_id, config_id, value
         )
 
     async def execute_command(
@@ -359,7 +562,7 @@ class SessionManager:
         active = self._get_active(task_id)
         args_str = args.get("args", "") if args else ""
         await active.protocol.execute_command(
-            active.agent_session_id, command, args_str
+            active.session_id, command, args_str
         )
 
     async def stop(self, task_id: str) -> bool:
@@ -389,6 +592,68 @@ class SessionManager:
 
 # Backward-compatible alias
 TaskManager = SessionManager
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────
+
+
+def _extract_session_meta(
+    result: Any,
+) -> tuple[
+    list[dict[str, str]] | None,
+    list[dict[str, str]] | None,
+    str | None,
+    list[dict[str, Any]] | None,
+]:
+    """Pull modes/models/config_options out of a typed NewSessionResponse /
+    LoadSessionResponse / ResumeSessionResponse."""
+    modes: list[dict[str, str]] | None = None
+    models: list[dict[str, str]] | None = None
+    current_mode_id: str | None = None
+
+    result_modes = getattr(result, "modes", None)
+    if result_modes:
+        available: list[Any] = list(getattr(result_modes, "available_modes", None) or [])
+        modes = [
+            {"id": str(getattr(m, "id", "")), "name": str(getattr(m, "name", ""))}
+            for m in available
+        ]
+        current_mode_id = (
+            getattr(result_modes, "current_mode_id", None)
+            or getattr(result_modes, "currentModeId", None)
+        )
+    config_opts = _normalize_config_options(getattr(result, "config_options", None))
+    return modes, models, current_mode_id, config_opts
+
+
+async def _apply_session_options(
+    protocol: AcpProtocol,
+    session_id: str,
+    mode: str | None,
+    model: str | None,
+    config_options: dict[str, Any] | None,
+) -> None:
+    """Apply mode/model/config_options after a session is created/resumed."""
+    if mode and mode != "default":
+        try:
+            await protocol.set_mode(session_id, mode)
+        except Exception as exc:
+            logger.warning("Failed to set mode %s: %s", mode, exc)
+    if model:
+        try:
+            await protocol.set_model(session_id, model)
+        except Exception as exc:
+            logger.warning("Failed to set model %s: %s", model, exc)
+    if config_options:
+        for config_id, value in config_options.items():
+            if config_id == "model":
+                continue
+            try:
+                await protocol.set_config_option(session_id, config_id, value)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to set config option %s=%s: %s", config_id, value, exc
+                )
 
 
 def _normalize_config_options(options: Any) -> list[dict[str, Any]] | None:

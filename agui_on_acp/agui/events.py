@@ -28,6 +28,7 @@ class AguiEventType(str, Enum):
     STATE_UPDATE = "STATE_UPDATE"
     STATE_SNAPSHOT = "STATE_SNAPSHOT"
     CUSTOM = "CUSTOM"
+    MESSAGES_SNAPSHOT = "MESSAGES_SNAPSHOT"
 
 
 class BaseAguiEvent(BaseModel):
@@ -171,6 +172,45 @@ class CustomEvent(BaseAguiEvent):
     value: dict[str, Any] = Field(default_factory=dict)
 
 
+class AssistantToolCall(BaseModel):
+    """A tool call embedded in an assistant message snapshot.
+
+    Mirrors ``ag-ui/sdks/typescript/packages/core/src/types.ts``'s
+    ``ToolCall`` shape (the ``function`` sub-object carries ``name`` and
+    ``arguments`` — the latter a JSON-serialised string).
+    """
+
+    id: str
+    type: Literal["function"] = "function"
+    function: dict[str, Any]
+
+
+class SnapshotMessage(BaseModel):
+    """One message in a ``MESSAGES_SNAPSHOT`` event.
+
+    ``role`` matches the AG-UI ``Message`` schema
+    (``ag-ui/.../core/src/types.ts:117-146``): user/assistant/tool/system/
+    developer. Only ``role="tool"`` messages carry ``toolCallId``;
+    assistant messages may carry ``toolCalls``.
+    """
+
+    id: str
+    role: Literal["user", "assistant", "tool", "system", "developer"]
+    content: str | None = None
+    toolCalls: list[AssistantToolCall] | None = None
+    toolCallId: str | None = None
+
+
+class MessagesSnapshotEvent(BaseAguiEvent):
+    """AG-UI ``MESSAGES_SNAPSHOT`` — replaces the client's entire message
+    list. Used to hydrate a transcript on ``connect`` (replay of an existing
+    session's history) without re-streaming deltas.
+    """
+
+    type: Literal[AguiEventType.MESSAGES_SNAPSHOT] = AguiEventType.MESSAGES_SNAPSHOT
+    messages: list[SnapshotMessage]
+
+
 # Union type for all streamable AG-UI events. ``InterruptOutcome`` is
 # intentionally excluded: it is not emitted on the wire itself but nested
 # inside ``RunFinishedEvent.outcome``, and its ``type`` is a plain string
@@ -189,4 +229,5 @@ AguiEvent = (
     | StateUpdateEvent
     | StateSnapshotEvent
     | CustomEvent
+    | MessagesSnapshotEvent
 )

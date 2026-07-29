@@ -2,7 +2,7 @@
 
 Every option is read from an environment variable carrying the
 ``AGUI_ON_ACP_`` prefix. Each option has a dedicated accessor function
-(e.g. :func:`project_name`) that parses the corresponding variable on
+(e.g. :func:`agent_command`) that parses the corresponding variable on
 every call, so the bridge can be configured purely through the
 environment without a config file or a CLI.
 
@@ -135,33 +135,6 @@ def _env_var_list(default: list[str]) -> list[str]:
 # Config accessors
 # --------------------------------------------------------------------------- #
 @_config_accessor
-def project_name() -> str:
-    """Internal project identifier surfaced in ``/health`` responses.
-
-    Env var: ``AGUI_ON_ACP_PROJECT_NAME``
-    """
-    return _env_var("acp-to-agui")
-
-
-@_config_accessor
-def display_title() -> str:
-    """Title shown in the FastAPI / OpenAPI docs.
-
-    Env var: ``AGUI_ON_ACP_DISPLAY_TITLE``
-    """
-    return _env_var("ACP → AG-UI Bridge")
-
-
-@_config_accessor
-def description() -> str:
-    """Description shown in the OpenAPI docs.
-
-    Env var: ``AGUI_ON_ACP_DESCRIPTION``
-    """
-    return _env_var("Give any ACP-compatible coding agent a rich web UI")
-
-
-@_config_accessor
 def agent_command() -> list[str]:
     """Command (and args) used to spawn the ACP agent, shell-style.
 
@@ -186,7 +159,48 @@ def cors_origins() -> list[str]:
 
     Env var: ``AGUI_ON_ACP_CORS_ORIGINS``
     """
-    return _env_var_list(["http://localhost:5173", "http://localhost:3000"])
+    return _env_var_list(
+        ["http://localhost:5173", "http://localhost:3000", "http://localhost:4200"]
+    )
+
+
+@_config_accessor
+def allowed_cwd_prefixes() -> list[str]:
+    """Absolute path prefixes a client-supplied ``cwd`` must fall under.
+
+    Empty (default) means: only the bridge's own ``os.getcwd()`` is allowed
+    — NOT client-controlled arbitrary paths, unlike the old implicit ``"."``
+    fallback. Env var: ``AGUI_ON_ACP_ALLOWED_CWD_PREFIXES`` (shlex-split,
+    so paths containing spaces can be quoted).
+    """
+    return _env_var_list([])
+
+
+@_config_accessor
+def idle_ttl_seconds() -> float:
+    """Seconds of inactivity after which an idle ``ActiveSession`` is reaped.
+
+    Env var: ``AGUI_ON_ACP_IDLE_TTL_SECONDS``
+    """
+    return float(_env_var("1800"))
+
+
+def is_cwd_allowed(cwd: str) -> bool:
+    """Return True if ``cwd`` falls under an allowlisted prefix.
+
+    When no prefixes are configured, the bridge's own ``os.getcwd()`` is
+    the only allowed root — closing the gap flagged in PLAN3 item 8 where a
+    browser could pass an arbitrary ``cwd`` (defaulting to ``"."``).
+    """
+    if not cwd:
+        return False
+    real = os.path.realpath(cwd)
+    prefixes = allowed_cwd_prefixes() or [os.getcwd()]
+    for p in prefixes:
+        rp = os.path.realpath(p)
+        if real == rp or real.startswith(rp.rstrip(os.sep) + os.sep):
+            return True
+    return False
 
 
 # --------------------------------------------------------------------------- #

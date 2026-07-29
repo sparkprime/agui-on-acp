@@ -9,6 +9,7 @@ import logging
 from typing import Any
 
 import acp
+import acp.schema
 
 logger = logging.getLogger(__name__)
 
@@ -58,18 +59,29 @@ class AcpProtocol:
 
     async def load_session(
         self, session_id: str, cwd: str, mcp_servers: list[dict[str, Any]] | None = None
-    ) -> Any:
+    ) -> acp.schema.LoadSessionResponse:
         self._log.info("Loading session %s (cwd=%s)", session_id, cwd)
-        # The SDK may expose this as a method on conn; use ext_method as fallback
-        try:
-            result = await self.conn.ext_method(
-                "session/load",
-                {"sessionId": session_id, "cwd": cwd, "mcpServers": mcp_servers or []},
-            )
-        except AttributeError:
-            # If ext_method doesn't exist, try direct method call
-            result = await self.conn.new_session(cwd=cwd, mcp_servers=mcp_servers or [])
-        return result
+        return await self.conn.load_session(
+            session_id=session_id, cwd=cwd, mcp_servers=mcp_servers or []
+        )
+
+    async def resume_session(
+        self, session_id: str, cwd: str, mcp_servers: list[dict[str, Any]] | None = None
+    ) -> acp.schema.ResumeSessionResponse:
+        self._log.info("Resuming session %s (cwd=%s)", session_id, cwd)
+        return await self.conn.resume_session(
+            session_id=session_id, cwd=cwd, mcp_servers=mcp_servers or []
+        )
+
+    async def list_sessions(
+        self, cwd: str | None = None, cursor: str | None = None
+    ) -> acp.schema.ListSessionsResponse:
+        self._log.info("Listing sessions (cwd=%s, cursor=%s)", cwd, cursor)
+        return await self.conn.list_sessions(cwd=cwd, cursor=cursor)
+
+    async def delete_session(self, session_id: str) -> acp.schema.DeleteSessionResponse:
+        self._log.info("Deleting session %s", session_id)
+        return await _request_delete_session(self.conn, session_id)
 
     async def prompt(self, session_id: str, prompt: list[dict[str, Any]]) -> Any:
         self._log.debug("Sending prompt to session %s", session_id)
@@ -143,3 +155,32 @@ class AcpProtocol:
             "session/command",
             {"sessionId": session_id, "command": {"command": name, "args": args or ""}},
         )
+
+
+async def _request_delete_session(
+    conn: acp.ClientSideConnection, session_id: str
+) -> acp.schema.DeleteSessionResponse:
+    """Send a ``session/delete`` request.
+
+    ``acp.ClientSideConnection`` has typed wrappers for most session
+    lifecycle methods (``close_session``, ``load_session``, …) but not yet
+    for ``session/delete`` — even though ``DeleteSessionRequest`` /
+    ``DeleteSessionResponse`` and ``AGENT_METHODS["session_delete"]``
+    already exist in the SDK's schema/meta modules. This helper reaches
+    past the public wrapper and calls ``request_model_from_dict`` directly
+    against the connection's private ``_conn`` (a ``Connection``), mirroring
+    exactly what a future upstream ``delete_session`` method would do.
+
+    Fragile across SDK versions by design — delete once the SDK grows the
+    typed method and ``AcpProtocol.delete_session`` can call it directly.
+    """
+    from acp.meta import AGENT_METHODS
+    from acp.utils import request_model_from_dict
+
+    raw_conn = getattr(conn, "_conn", conn)
+    return await request_model_from_dict(
+        raw_conn,
+        AGENT_METHODS["session_delete"],
+        acp.schema.DeleteSessionRequest(session_id=session_id),
+        acp.schema.DeleteSessionResponse,
+    )

@@ -26,10 +26,7 @@ from agui_on_acp.config import (
     agent_command,
     backend_port,
     cors_origins,
-    description,
-    display_title,
     env_var_name,
-    project_name,
 )
 
 
@@ -71,27 +68,6 @@ from agui_on_acp.config import (
     ),
 )
 @click.option(
-    "--project-name",
-    "project_name_flag",
-    default=project_name(),
-    show_default=True,
-    help="Internal project identifier (used in /health responses).",
-)
-@click.option(
-    "--display-title",
-    "display_title_flag",
-    default=display_title(),
-    show_default=True,
-    help="Title shown in the FastAPI/OpenAPI docs.",
-)
-@click.option(
-    "--description",
-    "description_flag",
-    default=description(),
-    show_default=True,
-    help="Description shown in the OpenAPI docs.",
-)
-@click.option(
     "--reload/--no-reload",
     default=True,
     show_default=True,
@@ -109,9 +85,6 @@ def main(
     backend_port_flag: int,
     host: str,
     cors_origins_flag: tuple[str, ...],
-    project_name_flag: str,
-    display_title_flag: str,
-    description_flag: str,
     reload: bool,
     log_level: str,
 ) -> None:
@@ -132,12 +105,6 @@ def main(
         os.environ[env_var_name(backend_port)] = str(backend_port_flag)
     if explicitly("cors_origins_flag") and cors_origins_flag:
         os.environ[env_var_name(cors_origins)] = ",".join(cors_origins_flag)
-    if explicitly("project_name_flag"):
-        os.environ[env_var_name(project_name)] = project_name_flag
-    if explicitly("display_title_flag"):
-        os.environ[env_var_name(display_title)] = display_title_flag
-    if explicitly("description_flag"):
-        os.environ[env_var_name(description)] = description_flag
 
     port = backend_port()
     click.echo(

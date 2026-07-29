@@ -215,7 +215,7 @@ functions.
 | `AGUI_ON_ACP_DESCRIPTION` | str | `Give any ACP-compatible coding agent a rich web UI` | Description shown in OpenAPI docs. |
 | `AGUI_ON_ACP_AGENT_COMMAND` | str (shell-style) | `opencode acp` | Command (+ args) used to spawn the ACP agent, parsed with `shlex.split`. |
 | `AGUI_ON_ACP_BACKEND_PORT` | int | `8000` | Port the bridge listens on. |
-| `AGUI_ON_ACP_CORS_ORIGINS` | list[str] (comma-separated) | `http://localhost:5173,http://localhost:3000` | Allowed CORS origins. |
+| `AGUI_ON_ACP_CORS_ORIGINS` | list[str] (comma-separated) | `http://localhost:5173,http://localhost:3000,http://localhost:4200` | Allowed CORS origins. |
 
 Any `AGUI_ON_ACP_*` variable not in the table above is unrecognised and is
 flagged with a warning at startup (`config.validate_env_vars`). The
@@ -233,7 +233,7 @@ Options:
   --port INTEGER               Port the bridge listens on.  [default: 8000]
   --host TEXT                  Host the bridge binds to.  [default: 0.0.0.0]
   --cors-origin ORIGIN         Allowed CORS origin. Repeat for multiple.
-                               Default: http://localhost:5173, http://localhost:3000.
+                               Default: http://localhost:5173, http://localhost:3000, http://localhost:4200.
   --project-name TEXT          Internal project id (used in /health responses).
   --display-title TEXT         Title shown in OpenAPI docs.
   --description TEXT           Description shown in OpenAPI docs.
