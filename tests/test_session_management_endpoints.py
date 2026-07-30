@@ -78,7 +78,7 @@ async def test_delete_removes_cwd_record():
     """DELETE removes the session from the agent's list AND drops the
     bridge's own ``session_id → cwd`` record (so it doesn't accumulate
     rows for sessions that no longer exist)."""
-    from agui_on_acp.sessions.manager import SessionNotFoundError
+    from agui_on_acp.sessions.manager import CwdRecordNotFoundError
 
     fake, manager, client = await make_stack(
         capabilities_opts=capabilities(list_=True, delete=True)
@@ -97,7 +97,7 @@ async def test_delete_removes_cwd_record():
         ids = {s["sessionId"] for s in (await client.get("/ag-ui/sessions")).json()["sessions"]}
         assert sid not in ids
         # …and the bridge's own cwd record is gone too.
-        with pytest.raises(SessionNotFoundError):
+        with pytest.raises(CwdRecordNotFoundError):
             await manager.resolve_cwd(sid)
     finally:
         await teardown_stack(fake, manager, client)

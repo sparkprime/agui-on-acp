@@ -22,17 +22,16 @@ Plus the management side: ``GET /ag-ui/sessions``, ``DELETE
 from __future__ import annotations
 
 import logging
-import time
-import uuid
 from typing import Any, cast
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from agui_on_acp.agui.sse import event_stream
 from agui_on_acp.config import is_cwd_allowed
 from agui_on_acp.sessions.manager import (
+    CwdRecordNotFoundError,
     DeleteUnsupportedError,
     ListUnsupportedError,
     LoadSessionUnsupportedError,
@@ -105,16 +104,22 @@ async def connect_session(session_id: str, request: Request, cwd: str | None = N
     # Resolve cwd from the store so the client doesn't need to resend it.
     try:
         resolved_cwd = await manager.resolve_cwd(session_id)
-    except SessionNotFoundError:
-        return _error_stream(f"no session {session_id}", status_code=404)
+    except CwdRecordNotFoundError as exc:
+        # The bridge has no cwd record for this id (created before the
+        # cwd-persistence store shipped, or by something other than this
+        # bridge) — distinct from the agent itself not knowing the id.
+        # Pre-stream failure: plain JSON, not an SSE RUN_ERROR (no stream
+        # was ever opened, so the client shouldn't need an SSE parser to
+        # read the error).
+        return _json_error(str(exc), status_code=404)
     if not is_cwd_allowed(resolved_cwd):
-        return _error_stream("cwd not allowed", status_code=403)
+        return _json_error("cwd not allowed", status_code=403)
     try:
         _active, replay_queue = await manager.connect_session(session_id, resolved_cwd)
     except LoadSessionUnsupportedError:
-        return _error_stream("loadSession not supported by this agent", status_code=501)
+        return _json_error("loadSession not supported by this agent", status_code=501)
     except SessionNotFoundError:
-        return _error_stream(f"no session {session_id}", status_code=404)
+        return _json_error(f"no session {session_id}", status_code=404)
 
     async def _on_disconnect() -> None:
         await manager.stop(session_id)
@@ -190,28 +195,16 @@ def _serialize_session_info(info: Any) -> dict[str, Any]:
     return result
 
 
-def _error_stream(message: str, *, status_code: int = 500) -> StreamingResponse:
-    """Yield a single ``RUN_ERROR`` SSE event with the given status code."""
-    import json
+def _json_error(message: str, *, status_code: int = 500) -> JSONResponse:
+    """Pre-stream error: a plain JSON ``{"error": ...}`` body.
 
-    error_event = {
-        "type": "RUN_ERROR",
-        "timestamp": time.time(),
-        "message": message,
-        "runId": str(uuid.uuid4()),
-        "taskId": "error",
-    }
-
-    async def _gen():
-        yield f"event: RUN_ERROR\ndata: {json.dumps(error_event)}\n\n"
-
-    return StreamingResponse(
-        _gen(),
-        media_type="text/event-stream",
+    Used for failures that happen BEFORE any SSE stream is opened (unknown
+    session, unsupported capability, cwd not allowed). Mid-stream failures
+    (errors that occur after a 200 + ``text/event-stream`` has started) are
+    surfaced as ``RUN_ERROR`` events on the stream itself, not here — the
+    client is already committed to parsing SSE in that case.
+    """
+    return JSONResponse(
+        {"error": message},
         status_code=status_code,
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
     )

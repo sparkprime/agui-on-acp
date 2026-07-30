@@ -6,7 +6,6 @@ import asyncio
 import logging
 import sys
 from contextlib import asynccontextmanager
-from typing import TYPE_CHECKING
 
 # Windows: force the Proactor event loop. uvicorn's --reload supervisor sets
 # WindowsSelectorEventLoopPolicy, which doesn't implement subprocess_exec and
@@ -22,9 +21,6 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from agui_on_acp import (
-    DESCRIPTION,
-    DISPLAY_TITLE,
-    PROJECT_NAME,
     __version__,
 )
 from agui_on_acp.config import (
@@ -39,8 +35,7 @@ from agui_on_acp.config import (
 from agui_on_acp.logging_config import setup_logging
 from agui_on_acp.types.api import HealthResponse
 
-if TYPE_CHECKING:
-    from agui_on_acp.sessions.manager import SessionManager
+from agui_on_acp.sessions.manager import SessionManager
 
 setup_logging()
 logger = logging.getLogger(__name__)
@@ -69,16 +64,13 @@ async def lifespan(app: FastAPI):
     setup_logging()  # Re-apply after uvicorn's setup
     validate_env_vars()
     log_the_config()
-    logger.info(f"ACP → AG-UI Bridge v{__version__} (FastAPI)")
+    logger.info(f"ACP on AGUI v{__version__}")
     logger.info(f"Backend: http://localhost:{backend_port()}")
     logger.info("Endpoints:")
-    skip = {"/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc"}
     for route in app.routes:
         path = getattr(route, "path", None)
         methods = getattr(route, "methods", None)
         if path is None or methods is None:
-            continue
-        if path in skip:
             continue
         joined = ", ".join(sorted(methods - {"HEAD", "OPTIONS"}))
         if joined:
@@ -94,7 +86,7 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    logger.info("Shutting down ACP → AG-UI Bridge")
+    logger.info("Shutting down.")
     reaper.cancel()
     try:
         await reaper
@@ -104,8 +96,8 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title=DISPLAY_TITLE,
-    description=DESCRIPTION,
+    title="AG-UI on ACP",
+    description="Give any ACP-compatible coding agent an AG-UI interface",
     version=__version__,
     lifespan=lifespan,
 )
@@ -122,7 +114,7 @@ app.add_middleware(
 @app.get("/health", response_model=HealthResponse, tags=["health"])
 async def health_check() -> HealthResponse:
     """Health check endpoint."""
-    return HealthResponse(status="ok", version=__version__, project=PROJECT_NAME)
+    return HealthResponse(status="ok", version=__version__, project="agui-on-acp")
 
 
 from agui_on_acp.agui_endpoint import router as agui_router

@@ -15,19 +15,18 @@ of AG-UI events. This is the standard AG-UI server contract:
 
 import asyncio
 import logging
-import uuid
 from typing import Any
 
 from fastapi import APIRouter, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from agui_on_acp.agui.events import AguiEvent, StateSnapshotEvent
 from agui_on_acp.agui.sse import event_stream
 from agui_on_acp.config import is_cwd_allowed
 from agui_on_acp.sessions.manager import (
+    CwdRecordNotFoundError,
     ResumeUnsupportedError,
-    SessionNotFoundError,
     SessionResumeFailedError,
 )
 
@@ -95,12 +94,13 @@ async def ag_ui_run(body: RunAgentInput, request: Request):
     """
     manager = getattr(request.app.state, "session_manager", None)
     if manager is None:
-        return _error_stream("Session manager not initialized")
+        return _json_error("Session manager not initialized", status_code=500)
 
     thread_id = body.threadId
     if not thread_id:
-        return _error_stream(
-            "threadId is required — create a session first via POST /ag-ui/sessions"
+        return _json_error(
+            "threadId is required — create a session first via POST /ag-ui/sessions",
+            status_code=400,
         )
 
     # ── Resume path ──────────────────────────────────────────────────────
@@ -110,17 +110,18 @@ async def ag_ui_run(body: RunAgentInput, request: Request):
                 thread_id, [r.model_dump() for r in body.resume]
             )
         except KeyError:
-            return _error_stream(
-                f"No active session for thread {thread_id} — that action expired, please try again"
+            return _json_error(
+                f"No active session for thread {thread_id} — that action expired, please try again",
+                status_code=404,
             )
         except ValueError as exc:
-            # No pending interrupt to resume — surface as RUN_ERROR instead
+            # No pending interrupt to resume — surface as a clear error instead
             # of a hanging empty stream.
-            return _error_stream(str(exc))
+            return _json_error(str(exc), status_code=409)
 
         queue = manager.get_event_queue(thread_id, actual_run_id)
         if queue is None:
-            return _error_stream("No event queue for resume run")
+            return _json_error("No event queue for resume run", status_code=500)
         return _sse_response(queue, thread_id, manager)
 
     # ── Fresh prompt on an existing/resumed session ─────────────────────────
@@ -130,23 +131,23 @@ async def ag_ui_run(body: RunAgentInput, request: Request):
     # for backward compatibility but ignored in favour of the stored record).
     try:
         cwd = await manager.resolve_cwd(thread_id)
-    except SessionNotFoundError:
-        return _error_stream(
-            f"No session {thread_id} — create one first via POST /ag-ui/sessions",
-            status_code=404,
-        )
+    except CwdRecordNotFoundError as exc:
+        # Bridge has no cwd record for this id (created before the
+        # cwd-persistence store shipped, or by something other than this
+        # bridge) — surface the specific reason rather than a bare "no session".
+        return _json_error(str(exc), status_code=404)
     if not is_cwd_allowed(cwd):
-        return _error_stream("cwd not allowed", status_code=403)
+        return _json_error("cwd not allowed", status_code=403)
 
     try:
         active = await manager.attach_for_prompt(thread_id, cwd, fp.get("mcpServers"))
     except ResumeUnsupportedError:
-        return _error_stream(
+        return _json_error(
             f"No active session for thread {thread_id} and this agent does not support session/resume",
             status_code=409,
         )
     except SessionResumeFailedError:
-        return _error_stream(
+        return _json_error(
             f"Could not resume session {thread_id} — the conversation may have expired",
             status_code=404,
         )
@@ -160,7 +161,7 @@ async def ag_ui_run(body: RunAgentInput, request: Request):
                 break
 
     if not user_message:
-        return _error_stream("No user message provided")
+        return _json_error("No user message provided", status_code=400)
 
     # Start a run
     try:
@@ -170,7 +171,7 @@ async def ag_ui_run(body: RunAgentInput, request: Request):
         )
     except Exception as exc:
         logger.error("Failed to start run: %s", exc)
-        return _error_stream(str(exc))
+        return _json_error(str(exc), status_code=500)
 
     # Emit a STATE_SNAPSHOT with available modes/models AFTER start_run has
     # attached the bridge to the run's queue — emitting it before
@@ -190,7 +191,7 @@ async def ag_ui_run(body: RunAgentInput, request: Request):
 
     queue = manager.get_event_queue(thread_id, actual_run_id)
     if queue is None:
-        return _error_stream("No event queue for run")
+        return _json_error("No event queue for run", status_code=500)
 
     return _sse_response(queue, thread_id, manager)
 
@@ -254,29 +255,14 @@ def _sse_response(
     )
 
 
-def _error_stream(message: str, *, status_code: int = 200):
-    """Yield a single ``RUN_ERROR`` event (optionally with a non-200 status)."""
-    import json
-    import time
+def _json_error(message: str, *, status_code: int = 500) -> JSONResponse:
+    """Pre-stream error: a plain JSON ``{"error": ...}`` body.
 
-    error_event = {
-        "type": "RUN_ERROR",
-        "timestamp": time.time(),
-        "message": message,
-        "runId": str(uuid.uuid4()),
-        "taskId": "error",
-    }
-
-    async def _gen():
-        yield f"event: RUN_ERROR\ndata: {json.dumps(error_event)}\n\n"
-
-    return StreamingResponse(
-        _gen(),
-        media_type="text/event-stream",
-        status_code=status_code,
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
-    )
+    Used for failures that happen BEFORE any SSE stream is opened (unknown
+    session, unsupported capability, cwd not allowed, no user message).
+    Mid-stream failures (errors that occur after a 200 +
+    ``text/event-stream`` has started) are surfaced as ``RUN_ERROR`` events
+    on the stream itself, not here — the client is already committed to
+    parsing SSE in that case.
+    """
+    return JSONResponse({"error": message}, status_code=status_code)

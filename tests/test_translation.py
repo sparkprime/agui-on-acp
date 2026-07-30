@@ -238,34 +238,35 @@ async def test_permission_resume_cancelled_replies_cancelled_to_acp(
 
 
 @pytest.mark.asyncio
-async def test_resume_with_no_pending_interrupt_yields_run_error(
+async def test_resume_with_no_pending_interrupt_yields_error(
     fake_agent: FakeAcpAgent, http_client: httpx.AsyncClient
 ):
     """A resume run for a session with no parked permission surfaces a
-    RUN_ERROR rather than hanging on an empty stream."""
+    JSON error (pre-stream) rather than hanging on an empty stream."""
     # First do a normal turn so the session exists, then send a resume.
     fake_agent.script = [text("hi"), end_turn()]
     async with http_client.stream("POST", "/ag-ui", json=_agui_body()) as resp:
         await read_sse_events(resp)
 
     resume_body = _agui_body(resume=[{"interruptId": "nope", "status": "resolved"}])
-    async with http_client.stream("POST", "/ag-ui", json=resume_body) as resp:
-        events = await read_sse_events(resp)
-    assert any(e["type"] == "RUN_ERROR" for e in events)
+    resp = await http_client.post("/ag-ui", json=resume_body)
+    assert resp.status_code == 409
+    assert "error" in resp.json()
 
 
 @pytest.mark.asyncio
-async def test_resume_for_unknown_session_yields_run_error(
+async def test_resume_for_unknown_session_yields_error(
     http_client: httpx.AsyncClient,
 ):
-    """A resume for a threadId with no active session surfaces RUN_ERROR."""
+    """A resume for a threadId with no active session surfaces a JSON
+    error (pre-stream)."""
     body = _agui_body(
         thread_id="never-existed",
         resume=[{"interruptId": "x", "status": "resolved"}],
     )
-    async with http_client.stream("POST", "/ag-ui", json=body) as resp:
-        events = await read_sse_events(resp)
-    assert any(e["type"] == "RUN_ERROR" for e in events)
+    resp = await http_client.post("/ag-ui", json=body)
+    assert resp.status_code == 404
+    assert "error" in resp.json()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -482,10 +483,10 @@ async def test_create_session_applies_mode_and_model():
 
 
 @pytest.mark.asyncio
-async def test_no_user_message_yields_run_error(
+async def test_no_user_message_yields_error(
     http_client: httpx.AsyncClient,
 ):
-    """A RunAgentInput with no user message surfaces a RUN_ERROR stream
+    """A RunAgentInput with no user message surfaces a JSON error (pre-stream)
     instead of starting a turn."""
     body = {
         "threadId": "fake-session-1",
@@ -493,9 +494,9 @@ async def test_no_user_message_yields_run_error(
         "messages": [{"role": "assistant", "content": "no user here"}],
         "forwardedProps": {"cwd": "/tmp/opencode"},
     }
-    async with http_client.stream("POST", "/ag-ui", json=body) as resp:
-        events = await read_sse_events(resp)
-    assert any(e["type"] == "RUN_ERROR" for e in events)
+    resp = await http_client.post("/ag-ui", json=body)
+    assert resp.status_code == 400
+    assert "error" in resp.json()
 
 
 @pytest.mark.asyncio

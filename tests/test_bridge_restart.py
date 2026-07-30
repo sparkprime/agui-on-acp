@@ -83,33 +83,41 @@ async def test_resume_after_bridge_restart_continues_same_session_id():
 async def test_permission_interrupt_orphaned_by_restart_yields_clear_error_not_hang():
     """A permission interrupt parked in manager1's bridge is lost when
     manager1 is discarded; resuming it against manager2 (which has no
-    ActiveSession at all) must surface a clear "no active session" error
-    rather than hanging or 500ing."""
-    fake1, manager1, client1 = await make_stack(
-        capabilities_opts=capabilities(resume=True)
-    )
-    shared_store = fake1.store
-    fake1.script = [request_permission("perm1"), end_turn()]
-    active = await manager1.create_session(cwd=CWD)
-    sid = active.session_id
-    async with client1.stream("POST", "/ag-ui", json=_prompt_body(sid)) as resp:
-        await read_until(resp, {"RUN_FINISHED"})
-    # Discard manager1 WITHOUT resolving the interrupt — the parked Future
-    # lives only in manager1's bridge.
-    await teardown_stack(fake1, manager1, client1)
-
-    fake2, manager2, client2 = await make_stack(
-        capabilities_opts=capabilities(resume=True), store=shared_store
-    )
+    ActiveSession at all) must surface a clear error rather than hanging
+    or 500ing."""
+    shared_data_dir = tempfile.mkdtemp()
     try:
-        # Attempt to resume the orphaned interrupt against manager2.
-        resume_body = _prompt_body(sid, content="")
-        resume_body["resume"] = [{"interruptId": "perm1", "status": "resolved"}]
-        async with client2.stream("POST", "/ag-ui", json=resume_body) as resp:
-            events = await read_sse_events(resp)
-        assert any(e["type"] == "RUN_ERROR" for e in events)
+        fake1, manager1, client1 = await make_stack(
+            capabilities_opts=capabilities(resume=True), data_dir=shared_data_dir
+        )
+        shared_store = fake1.store
+        fake1.script = [request_permission("perm1"), end_turn()]
+        active = await manager1.create_session(cwd=CWD)
+        sid = active.session_id
+        async with client1.stream("POST", "/ag-ui", json=_prompt_body(sid)) as resp:
+            await read_until(resp, {"RUN_FINISHED"})
+        # Discard manager1 WITHOUT resolving the interrupt — the parked Future
+        # lives only in manager1's bridge.
+        await teardown_stack(fake1, manager1, client1)
+
+        fake2, manager2, client2 = await make_stack(
+            capabilities_opts=capabilities(resume=True),
+            store=shared_store,
+            data_dir=shared_data_dir,
+        )
+        try:
+            # Attempt to resume the orphaned interrupt against manager2.
+            # manager2 has no ActiveSession (and no parked Future), so this
+            # is a pre-stream failure → JSON 404, not an SSE RUN_ERROR.
+            resume_body = _prompt_body(sid, content="")
+            resume_body["resume"] = [{"interruptId": "perm1", "status": "resolved"}]
+            resp = await client2.post("/ag-ui", json=resume_body)
+            assert resp.status_code == 404
+            assert "error" in resp.json()
+        finally:
+            await teardown_stack(fake2, manager2, client2)
     finally:
-        await teardown_stack(fake2, manager2, client2)
+        shutil.rmtree(shared_data_dir, ignore_errors=True)
 
 
 @pytest.mark.asyncio

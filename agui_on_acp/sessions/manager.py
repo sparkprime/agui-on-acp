@@ -71,6 +71,28 @@ class SessionNotFoundError(SessionManagerError):
         self.session_id = session_id
 
 
+class CwdRecordNotFoundError(SessionManagerError):
+    """The bridge has no durable ``session_id → cwd`` record for the id.
+
+    Distinct from ``SessionNotFoundError`` (the ACP agent itself has no
+    session by that id). This fires when the bridge was never told the
+    cwd — typically a session created before the cwd-persistence store
+    shipped, or by something other than this bridge. The endpoint surfaces
+    it as a 404 with a message that points at the bridge's own state, not
+    at the agent, so the user isn't sent looking for a missing session in
+    the agent's store.
+    """
+
+    def __init__(self, session_id: str) -> None:
+        super().__init__(
+            f"agui-on-acp has no cwd record for session {session_id} "
+            "(it was likely created before session-cwd persistence was "
+            "introduced, or by something other than this bridge). "
+            "Create a new session via POST /ag-ui/sessions to continue."
+        )
+        self.session_id = session_id
+
+
 class ResumeUnsupportedError(SessionManagerError):
     """The agent does not advertise ``sessionCapabilities.resume``."""
 
@@ -260,17 +282,18 @@ class SessionManager:
         """Return the cwd the bridge recorded for ``session_id``.
 
         Prefers a live ``ActiveSession.cwd`` (always current); falls back
-        to the durable ``SessionStore`` record. Raises ``SessionNotFoundError``
-        if neither has a record — i.e. the bridge never created this id
-        (and wasn't told about it by a prior process's store). Callers use
-        this to stop requiring the client to resend ``cwd`` on connect/prompt.
+        to the durable ``SessionStore`` record. Raises
+        ``CwdRecordNotFoundError`` if neither has a record — i.e. the bridge
+        never created this id (and wasn't told about it by a prior
+        process's store). Callers use this to stop requiring the client to
+        resend ``cwd`` on connect/prompt.
         """
         active = self._sessions.get(session_id)
         if active is not None:
             return active.cwd
         cwd = await self._store.get(session_id)
         if cwd is None:
-            raise SessionNotFoundError(session_id)
+            raise CwdRecordNotFoundError(session_id)
         return cwd
 
     async def connect_session(

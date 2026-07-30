@@ -107,7 +107,7 @@ async def test_prompt_with_no_live_session_and_resume_supported_calls_resume():
 @pytest.mark.asyncio
 async def test_prompt_with_known_id_but_resume_unsupported_is_hard_error():
     """Bridge knows the cwd (store record exists) but the agent doesn't
-    support ``session/resume`` and there's no live session → 409, RUN_ERROR,
+    support ``session/resume`` and there's no live session → 409 JSON error,
     and crucially NO new_session call (never falls back to create)."""
     fake, manager, client = await make_stack(
         capabilities_opts=capabilities(resume=False)
@@ -118,12 +118,11 @@ async def test_prompt_with_known_id_but_resume_unsupported_is_hard_error():
         # then drop the live session so attach_for_prompt must resume.
         active = await manager.create_session(cwd=CWD)
         await manager.stop(active.session_id)
-        async with client.stream(
-            "POST", "/ag-ui", json=_prompt_body(active.session_id)
-        ) as resp:
-            assert resp.status_code == 409
-            events = await read_sse_events(resp)
-        assert any(e["type"] == "RUN_ERROR" for e in events)
+        resp = await client.post(
+            "/ag-ui", json=_prompt_body(active.session_id)
+        )
+        assert resp.status_code == 409
+        assert "error" in resp.json()
         # Never fell back to create: only the explicit create_session call.
         assert len(fake.new_session_calls) == 1
         assert fake.load_session_calls == []
@@ -142,12 +141,9 @@ async def test_prompt_against_truly_unknown_session_yields_404_not_new_session()
     )
     try:
         fake.script = [text("hi"), end_turn()]
-        async with client.stream(
-            "POST", "/ag-ui", json=_prompt_body("truly-missing")
-        ) as resp:
-            assert resp.status_code == 404
-            events = await read_sse_events(resp)
-        assert any(e["type"] == "RUN_ERROR" for e in events)
+        resp = await client.post("/ag-ui", json=_prompt_body("truly-missing"))
+        assert resp.status_code == 404
+        assert "error" in resp.json()
         assert fake.new_session_calls == []
         # resume_session was NOT attempted — resolve_cwd failed first.
         assert fake.resume_session_calls == []
@@ -282,12 +278,9 @@ async def test_connect_unsupported_loadSession_is_clear_error():
     )
     try:
         active = await manager.create_session(cwd=CWD)
-        async with client.stream(
-            "GET", f"/ag-ui/sessions/{active.session_id}/connect"
-        ) as resp:
-            assert resp.status_code == 501
-            events = await read_sse_events(resp)
-        assert any(e["type"] == "RUN_ERROR" for e in events)
+        resp = await client.get(f"/ag-ui/sessions/{active.session_id}/connect")
+        assert resp.status_code == 501
+        assert "error" in resp.json()
     finally:
         await teardown_stack(fake, manager, client)
 
@@ -298,12 +291,9 @@ async def test_connect_unknown_session_is_404_not_500():
         capabilities_opts=capabilities(load_session=True)
     )
     try:
-        async with client.stream(
-            "GET", f"/ag-ui/sessions/never-created/connect?cwd={CWD}"
-        ) as resp:
-            assert resp.status_code == 404
-            events = await read_sse_events(resp)
-        assert any(e["type"] == "RUN_ERROR" for e in events)
+        resp = await client.get(f"/ag-ui/sessions/never-created/connect")
+        assert resp.status_code == 404
+        assert "error" in resp.json()
         # No new_session was minted as a fallback.
         assert fake.new_session_calls == []
     finally:
