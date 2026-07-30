@@ -17,9 +17,7 @@ CWD = "/tmp/opencode"
 
 @pytest.mark.asyncio
 async def test_list_sessions_proxies_and_reflects_store():
-    fake, manager, client = await make_stack(
-        capabilities_opts=capabilities(list_=True)
-    )
+    fake, manager, client = await make_stack(capabilities_opts=capabilities(list_=True))
     try:
         fake.store.create(CWD)
         fake.store.create("/repo")
@@ -94,7 +92,10 @@ async def test_delete_removes_cwd_record():
         assert sid in fake.delete_session_calls
 
         # Gone from the agent's list…
-        ids = {s["sessionId"] for s in (await client.get("/ag-ui/sessions")).json()["sessions"]}
+        ids = {
+            s["sessionId"]
+            for s in (await client.get("/ag-ui/sessions")).json()["sessions"]
+        }
         assert sid not in ids
         # …and the bridge's own cwd record is gone too.
         with pytest.raises(CwdRecordNotFoundError):

@@ -152,8 +152,6 @@ agui_on_acp/
 ├── config.py          # Env-var-backed config accessors (AGUI_ON_ACP_*)
 ├── logging_config.py  # Colored demo formatter (◀ ACP / ● BRIDGE / ▶ AG-UI)
 ├── agui_endpoint.py   # POST /ag-ui — the standard AG-UI run endpoint
-├── types/
-│   └── api.py         # HealthResponse
 ├── sessions/
 │   └── manager.py     # SessionManager — in-memory session table + run lifecycle
 ├── agent/

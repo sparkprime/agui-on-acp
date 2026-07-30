@@ -650,9 +650,7 @@ class FakeAcpAgent:
                 continue
             if cwd is not None and s.cwd != cwd:
                 continue
-            sessions.append(
-                schema.SessionInfo(session_id=s.session_id, cwd=s.cwd)
-            )
+            sessions.append(schema.SessionInfo(session_id=s.session_id, cwd=s.cwd))
         return schema.ListSessionsResponse(sessions=sessions)
 
     async def close_session(
@@ -686,7 +684,9 @@ class FakeAcpAgent:
         self.store.get(session_id)
         return schema.ResumeSessionResponse()
 
-    async def delete_session(self, session_id: str, **kwargs: Any) -> schema.DeleteSessionResponse:
+    async def delete_session(
+        self, session_id: str, **kwargs: Any
+    ) -> schema.DeleteSessionResponse:
         self.delete_session_calls.append(session_id)
         s = self.store.sessions.get(session_id)
         if s is not None:

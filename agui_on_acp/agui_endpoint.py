@@ -19,7 +19,7 @@ from typing import Any
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from agui_on_acp.agui.events import AguiEvent, StateSnapshotEvent
 from agui_on_acp.agui.sse import event_stream
@@ -38,7 +38,7 @@ router = APIRouter()
 class ToolCall(BaseModel):
     id: str
     type: str = "function"
-    function: dict[str, Any] = Field(default_factory=dict)
+    function: dict[str, Any] = {}
 
 
 class AgUiMessage(BaseModel):
@@ -67,12 +67,12 @@ class RunAgentInput(BaseModel):
 
     threadId: str | None = None
     runId: str | None = None
-    state: dict[str, Any] = Field(default_factory=dict[str, Any])
-    messages: list[AgUiMessage] = Field(default_factory=list[AgUiMessage])
-    tools: list[dict[str, Any]] = Field(default_factory=list[dict[str, Any]])
-    context: list[Any] = Field(default_factory=list[Any])
-    forwardedProps: dict[str, Any] = Field(default_factory=dict[str, Any])
-    resume: list[ResumeEntry] = Field(default_factory=list[ResumeEntry])
+    state: dict[str, Any] = {}
+    messages: list[AgUiMessage] = []
+    tools: list[dict[str, Any]] = []
+    context: list[Any] = []
+    forwardedProps: dict[str, Any] = {}
+    resume: list[ResumeEntry] = []
 
 
 @router.post("/ag-ui")
@@ -200,12 +200,12 @@ class ConfigUpdateRequest(BaseModel):
     """Body for ``POST /ag-ui/config`` — a mid-session config change."""
 
     threadId: str
-    configOptions: dict[str, Any] = Field(default_factory=dict[str, Any])
+    configOptions: dict[str, Any] = {}
 
 
 class ConfigUpdateResponse(BaseModel):
     ok: bool = True
-    applied: list[str] = Field(default_factory=list[str])
+    applied: list[str] = []
 
 
 @router.post("/ag-ui/config")

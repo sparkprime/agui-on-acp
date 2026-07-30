@@ -15,8 +15,6 @@ the built-in default, so the bridge can also be configured purely
 through the environment.
 """
 
-from __future__ import annotations
-
 import os
 
 import click

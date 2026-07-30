@@ -169,7 +169,7 @@ class StateSnapshotEvent(BaseAguiEvent):
 class CustomEvent(BaseAguiEvent):
     type: Literal[AguiEventType.CUSTOM] = AguiEventType.CUSTOM
     name: str
-    value: dict[str, Any] = Field(default_factory=dict)
+    value: dict[str, Any] = {}
 
 
 class AssistantToolCall(BaseModel):

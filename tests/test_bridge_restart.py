@@ -49,7 +49,9 @@ async def test_resume_after_bridge_restart_continues_same_session_id():
         fake1.script = [text("first"), end_turn()]
         active = await manager1.create_session(cwd=CWD)
         sid = active.session_id
-        async with client1.stream("POST", "/ag-ui", json=_prompt_body(sid, "first")) as resp:
+        async with client1.stream(
+            "POST", "/ag-ui", json=_prompt_body(sid, "first")
+        ) as resp:
             events1 = await read_sse_events(resp)
         assert any(e["type"] == "RUN_FINISHED" for e in events1)
         await teardown_stack(fake1, manager1, client1)
@@ -63,7 +65,9 @@ async def test_resume_after_bridge_restart_continues_same_session_id():
         )
         try:
             fake2.script = [text("second"), end_turn()]
-            async with client2.stream("POST", "/ag-ui", json=_prompt_body(sid, "second")) as resp:
+            async with client2.stream(
+                "POST", "/ag-ui", json=_prompt_body(sid, "second")
+            ) as resp:
                 assert resp.status_code == 200
                 events2 = await read_sse_events(resp)
             # Resumed on agent2 (agent1 is gone) — never created anew.
@@ -143,7 +147,8 @@ async def test_list_and_delete_operate_on_whichever_subprocess_is_convenient():
         dele = await client2.delete("/ag-ui/sessions/fake-session-1")
         assert dele.status_code == 204
         ids_after = {
-            s["sessionId"] for s in (await client2.get("/ag-ui/sessions")).json()["sessions"]
+            s["sessionId"]
+            for s in (await client2.get("/ag-ui/sessions")).json()["sessions"]
         }
         assert "fake-session-1" not in ids_after
     finally:

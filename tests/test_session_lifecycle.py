@@ -14,7 +14,14 @@ from typing import Any
 import pytest
 
 from tests.conftest import make_stack, teardown_stack
-from tests.fake_agent import capabilities, end_turn, text, tool_end, tool_start, user_text
+from tests.fake_agent import (
+    capabilities,
+    end_turn,
+    text,
+    tool_end,
+    tool_start,
+    user_text,
+)
 from tests.sse_helpers import read_sse_events
 
 CWD = "/tmp/opencode"
@@ -118,9 +125,7 @@ async def test_prompt_with_known_id_but_resume_unsupported_is_hard_error():
         # then drop the live session so attach_for_prompt must resume.
         active = await manager.create_session(cwd=CWD)
         await manager.stop(active.session_id)
-        resp = await client.post(
-            "/ag-ui", json=_prompt_body(active.session_id)
-        )
+        resp = await client.post("/ag-ui", json=_prompt_body(active.session_id))
         assert resp.status_code == 409
         assert "error" in resp.json()
         # Never fell back to create: only the explicit create_session call.

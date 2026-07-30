@@ -27,8 +27,6 @@ fresh ``attach_for_prompt`` call — the store record (plus the agent's own
 persistence) is what gives the id continuity.
 """
 
-from __future__ import annotations
-
 import asyncio
 import logging
 import time
@@ -243,7 +241,9 @@ class SessionManager:
         protocol.conn = conn
 
         init_result = await protocol.initialize()
-        self._capabilities = init_result.agent_capabilities or acp.schema.AgentCapabilities()
+        self._capabilities = (
+            init_result.agent_capabilities or acp.schema.AgentCapabilities()
+        )
 
         mcp_list = _normalize_mcp_servers(mcp_servers)
         result = await protocol.new_session(cwd, mcp_list)
@@ -254,9 +254,7 @@ class SessionManager:
         runner.task_id = session_id
 
         modes, models, current_mode_id, config_opts = _extract_session_meta(result)
-        await _apply_session_options(
-            protocol, session_id, mode, model, config_options
-        )
+        await _apply_session_options(protocol, session_id, mode, model, config_options)
         if mode and mode != "default":
             current_mode_id = mode
 
@@ -444,7 +442,11 @@ class SessionManager:
         if sc is None or not sc.list:
             raise ListUnsupportedError()
         # Prefer a live subprocess for this cwd if one exists (avoids a spawn)
-        active = next((a for a in self._sessions.values() if a.cwd == cwd), None) if cwd else None
+        active = (
+            next((a for a in self._sessions.values() if a.cwd == cwd), None)
+            if cwd
+            else None
+        )
         if active is not None:
             return await active.protocol.list_sessions(cwd=cwd, cursor=cursor)
         return await self._probe_call(lambda p: p.list_sessions(cwd=cwd, cursor=cursor))
@@ -638,18 +640,14 @@ class SessionManager:
         """Apply a single config option mid-session via
         ``session/set_config_option`` (ACP 0.11)."""
         active = self._get_active(task_id)
-        await active.protocol.set_config_option(
-            active.session_id, config_id, value
-        )
+        await active.protocol.set_config_option(active.session_id, config_id, value)
 
     async def execute_command(
         self, task_id: str, command: str, args: dict[str, Any] | None = None
     ) -> None:
         active = self._get_active(task_id)
         args_str = args.get("args", "") if args else ""
-        await active.protocol.execute_command(
-            active.session_id, command, args_str
-        )
+        await active.protocol.execute_command(active.session_id, command, args_str)
 
     async def stop(self, task_id: str) -> bool:
         active = self._sessions.pop(task_id, None)
@@ -699,14 +697,15 @@ def _extract_session_meta(
 
     result_modes = getattr(result, "modes", None)
     if result_modes:
-        available: list[Any] = list(getattr(result_modes, "available_modes", None) or [])
+        available: list[Any] = list(
+            getattr(result_modes, "available_modes", None) or []
+        )
         modes = [
             {"id": str(getattr(m, "id", "")), "name": str(getattr(m, "name", ""))}
             for m in available
         ]
-        current_mode_id = (
-            getattr(result_modes, "current_mode_id", None)
-            or getattr(result_modes, "currentModeId", None)
+        current_mode_id = getattr(result_modes, "current_mode_id", None) or getattr(
+            result_modes, "currentModeId", None
         )
     config_opts = _normalize_config_options(getattr(result, "config_options", None))
     return modes, models, current_mode_id, config_opts

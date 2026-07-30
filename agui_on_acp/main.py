@@ -1,7 +1,5 @@
 """FastAPI main application for the ACP → AG-UI Bridge."""
 
-from __future__ import annotations
-
 import asyncio
 import logging
 import sys
@@ -17,12 +15,13 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+from typing import Literal
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
-from agui_on_acp import (
-    __version__,
-)
+from agui_on_acp import __version__
 from agui_on_acp.config import (
     agent_command,
     backend_port,
@@ -33,8 +32,6 @@ from agui_on_acp.config import (
     validate_env_vars,
 )
 from agui_on_acp.logging_config import setup_logging
-from agui_on_acp.types.api import HealthResponse
-
 from agui_on_acp.sessions.manager import SessionManager
 
 setup_logging()
@@ -109,6 +106,14 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+class HealthResponse(BaseModel):
+    """Response body for health check."""
+
+    status: Literal["ok"] = "ok"
+    version: str
+    project: str
 
 
 @app.get("/health", response_model=HealthResponse, tags=["health"])

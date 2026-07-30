@@ -19,8 +19,6 @@ Plus the management side: ``GET /ag-ui/sessions``, ``DELETE
 /ag-ui/sessions/{id}``, and ``GET /ag-ui/capabilities``.
 """
 
-from __future__ import annotations
-
 import logging
 from typing import Any, cast
 
@@ -60,7 +58,9 @@ class CreateSessionResponse(BaseModel):
 
 
 @router.post("/ag-ui/sessions", status_code=201, response_model=CreateSessionResponse)
-async def create_session(body: CreateSessionRequest, request: Request) -> CreateSessionResponse:
+async def create_session(
+    body: CreateSessionRequest, request: Request
+) -> CreateSessionResponse:
     """Create a new conversation (``session/new``).
 
     Returns the session id the client must use as ``threadId`` on

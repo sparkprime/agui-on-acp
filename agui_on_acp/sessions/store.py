@@ -17,8 +17,6 @@ The base directory is configurable (``AGUI_ON_ACP_DATA_DIR``, default
 ``~/.agui-on-acp``); tests inject a temp directory.
 """
 
-from __future__ import annotations
-
 import asyncio
 import json
 import logging

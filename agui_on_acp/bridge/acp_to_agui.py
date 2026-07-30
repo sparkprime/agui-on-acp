@@ -81,8 +81,6 @@ permission flow and every dropped ACP 0.11 variant) see
 ``docs/agui-acp-mapping.md``.
 """
 
-from __future__ import annotations
-
 import asyncio
 import json
 import logging
@@ -375,7 +373,9 @@ class AcpToAguiBridge:
 
         # Handle typed SDK objects
         update_type = type(update).__name__
-        if not isinstance(update, (acp.schema.AgentMessageChunk, acp.schema.UserMessageChunk)):
+        if not isinstance(
+            update, (acp.schema.AgentMessageChunk, acp.schema.UserMessageChunk)
+        ):
             self._log.info("recv %s", update_type)
 
         if isinstance(update, acp.schema.AgentMessageChunk):

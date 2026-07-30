@@ -30,8 +30,9 @@ dev = [
     "httpx>=0.27.0",
     "pytest-cov",
     "coverage",
-    "black",
-    "isort",
+    "black == 26.5.1",
+    "isort == 8.0.1",
+    "pylint == 4.0.6",
 ]
 
 [project.scripts]
@@ -44,7 +45,52 @@ filterwarnings = [
   "ignore::DeprecationWarning",
   "ignore::UserWarning:acp.*",
 ]
+xfail_strict = true
+log_level = "INFO"
+
+[tool.coverage.run]
+omit = [
+  "tests/*",
+]
+source = ["agui_on_acp"]
+data_file = "coverage-report/.coverage"
+
+[tool.coverage.report]
+skip_covered = true
+sort = "cover"
+fail_under = 5
+precision = 2
+exclude_lines = [
+  "pragma: exclude coverage",
+  "pragma: no cover",
+]
+
+[tool.coverage.html]
+directory = 'coverage-report'
+
+[tool.coverage.xml]
+output = "coverage-report/coverage-report.xml"
+
 
 [tool.pyright]
 typeCheckingMode = "strict"
 exclude = [".venv/**", "**/__pycache__", "**./.*", "build/**", "check_test_refs.py"]
+
+[tool.pylint.messages_control]
+disable = [
+  "too-few-public-methods",
+  "too-many-arguments",
+  "too-many-positional-arguments",
+  "too-many-instance-attributes",
+  "too-many-locals",
+  "too-many-branches",
+  "too-many-statements",
+  "too-many-public-methods",
+  "too-many-lines",
+  "too-many-return-statements",
+  "too-many-nested-blocks",
+  "duplicate-code",
+  "fixme",
+]
+
+

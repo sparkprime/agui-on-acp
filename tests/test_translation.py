@@ -27,6 +27,7 @@ import httpx
 import pytest
 
 from agui_on_acp.sessions.manager import SessionManager
+from tests.conftest import make_stack, teardown_stack
 from tests.fake_agent import (
     FakeAcpAgent,
     config_option_update,
@@ -46,7 +47,6 @@ from tests.fake_agent import (
     usage,
 )
 from tests.sse_helpers import event_of_type, read_sse_events, read_until
-from tests.conftest import make_stack, teardown_stack
 
 
 def _agui_body(
