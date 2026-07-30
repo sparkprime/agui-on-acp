@@ -31,6 +31,7 @@ from agui_on_acp.config import (
     agent_command,
     backend_port,
     cors_origins,
+    data_dir,
     idle_ttl_seconds,
     log_the_config,
     validate_env_vars,
@@ -86,7 +87,7 @@ async def lifespan(app: FastAPI):
 
     from agui_on_acp.sessions.manager import SessionManager
 
-    session_manager = SessionManager(agent_command=agent_command())
+    session_manager = SessionManager(agent_command=agent_command(), data_dir=data_dir())
     app.state.session_manager = session_manager
 
     reaper = asyncio.create_task(_idle_reaper(session_manager))

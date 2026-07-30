@@ -27,6 +27,7 @@ from agui_on_acp.agui.sse import event_stream
 from agui_on_acp.config import is_cwd_allowed
 from agui_on_acp.sessions.manager import (
     ResumeUnsupportedError,
+    SessionNotFoundError,
     SessionResumeFailedError,
 )
 
@@ -124,9 +125,18 @@ async def ag_ui_run(body: RunAgentInput, request: Request):
 
     # ── Fresh prompt on an existing/resumed session ─────────────────────────
     fp = body.forwardedProps
-    cwd = fp.get("cwd")
-    if not cwd or not is_cwd_allowed(cwd):
-        return _error_stream("cwd missing or not allowed")
+    # Resolve cwd from the bridge's durable ``session_id → cwd`` record so
+    # the client doesn't need to resend it (``forwardedProps.cwd`` is accepted
+    # for backward compatibility but ignored in favour of the stored record).
+    try:
+        cwd = await manager.resolve_cwd(thread_id)
+    except SessionNotFoundError:
+        return _error_stream(
+            f"No session {thread_id} — create one first via POST /ag-ui/sessions",
+            status_code=404,
+        )
+    if not is_cwd_allowed(cwd):
+        return _error_stream("cwd not allowed", status_code=403)
 
     try:
         active = await manager.attach_for_prompt(thread_id, cwd, fp.get("mcpServers"))

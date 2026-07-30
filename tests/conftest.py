@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import tempfile
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from typing import Any
@@ -151,8 +152,10 @@ def _patch_runner_spawn(agent: FakeAcpAgent) -> None:
 
 
 @pytest_asyncio.fixture
-async def session_manager(fake_agent: FakeAcpAgent) -> AsyncIterator[SessionManager]:
-    manager = SessionManager(agent_command=["fake"])
+async def session_manager(
+    fake_agent: FakeAcpAgent, tmp_path: Path
+) -> AsyncIterator[SessionManager]:
+    manager = SessionManager(agent_command=["fake"], data_dir=str(tmp_path))
     _patch_runner_spawn(fake_agent)
     try:
         yield manager
@@ -197,6 +200,7 @@ async def make_stack(
     capabilities_opts: acp.schema.AgentCapabilities | None = None,
     store: FakeSessionStore | None = None,
     script: list[Any] | None = None,
+    data_dir: str | None = None,
 ) -> tuple[FakeAcpAgent, SessionManager, httpx.AsyncClient]:
     """Construct a fresh fake-agent + transport + manager + httpx client.
 
@@ -205,14 +209,28 @@ async def make_stack(
     re-patches ``AgentRunner.spawn`` to the most recently built agent (so
     a second call for a "restart" test rewires the manager to agent2 —
     fine, since manager1 is discarded by then).
+
+    ``data_dir`` is the bridge's persistent-state directory (the per-session
+    ``cwd`` record store). When omitted a fresh temp dir is created and
+    cleaned up by ``teardown_stack``; pass an explicit path (shared across
+    two stacks) to model "the bridge restarted but its on-disk store
+    survived" — the caller then owns cleaning that dir up.
     """
+    owns_tmp = data_dir is None
+    tmp: tempfile.TemporaryDirectory[str] | None = None
+    if owns_tmp:
+        tmp = tempfile.TemporaryDirectory()
+        data_dir = tmp.name
     tp = make_transport_pair()
     agent = FakeAcpAgent(
         tp, script=script or [], capabilities=capabilities_opts, store=store
     )
     agent.attach()
     _patch_runner_spawn(agent)
-    manager = SessionManager(agent_command=["fake"])
+    manager = SessionManager(agent_command=["fake"], data_dir=data_dir)
+    if tmp is not None:
+        # Stash for teardown_stack to clean up only when we own it.
+        manager._test_tmp = tmp  # type: ignore[attr-defined]
     fastapi_app.state.session_manager = manager
     transport = ASGITransport(app=fastapi_app)
     client = httpx.AsyncClient(transport=transport, base_url="http://test")
@@ -228,3 +246,6 @@ async def teardown_stack(
     await agent.aclose()
     agent.transport.client_writer.close()
     agent.transport.agent_writer.close()
+    tmp = getattr(manager, "_test_tmp", None)
+    if tmp is not None:
+        tmp.cleanup()

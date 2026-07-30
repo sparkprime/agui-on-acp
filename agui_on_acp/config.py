@@ -154,6 +154,18 @@ def backend_port() -> int:
 
 
 @_config_accessor
+def data_dir() -> str:
+    """Base directory for the bridge's own persistent state (the
+    per-session ``cwd`` record store).
+
+    Env var: ``AGUI_ON_ACP_DATA_DIR`` — defaults to ``~/.agui-on-acp``.
+    ``~`` and ``$HOME``-style references are expanded.
+    """
+    raw = _env_var(os.path.expanduser("~/.agui-on-acp"))
+    return os.path.expanduser(raw)
+
+
+@_config_accessor
 def cors_origins() -> list[str]:
     """Allowed CORS origins, comma-separated.
 

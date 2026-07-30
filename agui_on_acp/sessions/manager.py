@@ -17,10 +17,14 @@ A conversation's id never changes silently: the AG-UI ``threadId`` IS the
 ACP ``session_id`` (``ActiveSession.session_id``). The old two-id split
 (``task_id`` vs ``agent_session_id``) is gone.
 
-All session state is in-memory: the manager keeps no persistent store. If
-the bridge process restarts, an AG-UI client must ``session/resume`` its
-previously-known ``threadId`` against a fresh ``attach_for_prompt`` call —
-the ACP agent's own backing store is what gives the id continuity.
+All session state is in-memory except one durable fact: the ``cwd`` each
+``session_id`` belongs to (``SessionStore``), written at ``create_session``
+time so ``connect``/``attach`` can answer "what cwd does this id belong to?"
+without the client resending it. Conversation content and run state stay
+in the ACP agent's own backing store; the bridge process restart drops
+in-memory state, and an AG-UI client resumes its ``threadId`` against a
+fresh ``attach_for_prompt`` call — the store record (plus the agent's own
+persistence) is what gives the id continuity.
 """
 
 from __future__ import annotations
@@ -30,6 +34,7 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Awaitable, Callable, cast
 
 import acp
@@ -38,6 +43,7 @@ from agui_on_acp.agent.acp_protocol import AcpProtocol
 from agui_on_acp.agent.runner import AgentRunner
 from agui_on_acp.agui.events import AguiEvent
 from agui_on_acp.bridge.acp_to_agui import AcpToAguiBridge
+from agui_on_acp.sessions.store import SessionStore
 
 logger = logging.getLogger(__name__)
 
@@ -129,11 +135,24 @@ class ActiveSession:
 
 
 class SessionManager:
-    def __init__(self, agent_command: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        agent_command: list[str] | None = None,
+        *,
+        data_dir: str | None = None,
+    ) -> None:
         self._sessions: dict[str, ActiveSession] = {}
         self._agent_command = agent_command or ["opencode", "acp"]
         self._capabilities: acp.schema.AgentCapabilities | None = None
         self._capabilities_lock = asyncio.Lock()
+        # Persistent ``session_id → cwd`` record. Written at create_session,
+        # read by connect/attach (so a client resuming by threadId alone
+        # doesn't need to resend cwd), removed on delete_session. ``data_dir``
+        # defaults to the configured base; tests inject a temp dir.
+        from agui_on_acp.config import data_dir as _data_dir_config
+
+        base = Path(data_dir) if data_dir is not None else Path(_data_dir_config())
+        self._store = SessionStore(base)
 
     @property
     def sessions(self) -> dict[str, ActiveSession]:
@@ -231,21 +250,53 @@ class SessionManager:
             config_options=config_opts,
         )
         self._sessions[session_id] = active
+        # Persist the ``session_id → cwd`` record so connect/attach can
+        # resolve cwd without the client resending it.
+        await self._store.put(session_id, cwd)
         logger.info("session ready → %s", session_id)
         return active
 
+    async def resolve_cwd(self, session_id: str) -> str:
+        """Return the cwd the bridge recorded for ``session_id``.
+
+        Prefers a live ``ActiveSession.cwd`` (always current); falls back
+        to the durable ``SessionStore`` record. Raises ``SessionNotFoundError``
+        if neither has a record — i.e. the bridge never created this id
+        (and wasn't told about it by a prior process's store). Callers use
+        this to stop requiring the client to resend ``cwd`` on connect/prompt.
+        """
+        active = self._sessions.get(session_id)
+        if active is not None:
+            return active.cwd
+        cwd = await self._store.get(session_id)
+        if cwd is None:
+            raise SessionNotFoundError(session_id)
+        return cwd
+
     async def connect_session(
-        self, session_id: str, cwd: str, mcp_servers: dict[str, Any] | None = None
+        self,
+        session_id: str,
+        cwd: str | None = None,
+        mcp_servers: dict[str, Any] | None = None,
     ) -> tuple[ActiveSession, asyncio.Queue[AguiEvent]]:
         """Connect to (replay) an existing session: ``session/load``.
 
-        Returns the new ``ActiveSession`` plus the replay queue the bridge
-        filled during ``session/load`` — the endpoint streams the latter as
-        the SSE body.
+        ``cwd`` is resolved from the live session or the durable store when
+        not supplied — the client no longer needs to resend it. Returns the
+        new ``ActiveSession`` plus the replay queue the bridge filled during
+        ``session/load`` (the endpoint streams the latter as the SSE body).
         """
         caps = await self.get_capabilities()
         if not caps.load_session:
             raise LoadSessionUnsupportedError(session_id)
+
+        # Resolve cwd from the live session / durable store when the caller
+        # didn't supply it — the AG-UI client no longer needs to resend cwd
+        # on connect. A caller-supplied cwd is ignored (the stored record is
+        # authoritative; letting a client override it would reintroduce the
+        # correctness gap this store exists to close).
+        if cwd is None:
+            cwd = await self.resolve_cwd(session_id)
 
         # If a live ActiveSession already owns this id (e.g. the client
         # ``POST /ag-ui/sessions`` created it moments ago and is now
@@ -303,18 +354,27 @@ class SessionManager:
         return active, replay_queue
 
     async def attach_for_prompt(
-        self, session_id: str, cwd: str, mcp_servers: dict[str, Any] | None = None
+        self,
+        session_id: str,
+        cwd: str | None = None,
+        mcp_servers: dict[str, Any] | None = None,
     ) -> ActiveSession:
         """Attach to a session for a new prompt turn.
 
         If a live ``ActiveSession`` already exists for ``session_id``,
         return it (no ACP call). Otherwise spawn a subprocess and call
         ``session/resume`` — NEVER ``session/new`` or ``session/load``.
+
+        ``cwd`` is resolved from the live session / durable store when not
+        supplied; the client no longer needs to resend it on prompt.
         """
         existing = self._sessions.get(session_id)
         if existing is not None:
             existing.touch()
             return existing
+
+        if cwd is None:
+            cwd = await self.resolve_cwd(session_id)
 
         caps = await self.get_capabilities()
         sc = caps.session_capabilities
@@ -380,8 +440,11 @@ class SessionManager:
                 await active.protocol.delete_session(session_id)
             finally:
                 await active.runner.kill()
-            return
-        await self._probe_call(lambda p: p.delete_session(session_id))
+        else:
+            await self._probe_call(lambda p: p.delete_session(session_id))
+        # Drop the bridge's own cwd record so it doesn't accumulate rows
+        # for sessions that no longer exist.
+        await self._store.remove(session_id)
 
     # ── Idle TTL reaper ───────────────────────────────────────────────────
 

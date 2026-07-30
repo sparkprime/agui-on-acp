@@ -21,11 +21,14 @@ CWD = "/tmp/opencode"
 
 
 def _prompt_body(sid: str, content: str = "hi") -> dict[str, Any]:
+    # No ``cwd`` in forwardedProps — the bridge resolves it from its durable
+    # ``session_id → cwd`` record, which is the whole point of the
+    # cwd-persistence change these tests exercise.
     return {
         "threadId": sid,
         "runId": "r1",
         "messages": [{"role": "user", "id": "u1", "content": content}],
-        "forwardedProps": {"cwd": CWD},
+        "forwardedProps": {},
     }
 
 
@@ -72,56 +75,68 @@ async def test_prompt_with_known_thread_id_never_calls_new_or_load():
 
 
 @pytest.mark.asyncio
-async def test_prompt_with_unknown_thread_id_and_resume_supported_calls_resume():
-    """A threadId unknown to THIS manager (simulating a bridge restart) but
-    present in the shared store resolves via ``session/resume`` — never
-    ``session/new``."""
+async def test_prompt_with_no_live_session_and_resume_supported_calls_resume():
+    """No live ``ActiveSession`` (e.g. after a bridge restart that
+    preserved the cwd record) but the bridge knows the cwd and the agent
+    supports resume → ``session/resume`` is called, never ``session/new``."""
     fake, manager, client = await make_stack(
         capabilities_opts=capabilities(resume=True)
     )
     try:
-        # Seed the store with a session created out-of-band (no live
-        # ActiveSession — exactly the post-restart shape).
-        stored = fake.store.create(CWD)
-        sid = stored.session_id
         fake.script = [text("hi"), end_turn()]
+        # Create the session (writes the bridge cwd record + a live
+        # session), then drop the live session — modelling "the bridge
+        # restarted; its on-disk cwd record survived but its in-memory
+        # session didn't".
+        active = await manager.create_session(cwd=CWD)
+        sid = active.session_id
+        await manager.stop(sid)
         async with client.stream("POST", "/ag-ui", json=_prompt_body(sid)) as resp:
             events = await read_sse_events(resp)
         assert any(e["type"] == "RUN_FINISHED" for e in events)
         assert len(fake.resume_session_calls) == 1
         assert fake.resume_session_calls[0]["session_id"] == sid
-        # Critical regression guard: no new_session was minted.
-        assert fake.new_session_calls == []
+        # Critical regression guard: prompt did not mint a new session —
+        # the one new_session call is the explicit create above.
+        assert len(fake.new_session_calls) == 1
         assert fake.load_session_calls == []
     finally:
         await teardown_stack(fake, manager, client)
 
 
 @pytest.mark.asyncio
-async def test_prompt_with_unknown_thread_id_and_resume_unsupported_is_hard_error():
-    """resume=False → 409, RUN_ERROR, and crucially NO new_session call."""
+async def test_prompt_with_known_id_but_resume_unsupported_is_hard_error():
+    """Bridge knows the cwd (store record exists) but the agent doesn't
+    support ``session/resume`` and there's no live session → 409, RUN_ERROR,
+    and crucially NO new_session call (never falls back to create)."""
     fake, manager, client = await make_stack(
         capabilities_opts=capabilities(resume=False)
     )
     try:
         fake.script = [text("hi"), end_turn()]
+        # Create the session (writes the bridge cwd record + live session),
+        # then drop the live session so attach_for_prompt must resume.
+        active = await manager.create_session(cwd=CWD)
+        await manager.stop(active.session_id)
         async with client.stream(
-            "POST", "/ag-ui", json=_prompt_body("no-such-session")
+            "POST", "/ag-ui", json=_prompt_body(active.session_id)
         ) as resp:
             assert resp.status_code == 409
             events = await read_sse_events(resp)
         assert any(e["type"] == "RUN_ERROR" for e in events)
-        # The whole point: never fall back to create.
-        assert fake.new_session_calls == []
+        # Never fell back to create: only the explicit create_session call.
+        assert len(fake.new_session_calls) == 1
         assert fake.load_session_calls == []
-        assert fake.resume_session_calls == []
+        assert fake.resume_session_calls == []  # resume unsupported → never called
     finally:
         await teardown_stack(fake, manager, client)
 
 
 @pytest.mark.asyncio
-async def test_prompt_resume_against_truly_missing_session_yields_404_not_new_session():
-    """resume=True but the id isn't in the store → 404, no new_session."""
+async def test_prompt_against_truly_unknown_session_yields_404_not_new_session():
+    """An id the bridge never recorded (no cwd record, no live session) →
+    404, no new_session, and no subprocess spawned at all (resolve_cwd fails
+    before attach_for_prompt runs)."""
     fake, manager, client = await make_stack(
         capabilities_opts=capabilities(resume=True)
     )
@@ -134,8 +149,8 @@ async def test_prompt_resume_against_truly_missing_session_yields_404_not_new_se
             events = await read_sse_events(resp)
         assert any(e["type"] == "RUN_ERROR" for e in events)
         assert fake.new_session_calls == []
-        # resume_session was attempted and the agent raised resource_not_found.
-        assert len(fake.resume_session_calls) == 1
+        # resume_session was NOT attempted — resolve_cwd failed first.
+        assert fake.resume_session_calls == []
     finally:
         await teardown_stack(fake, manager, client)
 
@@ -195,7 +210,10 @@ async def test_connect_calls_load_session_with_queue_already_attached(
         capabilities_opts=capabilities(load_session=True)
     )
     try:
-        stored = fake.store.create(CWD)
+        # Create via the manager so the bridge's cwd record exists (the
+        # client no longer needs to resend cwd on connect).
+        active = await manager.create_session(cwd=CWD)
+        sid = active.session_id
 
         from agui_on_acp.bridge.acp_to_agui import AcpToAguiBridge
 
@@ -210,15 +228,14 @@ async def test_connect_calls_load_session_with_queue_already_attached(
 
         monkeypatch.setattr(AcpToAguiBridge, "start_replay", _spy_start_replay)
 
-        async with client.stream(
-            "GET", f"/ag-ui/sessions/{stored.session_id}/connect?cwd={CWD}"
-        ) as resp:
+        # No ``?cwd=`` — the bridge resolves it from its durable record.
+        async with client.stream("GET", f"/ag-ui/sessions/{sid}/connect") as resp:
             assert resp.status_code == 200
             await read_sse_events(resp)
         # start_replay fired, and load_session ran on the agent.
         assert order == ["start_replay"], "start_replay must run before load"
         assert len(fake.load_session_calls) == 1
-        assert fake.load_session_calls[0]["session_id"] == stored.session_id
+        assert fake.load_session_calls[0]["session_id"] == sid
     finally:
         await teardown_stack(fake, manager, client)
 
@@ -229,17 +246,18 @@ async def test_connect_replay_emits_messages_snapshot_including_user_turns():
         capabilities_opts=capabilities(load_session=True)
     )
     try:
-        stored = fake.store.create(CWD)
-        stored.transcript = [
+        active = await manager.create_session(cwd=CWD)
+        sid = active.session_id
+        # Script the fake agent's replay transcript (session/load re-emits
+        # this history as session/update notifications).
+        fake.store.sessions[sid].transcript = [
             user_text("please help"),
             text("sure thing"),
             tool_start("tc1", title="bash"),
             tool_end("tc1", raw_output="ok"),
             end_turn(),
         ]
-        async with client.stream(
-            "GET", f"/ag-ui/sessions/{stored.session_id}/connect?cwd={CWD}"
-        ) as resp:
+        async with client.stream("GET", f"/ag-ui/sessions/{sid}/connect") as resp:
             assert resp.status_code == 200
             events = await read_sse_events(resp)
         snaps = [e for e in events if e["type"] == "MESSAGES_SNAPSHOT"]
@@ -252,7 +270,7 @@ async def test_connect_replay_emits_messages_snapshot_including_user_turns():
         assert "assistant" in roles
         # The tool call result is a tool-role message.
         assert "tool" in roles
-        assert fake.load_session_calls[0]["session_id"] == stored.session_id
+        assert fake.load_session_calls[0]["session_id"] == sid
     finally:
         await teardown_stack(fake, manager, client)
 
@@ -263,9 +281,9 @@ async def test_connect_unsupported_loadSession_is_clear_error():
         capabilities_opts=capabilities(load_session=False)
     )
     try:
-        stored = fake.store.create(CWD)
+        active = await manager.create_session(cwd=CWD)
         async with client.stream(
-            "GET", f"/ag-ui/sessions/{stored.session_id}/connect?cwd={CWD}"
+            "GET", f"/ag-ui/sessions/{active.session_id}/connect"
         ) as resp:
             assert resp.status_code == 501
             events = await read_sse_events(resp)

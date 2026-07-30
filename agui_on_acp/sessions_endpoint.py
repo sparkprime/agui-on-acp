@@ -88,19 +88,29 @@ async def create_session(body: CreateSessionRequest, request: Request) -> Create
 
 
 @router.get("/ag-ui/sessions/{session_id}/connect")
-async def connect_session(session_id: str, request: Request, cwd: str = "."):
+async def connect_session(session_id: str, request: Request, cwd: str | None = None):
     """Connect to (replay) an existing conversation.
 
     GET (not POST): it's a read-only replay of existing state, no body beyond
     query params, and ``EventSource`` in a browser can only do GET. Streams
     the replayed history as a ``MESSAGES_SNAPSHOT`` framed by a synthetic
     ``RUN_STARTED`` / ``RUN_FINISHED`` pair.
+
+    ``cwd`` is optional — the bridge resolves it from its durable
+    ``session_id → cwd`` record (written at create time). A client-supplied
+    ``cwd`` query param is accepted for backward compatibility but ignored
+    in favour of the stored record.
     """
     manager = request.app.state.session_manager
-    if not is_cwd_allowed(cwd):
+    # Resolve cwd from the store so the client doesn't need to resend it.
+    try:
+        resolved_cwd = await manager.resolve_cwd(session_id)
+    except SessionNotFoundError:
+        return _error_stream(f"no session {session_id}", status_code=404)
+    if not is_cwd_allowed(resolved_cwd):
         return _error_stream("cwd not allowed", status_code=403)
     try:
-        _active, replay_queue = await manager.connect_session(session_id, cwd)
+        _active, replay_queue = await manager.connect_session(session_id, resolved_cwd)
     except LoadSessionUnsupportedError:
         return _error_stream("loadSession not supported by this agent", status_code=501)
     except SessionNotFoundError:

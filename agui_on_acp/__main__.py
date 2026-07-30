@@ -26,6 +26,7 @@ from agui_on_acp.config import (
     agent_command,
     backend_port,
     cors_origins,
+    data_dir,
     env_var_name,
 )
 
@@ -68,6 +69,15 @@ from agui_on_acp.config import (
     ),
 )
 @click.option(
+    "--data-dir",
+    "data_dir_flag",
+    metavar="DIR",
+    help=(
+        "Base directory for the bridge's persistent state (per-session cwd "
+        f"records). Default: {data_dir()}."
+    ),
+)
+@click.option(
     "--reload/--no-reload",
     default=True,
     show_default=True,
@@ -85,6 +95,7 @@ def main(
     backend_port_flag: int,
     host: str,
     cors_origins_flag: tuple[str, ...],
+    data_dir_flag: str | None,
     reload: bool,
     log_level: str,
 ) -> None:
@@ -105,6 +116,8 @@ def main(
         os.environ[env_var_name(backend_port)] = str(backend_port_flag)
     if explicitly("cors_origins_flag") and cors_origins_flag:
         os.environ[env_var_name(cors_origins)] = ",".join(cors_origins_flag)
+    if explicitly("data_dir_flag") and data_dir_flag:
+        os.environ[env_var_name(data_dir)] = data_dir_flag
 
     port = backend_port()
     click.echo(

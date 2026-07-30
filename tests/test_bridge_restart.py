@@ -7,6 +7,8 @@ agent/transport/manager triple, not by any single component.
 
 from __future__ import annotations
 
+import shutil
+import tempfile
 from typing import Any
 
 import pytest
@@ -19,11 +21,14 @@ CWD = "/tmp/opencode"
 
 
 def _prompt_body(sid: str, content: str = "again") -> dict[str, Any]:
+    # No ``cwd`` in forwardedProps — the bridge resolves it from its
+    # durable ``session_id → cwd`` record, which is the whole point of
+    # the cwd-persistence change this restart test now also exercises.
     return {
         "threadId": sid,
         "runId": "r1",
         "messages": [{"role": "user", "id": "u1", "content": content}],
-        "forwardedProps": {"cwd": CWD},
+        "forwardedProps": {},
     }
 
 
@@ -31,37 +36,47 @@ def _prompt_body(sid: str, content: str = "again") -> dict[str, Any]:
 async def test_resume_after_bridge_restart_continues_same_session_id():
     """Create under manager1 → prompt → discard manager1 → prompt again
     under manager2 with the same threadId → succeeds via resume_session on
-    agent2; threadId unchanged throughout."""
-    fake1, manager1, client1 = await make_stack(
-        capabilities_opts=capabilities(resume=True)
-    )
-    shared_store = fake1.store
-    fake1.script = [text("first"), end_turn()]
-    active = await manager1.create_session(cwd=CWD)
-    sid = active.session_id
-    async with client1.stream("POST", "/ag-ui", json=_prompt_body(sid, "first")) as resp:
-        events1 = await read_sse_events(resp)
-    assert any(e["type"] == "RUN_FINISHED" for e in events1)
-    await teardown_stack(fake1, manager1, client1)
+    agent2; threadId unchanged throughout.
 
-    # The bridge "restarts": fresh fake+transport+manager, same store.
-    fake2, manager2, client2 = await make_stack(
-        capabilities_opts=capabilities(resume=True), store=shared_store
-    )
+    Both the fake agent's store AND the bridge's on-disk cwd record survive
+    the restart (shared ``store`` + shared ``data_dir``)."""
+    shared_data_dir = tempfile.mkdtemp()
     try:
-        fake2.script = [text("second"), end_turn()]
-        async with client2.stream("POST", "/ag-ui", json=_prompt_body(sid, "second")) as resp:
-            assert resp.status_code == 200
-            events2 = await read_sse_events(resp)
-        # Resumed on agent2 (agent1 is gone) — never created anew.
-        assert len(fake2.resume_session_calls) == 1
-        assert fake2.resume_session_calls[0]["session_id"] == sid
-        assert fake2.new_session_calls == []
-        # threadId is unchanged throughout.
-        started = [e for e in events2 if e["type"] == "RUN_STARTED"][0]
-        assert started["data"]["threadId"] == sid
+        fake1, manager1, client1 = await make_stack(
+            capabilities_opts=capabilities(resume=True), data_dir=shared_data_dir
+        )
+        shared_store = fake1.store
+        fake1.script = [text("first"), end_turn()]
+        active = await manager1.create_session(cwd=CWD)
+        sid = active.session_id
+        async with client1.stream("POST", "/ag-ui", json=_prompt_body(sid, "first")) as resp:
+            events1 = await read_sse_events(resp)
+        assert any(e["type"] == "RUN_FINISHED" for e in events1)
+        await teardown_stack(fake1, manager1, client1)
+
+        # The bridge "restarts": fresh fake+transport+manager, same fake
+        # store AND same bridge data_dir (cwd record survives on disk).
+        fake2, manager2, client2 = await make_stack(
+            capabilities_opts=capabilities(resume=True),
+            store=shared_store,
+            data_dir=shared_data_dir,
+        )
+        try:
+            fake2.script = [text("second"), end_turn()]
+            async with client2.stream("POST", "/ag-ui", json=_prompt_body(sid, "second")) as resp:
+                assert resp.status_code == 200
+                events2 = await read_sse_events(resp)
+            # Resumed on agent2 (agent1 is gone) — never created anew.
+            assert len(fake2.resume_session_calls) == 1
+            assert fake2.resume_session_calls[0]["session_id"] == sid
+            assert fake2.new_session_calls == []
+            # threadId is unchanged throughout.
+            started = [e for e in events2 if e["type"] == "RUN_STARTED"][0]
+            assert started["data"]["threadId"] == sid
+        finally:
+            await teardown_stack(fake2, manager2, client2)
     finally:
-        await teardown_stack(fake2, manager2, client2)
+        shutil.rmtree(shared_data_dir, ignore_errors=True)
 
 
 @pytest.mark.asyncio

@@ -74,22 +74,31 @@ async def test_list_unsupported_is_501():
 
 
 @pytest.mark.asyncio
-async def test_delete_removes_from_subsequent_list():
-    """delete → gone from the subsequent list; sessions not deleted remain."""
+async def test_delete_removes_cwd_record():
+    """DELETE removes the session from the agent's list AND drops the
+    bridge's own ``session_id → cwd`` record (so it doesn't accumulate
+    rows for sessions that no longer exist)."""
+    from agui_on_acp.sessions.manager import SessionNotFoundError
+
     fake, manager, client = await make_stack(
         capabilities_opts=capabilities(list_=True, delete=True)
     )
     try:
-        s_keep = fake.store.create(CWD)  # fake-session-1
-        s_del = fake.store.create(CWD)  # fake-session-2
+        # Create via the manager so the bridge writes a cwd record.
+        active = await manager.create_session(cwd=CWD)
+        sid = active.session_id
+        assert await manager.resolve_cwd(sid) == CWD
 
-        resp = await client.delete(f"/ag-ui/sessions/{s_del.session_id}")
+        resp = await client.delete(f"/ag-ui/sessions/{sid}")
         assert resp.status_code == 204
-        assert s_del.session_id in fake.delete_session_calls
+        assert sid in fake.delete_session_calls
 
+        # Gone from the agent's list…
         ids = {s["sessionId"] for s in (await client.get("/ag-ui/sessions")).json()["sessions"]}
-        assert s_keep.session_id in ids
-        assert s_del.session_id not in ids  # deleted → gone
+        assert sid not in ids
+        # …and the bridge's own cwd record is gone too.
+        with pytest.raises(SessionNotFoundError):
+            await manager.resolve_cwd(sid)
     finally:
         await teardown_stack(fake, manager, client)
 
