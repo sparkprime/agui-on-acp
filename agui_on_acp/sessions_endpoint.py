@@ -3,7 +3,7 @@ Capabilities.
 
 Split out of ``agui_endpoint.py`` because the session CRUD surface
 (``/ag-ui/sessions*``, ``/ag-ui/capabilities``) is a distinct concern from
-the run surface (``/ag-ui``, ``/ag-ui/config``).
+the run surface (``/ag-ui``).
 
 Three operations back the AG-UI conversation lifecycle (PLAN3 §"Core
 design"):

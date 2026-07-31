@@ -260,9 +260,11 @@ class SessionManager:
         runner.task_id = session_id
 
         modes, models, current_mode_id, config_opts = _extract_session_meta(result)
-        await _apply_session_options(protocol, session_id, mode, model, config_options)
-        if mode and mode != "default":
-            current_mode_id = mode
+        applied_mode = await _apply_session_options(
+            protocol, session_id, mode, model, config_options
+        )
+        if applied_mode is not None:
+            current_mode_id = applied_mode
 
         active = ActiveSession(
             session_id=session_id,
@@ -659,6 +661,34 @@ class SessionManager:
         active = self._get_active(task_id)
         await active.protocol.set_config_option(active.session_id, config_id, value)
 
+    async def apply_session_options(
+        self,
+        task_id: str,
+        mode: str | None,
+        model: str | None,
+        config_options: dict[str, Any] | None,
+    ) -> None:
+        """Apply mode/model/configOptions mid-session (best-effort).
+
+        Used by the prompt path (``POST /ag-ui`` ``forwardedProps``) to
+        change mode/model/config mid-conversation. Shares the create-time
+        ``_apply_session_options`` helper's best-effort policy: each
+        ``set_*`` call is wrapped in its own try/except so one bad option
+        doesn't abort the rest. A successful ``set_mode`` updates
+        ``active.current_mode_id`` so the post-``start_run`` ``STATE_SNAPSHOT``
+        reflects the new mode.
+        """
+        active = self._get_active(task_id)
+        applied_mode = await _apply_session_options(
+            active.protocol,
+            active.session_id,
+            mode,
+            model,
+            config_options,
+        )
+        if applied_mode is not None:
+            active.current_mode_id = applied_mode
+
     async def execute_command(
         self, task_id: str, command: str, args: dict[str, Any] | None = None
     ) -> None:
@@ -739,17 +769,25 @@ async def _apply_session_options(
     mode: str | None,
     model: str | None,
     config_options: dict[str, Any] | None,
-) -> None:
-    """Apply mode/model/config_options after a session is created/resumed.
+) -> str | None:
+    """Apply mode/model/config_options after a session is created/resumed
+    (create-time) or mid-conversation (prompt-time via
+    ``SessionManager.apply_session_options``).
 
     Each set_* call is best-effort — a failure (unsupported mode, invalid
     value) is non-fatal so the broad ``except Exception`` is intentional;
     ``exc_info=True`` ensures the full trace is logged without aborting the
     remaining options.
+
+    Returns the mode id that was successfully applied (or ``None`` if no
+    mode was applied / the call failed), so the caller can update its
+    ``current_mode_id`` tracker to match.
     """
+    applied_mode: str | None = None
     if mode and mode != "default":
         try:
             await protocol.set_mode(session_id, mode)
+            applied_mode = mode
         except Exception:  # pylint: disable=broad-exception-caught
             logger.warning("Failed to set mode %s", mode, exc_info=True)
     if model:
@@ -770,6 +808,7 @@ async def _apply_session_options(
                     value,
                     exc_info=True,
                 )
+    return applied_mode
 
 
 def _normalize_config_options(options: Any) -> list[dict[str, Any]] | None:

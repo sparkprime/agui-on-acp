@@ -176,6 +176,23 @@ async def ag_ui_run(body: RunAgentInput, request: Request):
         logger.exception("Failed to start run for thread %s", thread_id)
         return _json_error("failed to start run", status_code=500)
 
+    # Apply mode/model/configOptions carried in ``forwardedProps`` BEFORE
+    # emitting the STATE_SNAPSHOT — this is the sanctioned AG-UI mechanism
+    # for changing mode/model/config mid-conversation (the bridge-only
+    # ``POST /ag-ui/config`` endpoint was removed in favour of this). It
+    # reuses the same best-effort policy as create-time application
+    # (``_apply_session_options``): a single bad option is logged and
+    # skipped, never aborting the run. Must run after ``start_run`` attached
+    # the run's queue to the bridge — if the agent reflects a mode/config
+    # change back as a ``session/update`` notification it needs a live queue
+    # to land in (same ordering constraint as the snapshot below).
+    await manager.apply_session_options(
+        thread_id,
+        fp.get("mode"),
+        fp.get("model"),
+        fp.get("configOptions"),
+    )
+
     # Emit a STATE_SNAPSHOT with available modes/models AFTER start_run has
     # attached the bridge to the run's queue — emitting it before
     # start_run (the previous placement) dropped it because the bridge's
@@ -202,54 +219,6 @@ async def ag_ui_run(body: RunAgentInput, request: Request):
         return _json_error("No event queue for run", status_code=500)
 
     return _sse_response(queue, thread_id, manager)
-
-
-class ConfigUpdateRequest(BaseModel):
-    """Body for ``POST /ag-ui/config`` — a mid-session config change."""
-
-    threadId: str
-    configOptions: dict[str, Any] = {}
-
-
-class ConfigUpdateResponse(BaseModel):
-    """Response body for ``POST /ag-ui/config``."""
-
-    ok: bool = True
-    applied: list[str] = []
-
-
-@router.post("/ag-ui/config")
-async def ag_ui_set_config(body: ConfigUpdateRequest, request: Request):
-    """Bridge extension: apply mid-session config options without starting a
-    new AG-UI run.
-
-    AG-UI's ``POST /ag-ui`` is always either a fresh run or a resume; there is
-    no "change config" request type. This endpoint fills that gap by calling
-    ``session/set_config_option`` (ACP 0.11) for each supplied option. Not
-    part of the AG-UI standard — clients must opt in.
-    """
-    manager = getattr(request.app.state, "session_manager", None)
-    if manager is None:
-        return {"ok": False, "error": "Session manager not initialized"}
-    applied: list[str] = []
-    for config_id, value in body.configOptions.items():
-        try:
-            await manager.set_config_option(body.threadId, config_id, value)
-            applied.append(config_id)
-        except KeyError:
-            return {
-                "ok": False,
-                "error": f"No active session for thread {body.threadId}",
-            }
-        except Exception:  # pylint: disable=broad-exception-caught
-            # Non-fatal: a single bad config option shouldn't abort the rest.
-            logger.warning(
-                "set_config_option %s failed for thread %s",
-                config_id,
-                body.threadId,
-                exc_info=True,
-            )
-    return ConfigUpdateResponse(applied=applied)
 
 
 def _sse_response(

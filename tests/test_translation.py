@@ -894,43 +894,82 @@ async def test_elicitation_future_expires_when_no_resume_arrives(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Mid-session config change endpoint (P3)
+# Mid-session mode/model/config change via forwardedProps on POST /ag-ui (P3)
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_post_ag_ui_config_applies_config_options(
+async def test_prompt_forwarded_props_applies_mode(
     fake_agent: FakeAcpAgent, http_client: httpx.AsyncClient
 ):
-    """``POST /ag-ui/config`` applies each supplied config option via
-    ``session/set_config_option`` without starting a new run."""
-    # Establish a session first.
+    """``POST /ag-ui`` with ``forwardedProps.mode`` translates to ACP
+    ``session/set_mode`` before the turn runs."""
     fake_agent.script = [text("hi"), end_turn()]
-    async with http_client.stream("POST", "/ag-ui", json=_agui_body()) as resp:
-        await read_sse_events(resp)
-
-    resp = await http_client.post(
-        "/ag-ui/config",
-        json={"threadId": "fake-session-1", "configOptions": {"model": "claude-y"}},
-    )
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["ok"] is True
-    assert body["applied"] == ["model"]
-    assert ("fake-session-1", "claude-y") in fake_agent.set_model_calls
+    body = _agui_body(forwarded_props={"cwd": "/tmp/opencode", "mode": "plan"})
+    async with http_client.stream("POST", "/ag-ui", json=body) as resp:
+        events = await read_sse_events(resp)
+    assert ("fake-session-1", "plan") in fake_agent.set_mode_calls
+    # The run still completes normally.
+    assert events[-1]["type"] == "RUN_FINISHED"
 
 
 @pytest.mark.asyncio
-async def test_post_ag_ui_config_unknown_session(
-    http_client: httpx.AsyncClient,
+async def test_prompt_forwarded_props_applies_model(
+    fake_agent: FakeAcpAgent, http_client: httpx.AsyncClient
 ):
-    """Posting config for an unknown session returns ``{ok: false}``."""
-    resp = await http_client.post(
-        "/ag-ui/config",
-        json={"threadId": "nope", "configOptions": {"model": "x"}},
+    """``POST /ag-ui`` with ``forwardedProps.model`` translates to ACP
+    ``session/set_config_option(config_id="model", …)`` before the turn."""
+    fake_agent.script = [text("hi"), end_turn()]
+    body = _agui_body(forwarded_props={"cwd": "/tmp/opencode", "model": "claude-y"})
+    async with http_client.stream("POST", "/ag-ui", json=body) as resp:
+        events = await read_sse_events(resp)
+    assert ("fake-session-1", "claude-y") in fake_agent.set_model_calls
+    assert events[-1]["type"] == "RUN_FINISHED"
+
+
+@pytest.mark.asyncio
+async def test_prompt_forwarded_props_applies_config_options(
+    fake_agent: FakeAcpAgent, http_client: httpx.AsyncClient
+):
+    """``POST /ag-ui`` with ``forwardedProps.configOptions`` applies each via
+    ``session/set_config_option`` before the turn."""
+    fake_agent.script = [text("hi"), end_turn()]
+    body = _agui_body(
+        forwarded_props={"cwd": "/tmp/opencode", "configOptions": {"foo": "bar"}}
     )
-    assert resp.status_code == 200
-    assert resp.json()["ok"] is False
+    async with http_client.stream("POST", "/ag-ui", json=body) as resp:
+        events = await read_sse_events(resp)
+    assert ("fake-session-1", "foo", "bar") in fake_agent.set_config_option_calls
+    assert events[-1]["type"] == "RUN_FINISHED"
+
+
+@pytest.mark.asyncio
+async def test_prompt_forwarded_props_bad_option_does_not_abort_run(
+    fake_agent: FakeAcpAgent, http_client: httpx.AsyncClient
+):
+    """A bad/unsupported mode or config value is logged and skipped (best-effort);
+    the run still completes instead of erroring out the whole turn."""
+    fake_agent.script = [text("hi"), end_turn()]
+    fake_agent.fail_set_mode = "no-such-mode"
+    fake_agent.fail_set_config_option.add("bad-opt")
+    body = _agui_body(
+        forwarded_props={
+            "cwd": "/tmp/opencode",
+            "mode": "no-such-mode",
+            "configOptions": {"bad-opt": "x", "good-opt": "y"},
+        }
+    )
+    async with http_client.stream("POST", "/ag-ui", json=body) as resp:
+        events = await read_sse_events(resp)
+    # The failing calls were not recorded; the good one was.
+    assert ("fake-session-1", "no-such-mode") not in fake_agent.set_mode_calls
+    assert ("fake-session-1", "bad-opt", "x") not in (
+        fake_agent.set_config_option_calls
+    )
+    assert ("fake-session-1", "good-opt", "y") in fake_agent.set_config_option_calls
+    # No RUN_ERROR — the run finished normally.
+    assert all(e["type"] != "RUN_ERROR" for e in events)
+    assert events[-1]["type"] == "RUN_FINISHED"
 
 
 # ─────────────────────────────────────────────────────────────────────────────

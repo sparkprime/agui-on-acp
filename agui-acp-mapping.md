@@ -82,7 +82,7 @@ stream, where the client is already committed to parsing SSE.
 | `forwardedProps.cwd` | ignored | `cwd` is resolved from the bridge's durable `session_id → cwd` record (written at create time). The client no longer needs to resend it; if sent, it is silently ignored in favour of the stored record. |
 | ~~`forwardedProps.resumeSessionId`~~ | (deleted) | No longer read. Connect (the operation that calls `session/load`) is now `GET .../connect`, not a `POST /ag-ui` flag. |
 | ~~`forwardedProps.agentCommand`~~ | (deleted) | Per-request agent-command override was removed; the agent command is server-config only (`--agent-command` / `AGUI_ON_ACP_AGENT_COMMAND`). |
-| ~~`forwardedProps.mode`~~ / ~~`forwardedProps.model`~~ / ~~`forwardedProps.configOptions`~~ | moved to `POST /ag-ui/sessions` body | Mode/model/configOptions are now applied at Create time, not on the prompt path. |
+| ~~`forwardedProps.mode`~~ / ~~`forwardedProps.model`~~ / ~~`forwardedProps.configOptions`~~ | moved to `POST /ag-ui/sessions` body at Create time | Mode/model/configOptions are applied at Create time via the typed `POST /ag-ui/sessions` body. They are *also* re-applied at Prompt time via `forwardedProps` (see "Config & model discovery" below) — the two paths are consistent and use the same field names. The struck-out row refers to the old behaviour where these were *only* read on the prompt path and Create-time had no typed fields. |
 | `resume[].interruptId` | resolves parked Future keyed by the same id | The id is `=== ACP tool_call_id === AG-UI toolCallId`. One correlation key, three names. |
 | `resume[].status="resolved"` + `payload` | `AllowedOutcome{optionId: payload, outcome:"selected"}` | The `payload` may be a string, a `{optionId}` dict, or null (defaults to `"once"`). **Not 1:1:** the AG-UI payload is normalised to ACP's `optionId` field. |
 | `resume[].status="cancelled"` | `DeniedOutcome{outcome:"cancelled"}` | AG-UI "cancelled" → ACP "cancelled". |
@@ -145,7 +145,7 @@ stream, where the client is already committed to parsing SSE.
 |---|---|---|
 | Server → client (advertise options) | `STATE_SNAPSHOT` with `modes` / `models` / `currentModeId` / `configOptions` | Read at Create time from `session/new`'s response, stashed on `ActiveSession`, then emitted as a snapshot after `start_run` attaches the run's queue. Re-emitted on `ConfigOptionUpdate` notifications mid-turn. |
 | Client → server (select option at create) | `POST /ag-ui/sessions` body (`mode`, `model`, `configOptions`) → `session/set_mode` / `set_config_option` | Applied once at Create, before the first prompt. |
-| Mid-session config change | `POST /ag-ui/config` (bridge extension) → `session/set_config_option` per option | AG-UI's `POST /ag-ui` is always a fresh run or a resume; the bridge exposes a separate `POST /ag-ui/config` endpoint (`{threadId, configOptions}`) so clients can switch models / toggle options mid-session without contorting the run contract. Not part of the AG-UI standard. |
+| Mid-session config change | `POST /ag-ui` with `forwardedProps.mode` / `.model` / `.configOptions` → `session/set_mode` / `session/set_config_option` | `forwardedProps` is AG-UI's sanctioned extension mechanism (`RunAgentInput.forwardedProps` is untyped `any` by design). The bridge applies these on the prompt call, *after* `start_run` attached the run's queue (so any reflected `session/update` has a live sink) and *before* the post-`start_run` `STATE_SNAPSHOT`. Application is best-effort — a bad option is logged and skipped, never aborting the run (same policy as Create-time application). No bespoke sibling endpoint. |
 
 ---
 
@@ -199,7 +199,7 @@ stream, where the client is already committed to parsing SSE.
 | Tool approval (HITL) | ✅ `RUN_FINISHED{interrupt}` + `resume` | ✅ `request_permission` | maps (with state held — the hard part) |
 | Modes | ✅ `STATE_SNAPSHOT.modes` | ✅ `NewSessionResponse.modes` / `CurrentModeUpdate` | maps |
 | Models / config options | ✅ `STATE_SNAPSHOT.configOptions` | ✅ `configOptions` (0.11) | maps |
-| Mid-session config change | ✅ `POST /ag-ui/config` (bridge ext) | ✅ `set_config_option` | maps (bridge extension endpoint) |
+| Mid-session config change | ✅ `POST /ag-ui` `forwardedProps` | ✅ `set_mode` / `set_config_option` | maps (mode/model/configOptions carried in `forwardedProps` on the standard run call) |
 | Cancel | ⚠️ client disconnect | ✅ `session/cancel` | maps via disconnect detection |
 | File reads/writes by agent | (invisible to client) | ✅ `read_text_file` etc. | bridge handles server-side |
 | Terminals | (invisible to client) | ✅ terminal methods | bridge fabricates ids |

@@ -477,6 +477,13 @@ class FakeAcpAgent:
         # late assignment still takes effect).
         self.prompt_exception: BaseException | None = None
 
+        # Optional failure injection for the best-effort paths. If a config
+        # id / mode id is listed here, the matching set_* call raises instead
+        # of recording — used to exercise the prompt-time "bad option doesn't
+        # abort the run" policy. Maps: {"mode": <mode_id>, "config": {cid: …}}.
+        self.fail_set_mode: str | None = None
+        self.fail_set_config_option: set[str] = set()
+
     # ── Wiring ──────────────────────────────────────────────────────────
 
     def attach(self) -> acp.AgentSideConnection:
@@ -615,6 +622,8 @@ class FakeAcpAgent:
         self, mode_id: str, session_id: str, **_kwargs: Any
     ) -> schema.SetSessionModeResponse:
         """Record the mode change."""
+        if self.fail_set_mode is not None and mode_id == self.fail_set_mode:
+            raise acp.RequestError.invalid_params({"mode": mode_id})
         self.set_mode_calls.append((session_id, mode_id))
         return schema.SetSessionModeResponse()
 
@@ -622,6 +631,8 @@ class FakeAcpAgent:
         self, config_id: str, session_id: str, value: str | bool, **_kwargs: Any
     ) -> schema.SetSessionConfigOptionResponse:
         """Record the config-option change (model is a special config_id)."""
+        if config_id in self.fail_set_config_option:
+            raise acp.RequestError.invalid_params({"config_id": config_id})
         self.set_config_option_calls.append((session_id, config_id, value))
         if config_id == "model":
             self.set_model_calls.append((session_id, str(value)))
