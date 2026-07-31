@@ -29,6 +29,11 @@ class AguiEventType(str, Enum):
     STATE_SNAPSHOT = "STATE_SNAPSHOT"
     CUSTOM = "CUSTOM"
     MESSAGES_SNAPSHOT = "MESSAGES_SNAPSHOT"
+    REASONING_START = "REASONING_START"
+    REASONING_MESSAGE_START = "REASONING_MESSAGE_START"
+    REASONING_MESSAGE_CONTENT = "REASONING_MESSAGE_CONTENT"
+    REASONING_MESSAGE_END = "REASONING_MESSAGE_END"
+    REASONING_END = "REASONING_END"
 
 
 class BaseAguiEvent(BaseModel):
@@ -125,6 +130,56 @@ class TextMessageEndEvent(BaseAguiEvent):
     """Marks the end of an assistant text message."""
 
     type: Literal[AguiEventType.TEXT_MESSAGE_END] = AguiEventType.TEXT_MESSAGE_END
+    messageId: str
+
+
+class ReasoningStartEvent(BaseAguiEvent):
+    """Marks the beginning of a reasoning phase (AG-UI ``REASONING_START``).
+
+    Brackets a whole reasoning phase; a phase contains one
+    ``ReasoningMessageStart/Content*/End`` sequence. Emitted on the first
+    ``AgentThoughtChunk`` of a contiguous run and closed by
+    ``ReasoningEndEvent`` on the same lifecycle triggers that close an open
+    text message (tool call start, turn end, run finish/error).
+    """
+
+    type: Literal[AguiEventType.REASONING_START] = AguiEventType.REASONING_START
+    messageId: str
+
+
+class ReasoningMessageStartEvent(BaseAguiEvent):
+    """Marks the beginning of a single reasoning message within a phase."""
+
+    type: Literal[AguiEventType.REASONING_MESSAGE_START] = (
+        AguiEventType.REASONING_MESSAGE_START
+    )
+    messageId: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    role: Literal["reasoning"] = "reasoning"
+
+
+class ReasoningMessageContentEvent(BaseAguiEvent):
+    """A text delta for the currently-open reasoning message."""
+
+    type: Literal[AguiEventType.REASONING_MESSAGE_CONTENT] = (
+        AguiEventType.REASONING_MESSAGE_CONTENT
+    )
+    messageId: str
+    delta: str
+
+
+class ReasoningMessageEndEvent(BaseAguiEvent):
+    """Marks the end of a single reasoning message within a phase."""
+
+    type: Literal[AguiEventType.REASONING_MESSAGE_END] = (
+        AguiEventType.REASONING_MESSAGE_END
+    )
+    messageId: str
+
+
+class ReasoningEndEvent(BaseAguiEvent):
+    """Marks the end of a reasoning phase."""
+
+    type: Literal[AguiEventType.REASONING_END] = AguiEventType.REASONING_END
     messageId: str
 
 
@@ -256,4 +311,9 @@ AguiEvent = (
     | StateSnapshotEvent
     | CustomEvent
     | MessagesSnapshotEvent
+    | ReasoningStartEvent
+    | ReasoningMessageStartEvent
+    | ReasoningMessageContentEvent
+    | ReasoningMessageEndEvent
+    | ReasoningEndEvent
 )

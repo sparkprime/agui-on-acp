@@ -714,20 +714,84 @@ async def test_plan_update_and_removed_become_custom(
 
 
 @pytest.mark.asyncio
-async def test_agent_thought_chunk_becomes_custom_agent_thought(
+async def test_agent_thought_chunk_becomes_reasoning_events(
     fake_agent: FakeAcpAgent, http_client: httpx.AsyncClient
 ):
-    """An AgentThoughtChunk becomes an ``agent:thought`` CUSTOM event."""
+    """An AgentThoughtChunk maps to the standard AG-UI ``REASONING_*``
+    sequence: REASONING_START → REASONING_MESSAGE_START →
+    REASONING_MESSAGE_CONTENT (with the delta) → REASONING_MESSAGE_END →
+    REASONING_END."""
     fake_agent.script = [thought("reasoning about the problem"), end_turn()]
     async with http_client.stream("POST", "/ag-ui", json=_agui_body()) as resp:
         events = await read_sse_events(resp)
-    customs = [
-        e
-        for e in events
-        if e["type"] == "CUSTOM" and e["data"]["name"] == "agent:thought"
+    types = [e["type"] for e in events]
+    assert "REASONING_START" in types
+    start_idx = types.index("REASONING_START")
+    msg_start_idx = types.index("REASONING_MESSAGE_START")
+    content_idx = types.index("REASONING_MESSAGE_CONTENT")
+    msg_end_idx = types.index("REASONING_MESSAGE_END")
+    end_idx = types.index("REASONING_END")
+    assert start_idx < msg_start_idx < content_idx < msg_end_idx < end_idx
+
+    content = event_of_type(events, "REASONING_MESSAGE_CONTENT")
+    assert content["data"]["delta"] == "reasoning about the problem"
+    msg_start = event_of_type(events, "REASONING_MESSAGE_START")
+    assert msg_start["data"]["role"] == "reasoning"
+    # The phase and message share the same id.
+    assert msg_start["data"]["messageId"] == content["data"]["messageId"]
+
+
+@pytest.mark.asyncio
+async def test_consecutive_thought_chunks_coalesce_into_one_reasoning_message(
+    fake_agent: FakeAcpAgent, http_client: httpx.AsyncClient
+):
+    """Multiple contiguous ``AgentThoughtChunk``s coalesce into a single
+    reasoning phase with one ``REASONING_MESSAGE_START``, multiple
+    ``REASONING_MESSAGE_CONTENT`` deltas, and one ``REASONING_MESSAGE_END`` —
+    mirroring how regular text chunks coalesce."""
+    fake_agent.script = [
+        thought("first "),
+        thought("second "),
+        thought("third"),
+        end_turn(),
     ]
-    assert customs, "expected an agent:thought CUSTOM event"
-    assert customs[-1]["data"]["value"]["delta"] == "reasoning about the problem"
+    async with http_client.stream("POST", "/ag-ui", json=_agui_body()) as resp:
+        events = await read_sse_events(resp)
+    types = [e["type"] for e in events]
+    assert types.count("REASONING_START") == 1
+    assert types.count("REASONING_MESSAGE_START") == 1
+    assert types.count("REASONING_MESSAGE_CONTENT") == 3
+    assert types.count("REASONING_MESSAGE_END") == 1
+    assert types.count("REASONING_END") == 1
+
+    deltas = "".join(
+        e["data"]["delta"] for e in events if e["type"] == "REASONING_MESSAGE_CONTENT"
+    )
+    assert deltas == "first second third"
+
+
+@pytest.mark.asyncio
+async def test_reasoning_closed_when_tool_call_starts(
+    fake_agent: FakeAcpAgent, http_client: httpx.AsyncClient
+):
+    """A reasoning block is closed (``REASONING_MESSAGE_END`` +
+    ``REASONING_END``) when a tool call starts immediately after, matching
+    the lifecycle guarantee already applied to regular text messages."""
+    fake_agent.script = [
+        thought("thinking about which tool to call"),
+        tool_start("tc1", title="read file", kind="read", raw_input={"path": "/a"}),
+        tool_end("tc1", status="completed", raw_output={"output": "ok"}),
+        end_turn(),
+    ]
+    async with http_client.stream("POST", "/ag-ui", json=_agui_body()) as resp:
+        events = await read_sse_events(resp)
+    types = [e["type"] for e in events]
+    msg_end_idx = types.index("REASONING_MESSAGE_END")
+    end_idx = types.index("REASONING_END")
+    tool_start_idx = types.index("TOOL_CALL_START")
+    # Reasoning closes before the tool call opens.
+    assert end_idx < tool_start_idx
+    assert msg_end_idx < end_idx
 
 
 # ─────────────────────────────────────────────────────────────────────────────

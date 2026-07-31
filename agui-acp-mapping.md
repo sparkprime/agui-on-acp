@@ -107,7 +107,7 @@ stream, where the client is already committed to parsing SSE.
 | **ACP 0.11:** `UsageUpdate` | `CUSTOM` (`name="agent:usage"`, `value={used, size, cost?}`) | `cost` (when present) is `{amount, currency}`. Clients render a token/cost meter; dedupe upstream. |
 | **ACP 0.11:** `SessionInfoUpdate` | `CUSTOM` (`name="agent:session_info"`, `value={title?, updatedAt?}`) | Carries `title` and `updatedAt`; useful for titling the conversation thread. |
 | **ACP 0.11:** `AgentPlanUpdate` / `AgentPlanContentUpdate` / `AgentPlanRemovedUpdate` | `CUSTOM` (`agent:plan` / `agent:plan_update` / `agent:plan_removed`) | Each variant maps to a `CUSTOM` whose `value` is the plan payload verbatim (`{entries}` / the discriminated plan content / `{id}`). Clients that don't render plans ignore them. |
-| **ACP 0.11:** `AgentThoughtChunk` | `CUSTOM` (`name="agent:thought"`, `value={delta}`) | Agent reasoning streamed as thought deltas; the text message stream is kept clean so clients decide whether to surface reasoning. |
+| **ACP 0.11:** `AgentThoughtChunk` | `REASONING_START` → `REASONING_MESSAGE_START` → `REASONING_MESSAGE_CONTENT` (×N) → `REASONING_MESSAGE_END` → `REASONING_END` | Agent reasoning streamed as thought deltas, now mapped to AG-UI's first-class reasoning event family (was a `CUSTOM agent:thought` escape hatch). The bridge synthesises the phase/message framing: a contiguous run of thought chunks opens one reasoning phase with one reasoning message (multiple `CONTENT` deltas), closed on the same lifecycle triggers that close an open text message (tool call start, turn end, run finish/error). The text-message stream is kept clean so clients decide whether to surface reasoning. Reasoning is **not** folded into the `MESSAGES_SNAPSHOT` on `connect` replay (spec-conformant — AG-UI permits omitting reasoning from snapshots); historical thought chunks emit live during replay. |
 | `UserMessageChunk` | (dropped in live mode) | In live mode: echo of the user's own message; not needed (AG-UI client already has it). **During replay** (connect): coalesced into the `MESSAGES_SNAPSHOT` as a `role="user"` message (see next row). |
 | **replay** (any `session/update` during `session/load`) | `MESSAGES_SNAPSHOT` (one event) | The entire historical `session/update` stream delivered during `session/load` is coalesced into a single `MESSAGES_SNAPSHOT` event (AG-UI's "replace the whole message list" operation). The bridge redirects its coalescing state machine — agent/user text → `SnapshotMessage{role, content}`, tool calls → `SnapshotMessage{role:"assistant", toolCalls}`, tool results → `SnapshotMessage{role:"tool", toolCallId}` — instead of emitting deltas. Framed by a synthetic `RUN_STARTED`/`RUN_FINISHED` pair so the SSE stream has normal start/end markers. |
 
@@ -191,7 +191,7 @@ stream, where the client is already committed to parsing SSE.
 | Streaming tool args | ✅ `TOOL_CALL_ARGS` (delta string) | ✅ `ToolCallStart.raw_input` | maps (one-shot in ACP, chunked in AG-UI) |
 | Tool result | ✅ `TOOL_CALL_RESULT` | ✅ `ToolCallProgress.raw_output` | maps (renamed field) |
 | Tool progress (in-flight output) | ❌ (repurposes `TOOL_CALL_ARGS`) | ✅ `ToolCallProgress` w/ `status=running` | **not 1:1** |
-| Agent reasoning / "thought" | `CUSTOM agent:thought` | ✅ `AgentThoughtChunk` | maps (via `CUSTOM` with `{delta}`) |
+| Agent reasoning / "thought" | ✅ `REASONING_*` | ✅ `AgentThoughtChunk` | maps (with synthesised phase/message framing — one phase per contiguous run) |
 | Plans / todos | `CUSTOM agent:plan[_update|_removed]` | ✅ `AgentPlanUpdate` / `…ContentUpdate` / `…RemovedUpdate` | maps (each variant → a `CUSTOM` with the plan payload) |
 | Token usage / cost | `CUSTOM agent:usage` | ✅ `UsageUpdate` | maps (with `{used, size, cost?}`) |
 | Session title / metadata | `CUSTOM agent:session_info` | ✅ `SessionInfoUpdate` | maps |
@@ -224,7 +224,7 @@ stream, where the client is already committed to parsing SSE.
 |---|---|---|
 | Session title settable from the client | AG-UI has no "rename thread" operation; ACP has `SessionInfoUpdate` (agent → client only) | An ACP method for the client to set `SessionInfo.title`, or a bridge extension endpoint that the agent would need a way to receive (no such ACP call exists today). |
 | Per-session MCP server add/remove mid-conversation | AG-UI has no standard for this; ACP takes `mcpServers` only at `session/new`/`load`/`resume` | An ACP `session/set_mcp_servers` (doesn't exist) or a full re-`resume` with a new server list (works today but is heavy). |
-| Tool progress as a first-class event | AG-UI has no `TOOL_CALL_PROGRESS`; the bridge repurposes `TOOL_CALL_ARGS` with `{"_progress": …}` | An AG-UI spec addition for in-flight tool output, or a `CUSTOM` event with a stable name (the bridge already does the latter via `agent:thought` for reasoning). |
+| Tool progress as a first-class event | AG-UI has no `TOOL_CALL_PROGRESS`; the bridge repurposes `TOOL_CALL_ARGS` with `{"_progress": …}` | An AG-UI spec addition for in-flight tool output, or a `CUSTOM` event with a stable name. |
 
 ### Out of scope (doesn't make sense for this bridge)
 

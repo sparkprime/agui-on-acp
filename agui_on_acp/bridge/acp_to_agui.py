@@ -99,6 +99,11 @@ from agui_on_acp.agui.events import (
     Interrupt,
     InterruptOutcome,
     MessagesSnapshotEvent,
+    ReasoningEndEvent,
+    ReasoningMessageContentEvent,
+    ReasoningMessageEndEvent,
+    ReasoningMessageStartEvent,
+    ReasoningStartEvent,
     RunErrorEvent,
     RunFinishedEvent,
     RunStartedEvent,
@@ -143,6 +148,14 @@ class AcpToAguiBridge:
         self._queue: asyncio.Queue[AguiEvent] | None = None
         self._current_message_id: str | None = None
         self._has_open_message: bool = False
+        # Reasoning state — mirrors the text-message state machine but
+        # adds an outer REASONING_START/REASONING_END phase bracket (AG-UI
+        # treats a contiguous run of AgentThoughtChunks as one phase
+        # containing one reasoning message). Opened lazily on the first
+        # thought delta; closed by ``_close_open_reasoning`` on the same
+        # lifecycle triggers that close an open text message.
+        self._current_reasoning_id: str | None = None
+        self._has_open_reasoning: bool = False
         self._open_tool_calls: set[str] = set()
 
         # Replay-mode state — set by start_replay() / cleared by end_replay().
@@ -209,6 +222,8 @@ class AcpToAguiBridge:
         self._queue = queue
         self._current_message_id = None
         self._has_open_message = False
+        self._current_reasoning_id = None
+        self._has_open_reasoning = False
         self._open_tool_calls.clear()
 
         self._emit(
@@ -232,6 +247,7 @@ class AcpToAguiBridge:
 
     def finish_run(self) -> None:
         """Explicitly finish the current run (e.g. on turn_end)."""
+        self._close_open_reasoning()
         self._close_open_message()
         self._close_all_tool_calls()
         if self._run_id:
@@ -244,6 +260,7 @@ class AcpToAguiBridge:
 
     def error_run(self, message: str, code: str | None = None) -> None:
         """Emit RUN_ERROR and close the run."""
+        self._close_open_reasoning()
         self._close_open_message()
         self._close_all_tool_calls()
         if self._run_id:
@@ -270,6 +287,8 @@ class AcpToAguiBridge:
         self._run_id = run_id
         self._queue = queue
         self._has_open_message = False
+        self._current_reasoning_id = None
+        self._has_open_reasoning = False
 
         self._emit(
             RunStartedEvent(
@@ -337,6 +356,7 @@ class AcpToAguiBridge:
         ``request_permission``; ``attach_resume_queue`` re-attaches a new
         stream on resume.
         """
+        self._close_open_reasoning()
         self._close_open_message()
         if self._run_id:
             self._emit(
@@ -462,9 +482,8 @@ class AcpToAguiBridge:
         elif isinstance(update, acp.schema.AgentThoughtChunk):
             content = getattr(update, "content", None)
             thought_text = getattr(content, "text", "") if content else ""
-            self._emit(
-                CustomEvent(name="agent:thought", value={"delta": thought_text or ""})
-            )
+            if thought_text:
+                self._emit_reasoning_delta(thought_text)
         else:
             # Fallback: try to extract as dict
             if hasattr(update, "model_dump"):
@@ -1057,7 +1076,8 @@ class AcpToAguiBridge:
                 if isinstance(content, dict)
                 else ""
             )
-            self._emit(CustomEvent(name="agent:thought", value={"delta": thought_text}))
+            if thought_text:
+                self._emit_reasoning_delta(thought_text)
         else:
             self._log.debug("Unhandled session/update kind: %s", kind)
 
@@ -1117,6 +1137,7 @@ class AcpToAguiBridge:
         if self._replay_mode:
             self._append_replay_tool_start(update)
             return
+        self._close_open_reasoning()
         self._close_open_message()
 
         tool_call_id = str(
@@ -1244,6 +1265,7 @@ class AcpToAguiBridge:
 
     def _handle_tool_call_dict(self, update: dict[str, Any]) -> None:
         """Translate tool_call dict to TOOL_CALL_START + TOOL_CALL_ARGS."""
+        self._close_open_reasoning()
         self._close_open_message()
 
         tool_call_id = update.get("toolCallId", str(uuid.uuid4()))
@@ -1344,6 +1366,35 @@ class AcpToAguiBridge:
         if self._has_open_message and self._current_message_id:
             self._emit(TextMessageEndEvent(messageId=self._current_message_id))
             self._has_open_message = False
+
+    def _emit_reasoning_delta(self, text: str) -> None:
+        """Stream a reasoning/thought delta as AG-UI ``REASONING_*`` events.
+
+        Opens a reasoning phase (``REASONING_START`` + ``REASONING_MESSAGE_START``)
+        on the first delta of a contiguous run, emits ``REASONING_MESSAGE_CONTENT``
+        for each delta, and leaves the phase open until ``_close_open_reasoning``
+        closes it on the same lifecycle triggers that close an open text
+        message (tool call start, turn end, run finish/error). Mirrors the
+        text-message state machine with the addition of the outer phase
+        bracket AG-UI requires for reasoning.
+        """
+        if not self._has_open_reasoning:
+            msg_id = str(uuid.uuid4())
+            self._current_reasoning_id = msg_id
+            self._has_open_reasoning = True
+            self._emit(ReasoningStartEvent(messageId=msg_id))
+            self._emit(ReasoningMessageStartEvent(messageId=msg_id))
+        message_id = self._current_reasoning_id
+        assert message_id is not None  # set when the phase opened above
+        self._emit(ReasoningMessageContentEvent(messageId=message_id, delta=text))
+
+    def _close_open_reasoning(self) -> None:
+        """Close the current reasoning phase/message if one is open."""
+        if self._has_open_reasoning and self._current_reasoning_id:
+            self._emit(ReasoningMessageEndEvent(messageId=self._current_reasoning_id))
+            self._emit(ReasoningEndEvent(messageId=self._current_reasoning_id))
+            self._has_open_reasoning = False
+            self._current_reasoning_id = None
 
     def _close_all_tool_calls(self) -> None:
         """Close all open tool calls."""
