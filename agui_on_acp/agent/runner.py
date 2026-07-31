@@ -11,6 +11,10 @@ import shutil
 import signal
 import subprocess
 import sys
+
+# asyncio.subprocess.Process is not directly importable as a name in some
+# pylint versions; re-export for the type annotation below.
+from asyncio.subprocess import Process as _AsyncSubprocessProcess
 from typing import Any
 
 import acp
@@ -23,7 +27,7 @@ def _kill_process_tree(root_pid: int) -> None:
     ps_path = shutil.which("ps") or "/bin/ps"
     try:
         out = subprocess.check_output([ps_path, "-eo", "pid,ppid"], text=True)
-    except Exception:
+    except (OSError, subprocess.SubprocessError):
         try:
             os.kill(root_pid, signal.SIGKILL)
         except OSError:
@@ -104,7 +108,7 @@ class AgentRunner:
         self._log = logging.LoggerAdapter(logger, {"task_id": task_id})
 
         self.conn: acp.ClientSideConnection | None = None
-        self.process: asyncio.subprocess.Process | None = None
+        self.process: _AsyncSubprocessProcess | None = None
         self._context_manager: Any = None
 
     async def spawn(
@@ -150,6 +154,12 @@ class AgentRunner:
             # the unstable protocol accepts them without a per-call warning.
             use_unstable_protocol=True,
         )
+        # Enter the context manager manually (instead of ``async with``) so
+        # the process stays alive across ``spawn()`` and ``kill()`` calls.
+        # pylint: disable=unnecessary-dunder-call,no-member
+        # The context manager is typed as Any (the SDK returns an
+        # AsyncGeneratorContextManager that pylint can't introspect), so
+        # the __aenter__/__aexit__ members are real but opaque to the checker.
         conn, process = await self._context_manager.__aenter__()
 
         self.conn = conn
@@ -162,9 +172,15 @@ class AgentRunner:
         """Kill the subprocess and all its descendants."""
         if self._context_manager:
             try:
+                # Exit the context manager manually to mirror the manual
+                # __aenter__ in spawn().  Swallow errors — the process may
+                # already be dead during shutdown.
+                # pylint: disable=unnecessary-dunder-call,no-member
                 await self._context_manager.__aexit__(None, None, None)
-            except Exception:
-                pass
+            except Exception:  # pylint: disable=broad-exception-caught
+                self._log.debug(
+                    "context manager exit failed during kill", exc_info=True
+                )
             self._context_manager = None
 
         # Fallback: if the process is still alive, force-kill the tree
@@ -176,4 +192,5 @@ class AgentRunner:
         self.process = None
 
     def is_alive(self) -> bool:
+        """Return True if the subprocess is still running."""
         return self.process is not None and self.process.returncode is None

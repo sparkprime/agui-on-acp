@@ -5,8 +5,6 @@ Persistence is modeled by a store object outliving the fake
 agent/transport/manager triple, not by any single component.
 """
 
-from __future__ import annotations
-
 import shutil
 import tempfile
 from typing import Any

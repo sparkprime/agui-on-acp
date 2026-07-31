@@ -4,24 +4,15 @@ import asyncio
 import logging
 import sys
 from contextlib import asynccontextmanager
-
-# Windows: force the Proactor event loop. uvicorn's --reload supervisor sets
-# WindowsSelectorEventLoopPolicy, which doesn't implement subprocess_exec and
-# breaks spawning ACP agents (NotImplementedError from _make_subprocess_transport).
-if sys.platform == "win32":
-    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-
-from dotenv import load_dotenv
-
-load_dotenv()
-
 from typing import Literal
 
+from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from agui_on_acp import __version__
+from agui_on_acp.agui_endpoint import router as agui_router
 from agui_on_acp.config import (
     agent_command,
     backend_port,
@@ -33,6 +24,15 @@ from agui_on_acp.config import (
 )
 from agui_on_acp.logging_config import setup_logging
 from agui_on_acp.sessions.manager import SessionManager
+from agui_on_acp.sessions_endpoint import router as sessions_router
+
+load_dotenv()
+
+# Windows: force the Proactor event loop. uvicorn's --reload supervisor sets
+# WindowsSelectorEventLoopPolicy, which doesn't implement subprocess_exec and
+# breaks spawning ACP agents (NotImplementedError from _make_subprocess_transport).
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
 setup_logging()
 logger = logging.getLogger(__name__)
@@ -51,33 +51,34 @@ async def _idle_reaper(manager: SessionManager) -> None:
             destroyed = await manager.sweep_idle(idle_ttl_seconds())
             if destroyed:
                 logger.info("idle-reaped sessions: %s", destroyed)
-        except Exception:
+        except Exception:  # pylint: disable=broad-exception-caught
+            # Background task — must not crash the reaper loop.  Any failure
+            # is retried on the next 60 s tick; logger.exception captures the
+            # full trace so the error is visible without killing the task.
             logger.exception("idle reaper sweep failed")
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(_app: FastAPI):
     """Application lifespan context manager for startup/shutdown."""
     setup_logging()  # Re-apply after uvicorn's setup
     validate_env_vars()
     log_the_config()
-    logger.info(f"ACP on AGUI v{__version__}")
-    logger.info(f"Backend: http://localhost:{backend_port()}")
+    logger.info("ACP on AGUI v%s", __version__)
+    logger.info("Backend: http://localhost:%d", backend_port())
     logger.info("Endpoints:")
-    for route in app.routes:
+    for route in _app.routes:
         path = getattr(route, "path", None)
         methods = getattr(route, "methods", None)
         if path is None or methods is None:
             continue
         joined = ", ".join(sorted(methods - {"HEAD", "OPTIONS"}))
         if joined:
-            logger.info(f"  {joined:6s} {path}")
+            logger.info("  %6s %s", joined, path)
     logger.info("---")
 
-    from agui_on_acp.sessions.manager import SessionManager
-
     session_manager = SessionManager(agent_command=agent_command(), data_dir=data_dir())
-    app.state.session_manager = session_manager
+    _app.state.session_manager = session_manager
 
     reaper = asyncio.create_task(_idle_reaper(session_manager))
 
@@ -121,9 +122,6 @@ async def health_check() -> HealthResponse:
     """Health check endpoint."""
     return HealthResponse(status="ok", version=__version__, project="agui-on-acp")
 
-
-from agui_on_acp.agui_endpoint import router as agui_router
-from agui_on_acp.sessions_endpoint import router as sessions_router
 
 app.include_router(agui_router, tags=["ag-ui"])
 app.include_router(sessions_router, tags=["sessions"])

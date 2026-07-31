@@ -133,4 +133,7 @@ def main(
 
 
 if __name__ == "__main__":
+    # pylint: disable=no-value-for-parameter
+    # Click injects the parameters from the command line; the bare ``main()``
+    # call is the standard Click entry-point pattern.
     main()

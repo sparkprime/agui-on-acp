@@ -17,8 +17,6 @@ interrupt/resume permission flow (the core impedance-mismatch fix from
 design-v2), cancel, disconnect, permission TTL expiry, and error paths.
 """
 
-from __future__ import annotations
-
 import asyncio
 import contextlib
 from typing import Any, cast
@@ -26,6 +24,7 @@ from typing import Any, cast
 import httpx
 import pytest
 
+from agui_on_acp.agui.sse import event_stream
 from agui_on_acp.sessions.manager import SessionManager
 from tests.conftest import make_stack, teardown_stack
 from tests.fake_agent import (
@@ -306,7 +305,6 @@ async def test_client_disconnect_triggers_acp_cancel(
     fake_agent: FakeAcpAgent,
     session_manager: SessionManager,
     precreated_session_id: str,
-    http_client: httpx.AsyncClient,
 ):
     """When the AG-UI client disconnects mid-run (CancelledError on the SSE
     generator), the bridge calls ``session/cancel`` on the ACP agent and
@@ -318,8 +316,6 @@ async def test_client_disconnect_triggers_acp_cancel(
     close, so we drive it directly: start the run, then cancel the task
     consuming the SSE ``event_stream`` — the exact event the ASGI server
     delivers on a real socket close."""
-    from agui_on_acp.agui.sse import event_stream
-
     fake_agent.script = [
         text("streaming..."),
         sleep(10.0),  # hold the turn open so we can disconnect mid-stream
@@ -650,6 +646,7 @@ async def test_create_session_applies_config_options():
 async def test_usage_update_becomes_custom_agent_usage(
     fake_agent: FakeAcpAgent, http_client: httpx.AsyncClient
 ):
+    """A UsageUpdate notification becomes an ``agent:usage`` CUSTOM event."""
     fake_agent.script = [
         usage(used=4200, size=200000, cost={"amount": 0.03, "currency": "USD"}),
         end_turn(),
@@ -673,6 +670,7 @@ async def test_usage_update_becomes_custom_agent_usage(
 async def test_session_info_update_becomes_custom(
     fake_agent: FakeAcpAgent, http_client: httpx.AsyncClient
 ):
+    """A SessionInfoUpdate notification becomes an ``agent:session_info`` event."""
     fake_agent.script = [
         session_info(title="My conversation", updated_at="2026-01-01T00:00:00Z"),
         end_turn(),
@@ -692,6 +690,7 @@ async def test_session_info_update_becomes_custom(
 async def test_plan_update_and_removed_become_custom(
     fake_agent: FakeAcpAgent, http_client: httpx.AsyncClient
 ):
+    """AgentPlanUpdate and AgentPlanRemovedUpdate become CUSTOM events."""
     fake_agent.script = [
         plan(
             entries=[
@@ -718,6 +717,7 @@ async def test_plan_update_and_removed_become_custom(
 async def test_agent_thought_chunk_becomes_custom_agent_thought(
     fake_agent: FakeAcpAgent, http_client: httpx.AsyncClient
 ):
+    """An AgentThoughtChunk becomes an ``agent:thought`` CUSTOM event."""
     fake_agent.script = [thought("reasoning about the problem"), end_turn()]
     async with http_client.stream("POST", "/ag-ui", json=_agui_body()) as resp:
         events = await read_sse_events(resp)
@@ -924,6 +924,7 @@ async def test_post_ag_ui_config_applies_config_options(
 async def test_post_ag_ui_config_unknown_session(
     http_client: httpx.AsyncClient,
 ):
+    """Posting config for an unknown session returns ``{ok: false}``."""
     resp = await http_client.post(
         "/ag-ui/config",
         json={"threadId": "nope", "configOptions": {"model": "x"}},

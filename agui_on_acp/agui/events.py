@@ -46,6 +46,8 @@ class BaseAguiEvent(BaseModel):
 
 
 class RunStartedEvent(BaseAguiEvent):
+    """Signals the start of an AG-UI run."""
+
     type: Literal[AguiEventType.RUN_STARTED] = AguiEventType.RUN_STARTED
     runId: str
     taskId: str
@@ -81,6 +83,8 @@ class InterruptOutcome(BaseModel):
 
 
 class RunFinishedEvent(BaseAguiEvent):
+    """Signals the end of an AG-UI run (optionally with an interrupt outcome)."""
+
     type: Literal[AguiEventType.RUN_FINISHED] = AguiEventType.RUN_FINISHED
     runId: str
     taskId: str
@@ -89,6 +93,8 @@ class RunFinishedEvent(BaseAguiEvent):
 
 
 class RunErrorEvent(BaseAguiEvent):
+    """Signals a run-ending error."""
+
     type: Literal[AguiEventType.RUN_ERROR] = AguiEventType.RUN_ERROR
     runId: str
     taskId: str
@@ -98,12 +104,16 @@ class RunErrorEvent(BaseAguiEvent):
 
 
 class TextMessageStartEvent(BaseAguiEvent):
+    """Marks the beginning of an assistant text message."""
+
     type: Literal[AguiEventType.TEXT_MESSAGE_START] = AguiEventType.TEXT_MESSAGE_START
     messageId: str = Field(default_factory=lambda: str(uuid.uuid4()))
     role: Literal["assistant"] = "assistant"
 
 
 class TextMessageContentEvent(BaseAguiEvent):
+    """A text delta for the currently-open assistant message."""
+
     type: Literal[AguiEventType.TEXT_MESSAGE_CONTENT] = (
         AguiEventType.TEXT_MESSAGE_CONTENT
     )
@@ -112,11 +122,15 @@ class TextMessageContentEvent(BaseAguiEvent):
 
 
 class TextMessageEndEvent(BaseAguiEvent):
+    """Marks the end of an assistant text message."""
+
     type: Literal[AguiEventType.TEXT_MESSAGE_END] = AguiEventType.TEXT_MESSAGE_END
     messageId: str
 
 
 class ToolCallStartEvent(BaseAguiEvent):
+    """Marks the beginning of a tool call."""
+
     type: Literal[AguiEventType.TOOL_CALL_START] = AguiEventType.TOOL_CALL_START
     toolCallId: str
     toolCallName: str
@@ -124,12 +138,16 @@ class ToolCallStartEvent(BaseAguiEvent):
 
 
 class ToolCallArgsEvent(BaseAguiEvent):
+    """A JSON-string delta of arguments for a tool call."""
+
     type: Literal[AguiEventType.TOOL_CALL_ARGS] = AguiEventType.TOOL_CALL_ARGS
     toolCallId: str
     delta: str  # JSON string chunk of args
 
 
 class ToolCallEndEvent(BaseAguiEvent):
+    """Marks the end of a tool call (end-of-args-streaming)."""
+
     type: Literal[AguiEventType.TOOL_CALL_END] = AguiEventType.TOOL_CALL_END
     toolCallId: str
     result: str | None = None
@@ -157,16 +175,22 @@ class ToolCallResultEvent(BaseAguiEvent):
 
 
 class StateUpdateEvent(BaseAguiEvent):
+    """An incremental state update (partial merge)."""
+
     type: Literal[AguiEventType.STATE_UPDATE] = AguiEventType.STATE_UPDATE
     state: dict[str, Any]  # arbitrary JSON state
 
 
 class StateSnapshotEvent(BaseAguiEvent):
+    """A full state snapshot (replaces all prior state)."""
+
     type: Literal[AguiEventType.STATE_SNAPSHOT] = AguiEventType.STATE_SNAPSHOT
     snapshot: dict[str, Any]
 
 
 class CustomEvent(BaseAguiEvent):
+    """A vendor-extension event not covered by a standard AG-UI type."""
+
     type: Literal[AguiEventType.CUSTOM] = AguiEventType.CUSTOM
     name: str
     value: dict[str, Any] = {}
@@ -197,8 +221,10 @@ class SnapshotMessage(BaseModel):
     id: str
     role: Literal["user", "assistant", "tool", "system", "developer"]
     content: str | None = None
-    toolCalls: list[AssistantToolCall] | None = None
-    toolCallId: str | None = None
+    # camelCase field names match the AG-UI wire schema (ag-ui types.ts) —
+    # they must stay camelCase for client compatibility.
+    toolCalls: list[AssistantToolCall] | None = None  # pylint: disable=invalid-name
+    toolCallId: str | None = None  # pylint: disable=invalid-name
 
 
 class MessagesSnapshotEvent(BaseAguiEvent):

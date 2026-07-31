@@ -1,4 +1,4 @@
-"""AcpToAguiBridge — implements the acp.Client protocol to translate SDK callbacks into AG-UI events.
+"""AcpToAguiBridge — translates ACP SDK callbacks into AG-UI events.
 
 This is the core of the bridge architecture. It maintains per-run state
 (open message, open tool calls) and emits properly sequenced AG-UI events
@@ -82,6 +82,7 @@ permission flow and every dropped ACP 0.11 variant) see
 """
 
 import asyncio
+import datetime
 import json
 import logging
 import os
@@ -93,6 +94,7 @@ import acp.schema
 
 from agui_on_acp.agui.events import (
     AguiEvent,
+    AssistantToolCall,
     CustomEvent,
     Interrupt,
     InterruptOutcome,
@@ -352,9 +354,14 @@ class AcpToAguiBridge:
 
     def on_connect(self, conn: Any) -> None:
         """Called when the connection is established."""
+        # conn is unused but the acp.Client Protocol requires it and pyright
+        # enforces the parameter name.
+        # pylint: disable=unused-argument
         self._log.info("ACP connection established")
 
-    async def session_update(self, session_id: str, update: Any, **kwargs: Any) -> None:
+    async def session_update(
+        self, session_id: str, update: Any, **_kwargs: Any
+    ) -> None:
         """Handle streaming updates from the SDK.
 
         The `update` is a typed object (AgentMessageChunk, ToolCallStart,
@@ -471,9 +478,12 @@ class AcpToAguiBridge:
                     "Unhandled session_update type: %s", type(update).__name__
                 )
 
-    async def request_permission(
-        self, session_id: str, tool_call: Any, options: Any, **kwargs: Any
+    async def request_permission(  # pylint: disable=unused-argument
+        self, session_id: str, tool_call: Any, options: Any, **_kwargs: Any
     ) -> acp.RequestPermissionResponse:
+        # session_id is unused — the bridge keys permissions by tool_call_id —
+        # but the acp.Client Protocol requires it and the SDK dispatches by
+        # keyword from the request model fields.
         """Handle tool approval requests from the SDK.
 
         Emits a ``RUN_FINISHED{outcome:interrupt}`` so the AG-UI client
@@ -512,7 +522,7 @@ class AcpToAguiBridge:
         if isinstance(options, list):
             options_list = cast(list[Any], options)
         elif hasattr(options, "__iter__"):
-            options_list = [opt for opt in options]
+            options_list = list(options)
         else:
             options_list = []
 
@@ -531,11 +541,10 @@ class AcpToAguiBridge:
         # so the AG-UI client guard (agent.ts:407-411) and our server-side
         # cleanup agree.
         loop = asyncio.get_event_loop()
-        import datetime as _dt
 
-        expires_at_iso = _dt.datetime.fromtimestamp(
-            _dt.datetime.now().timestamp() + PERMISSION_TTL_SECONDS,
-            tz=_dt.timezone.utc,
+        expires_at_iso = datetime.datetime.fromtimestamp(
+            datetime.datetime.now().timestamp() + PERMISSION_TTL_SECONDS,
+            tz=datetime.timezone.utc,
         ).isoformat()
 
         interrupt = Interrupt(
@@ -613,19 +622,24 @@ class AcpToAguiBridge:
 
         Return empty dict for unhandled methods.
         """
+        # params is unused — we acknowledge all extension methods — but the
+        # acp.Client Protocol requires it and pyright enforces the name.
+        # pylint: disable=unused-argument
         self._log.debug("ext_method called: %s", method)
         return {}
 
     # ── acp.Client Protocol — File operations ────────────────────────────────
 
-    async def read_text_file(
+    async def read_text_file(  # pylint: disable=unused-argument
         self,
         session_id: str,
         path: str,
         line: int | None = None,
         limit: int | None = None,
-        **kwargs: Any,
+        **_kwargs: Any,
     ) -> acp.ReadTextFileResponse:
+        # session_id is unused (cwd resolves the path) but the acp.Client
+        # Protocol requires it; the SDK dispatches by keyword.
         """Read a text file on behalf of the agent."""
         self._log.debug("read_text_file: %s", path)
         try:
@@ -643,13 +657,15 @@ class AcpToAguiBridge:
                 else:
                     content = f.read()
             return acp.ReadTextFileResponse(content=content)
-        except Exception as exc:
-            self._log.error("read_text_file failed: %s", exc)
+        except (OSError, UnicodeDecodeError) as exc:
+            logger.exception("read_text_file failed: %s", path)
             return acp.ReadTextFileResponse(content=f"Error reading file: {exc}")
 
-    async def write_text_file(
-        self, session_id: str, path: str, content: str, **kwargs: Any
+    async def write_text_file(  # pylint: disable=unused-argument
+        self, session_id: str, path: str, content: str, **_kwargs: Any
     ) -> acp.WriteTextFileResponse | None:
+        # session_id is unused (cwd resolves the path) but the acp.Client
+        # Protocol requires it; the SDK dispatches by keyword.
         """Write a text file on behalf of the agent."""
         self._log.debug("write_text_file: %s", path)
         try:
@@ -660,13 +676,17 @@ class AcpToAguiBridge:
             with open(full_path, "w", encoding="utf-8") as f:
                 f.write(content)
             return acp.WriteTextFileResponse()
-        except Exception as exc:
-            self._log.error("write_text_file failed: %s", exc)
+        except OSError:
+            logger.exception("write_text_file failed: %s", path)
             return None
 
     # ── acp.Client Protocol — Terminal operations ────────────────────────────
+    # The ``session_id`` and ``terminal_id`` params are required by the
+    # acp.Client Protocol (the SDK dispatches them by keyword from the
+    # request model fields) but are unused — the bridge doesn't manage
+    # terminals, it just acknowledges the calls.
 
-    async def create_terminal(
+    async def create_terminal(  # pylint: disable=unused-argument
         self,
         session_id: str,
         command: str,
@@ -674,7 +694,7 @@ class AcpToAguiBridge:
         env: Any = None,
         cwd: str | None = None,
         output_byte_limit: int | None = None,
-        **kwargs: Any,
+        **_kwargs: Any,
     ) -> acp.CreateTerminalResponse:
         """Create a terminal process for the agent.
 
@@ -687,26 +707,26 @@ class AcpToAguiBridge:
         )
         return acp.CreateTerminalResponse(terminal_id=terminal_id)
 
-    async def terminal_output(
-        self, session_id: str, terminal_id: str, **kwargs: Any
+    async def terminal_output(  # pylint: disable=unused-argument
+        self, session_id: str, terminal_id: str, **_kwargs: Any
     ) -> acp.TerminalOutputResponse:
         """Get terminal output."""
         return acp.TerminalOutputResponse(output="", truncated=False)
 
-    async def release_terminal(
-        self, session_id: str, terminal_id: str, **kwargs: Any
+    async def release_terminal(  # pylint: disable=unused-argument
+        self, session_id: str, terminal_id: str, **_kwargs: Any
     ) -> acp.ReleaseTerminalResponse | None:
         """Release a terminal."""
         return acp.ReleaseTerminalResponse()
 
-    async def wait_for_terminal_exit(
-        self, session_id: str, terminal_id: str, **kwargs: Any
+    async def wait_for_terminal_exit(  # pylint: disable=unused-argument
+        self, session_id: str, terminal_id: str, **_kwargs: Any
     ) -> acp.WaitForTerminalExitResponse:
         """Wait for a terminal to exit."""
         return acp.WaitForTerminalExitResponse(exit_code=0)
 
-    async def kill_terminal(
-        self, session_id: str, terminal_id: str, **kwargs: Any
+    async def kill_terminal(  # pylint: disable=unused-argument
+        self, session_id: str, terminal_id: str, **_kwargs: Any
     ) -> acp.KillTerminalResponse | None:
         """Kill a terminal."""
         return acp.KillTerminalResponse()
@@ -717,7 +737,7 @@ class AcpToAguiBridge:
     # ``request_permission``: park a Future, end the SSE stream with an
     # interrupt outcome, and resolve the Future when the client resumes.
 
-    async def create_elicitation(self, message: str, mode: Any, **kwargs: Any) -> Any:
+    async def create_elicitation(self, message: str, mode: Any, **_kwargs: Any) -> Any:
         """Surface an ACP elicitation as an AG-UI interrupt.
 
         Parks a Future keyed by the elicitation id (taken from ``mode`` for
@@ -735,11 +755,9 @@ class AcpToAguiBridge:
         if requested_schema is not None:
             response_schema = _model_to_dict(requested_schema)
 
-        import datetime as _dt
-
-        expires_at_iso = _dt.datetime.fromtimestamp(
-            _dt.datetime.now().timestamp() + PERMISSION_TTL_SECONDS,
-            tz=_dt.timezone.utc,
+        expires_at_iso = datetime.datetime.fromtimestamp(
+            datetime.datetime.now().timestamp() + PERMISSION_TTL_SECONDS,
+            tz=datetime.timezone.utc,
         ).isoformat()
 
         interrupt = Interrupt(
@@ -775,7 +793,7 @@ class AcpToAguiBridge:
         )
         return response
 
-    async def complete_elicitation(self, elicitation_id: str, **kwargs: Any) -> None:
+    async def complete_elicitation(self, elicitation_id: str, **_kwargs: Any) -> None:
         """The agent notified that a previously-started elicitation completed
         mid-stream. Surface it as a CUSTOM event so clients can react (rare;
         usually the accept/decline reply closes the loop)."""
@@ -1405,8 +1423,7 @@ class AcpToAguiBridge:
             last = SnapshotMessage(id=str(uuid.uuid4()), role="assistant")
             self._replay_messages.append(last)
         if last.toolCalls is None:
-            last.toolCalls = []
-        from agui_on_acp.agui.events import AssistantToolCall
+            last.toolCalls = []  # pylint: disable=invalid-name
 
         call = AssistantToolCall(
             id=tool_call_id,
@@ -1469,7 +1486,9 @@ class AcpToAguiBridge:
         if hasattr(result_obj, "model_dump"):
             try:
                 result_obj = result_obj.model_dump()
-            except Exception:
+            except Exception:  # pylint: disable=broad-exception-caught
+                # model_dump can fail on exotic/non-serializable fields —
+                # fall through to the dict/str path below.
                 pass
         if isinstance(result_obj, dict):
             result_dict = cast(dict[str, Any], result_obj)
@@ -1480,11 +1499,12 @@ class AcpToAguiBridge:
                 return result_dict["output"]
             try:
                 return json.dumps(result_dict, default=str)
-            except Exception:
+            except (TypeError, ValueError):
+                # Non-serializable content — fall back to repr.
                 return str(result_dict)
         try:
             return json.dumps(result_obj, default=str)
-        except Exception:
+        except (TypeError, ValueError):
             return str(result_obj)
 
 
@@ -1502,10 +1522,13 @@ def _model_to_dict(obj: Any) -> Any:
     if hasattr(obj, "model_dump"):
         try:
             return obj.model_dump(by_alias=True, mode="json", exclude_none=True)
-        except Exception:
+        except Exception:  # pylint: disable=broad-exception-caught
+            # First attempt failed — try without ``mode="json"`` (some
+            # pydantic models contain non-JSON-serializable objects).
             try:
                 return obj.model_dump(by_alias=True, exclude_none=True)
-            except Exception:
+            except Exception:  # pylint: disable=broad-exception-caught
+                # Both model_dump paths failed — fall through to return obj.
                 pass
     return obj
 

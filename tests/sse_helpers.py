@@ -5,8 +5,6 @@
 typed dicts so tests can assert cleanly.
 """
 
-from __future__ import annotations
-
 import asyncio
 import json
 from typing import Any
@@ -40,8 +38,6 @@ def parse_sse_frame(frame: str) -> dict[str, Any] | None:
 
 async def read_sse_events(
     response: httpx.Response,
-    *,
-    timeout: float = 5.0,
 ) -> list[dict[str, Any]]:
     """Read an SSE response fully until the stream ends, return parsed events.
 
@@ -91,6 +87,7 @@ async def read_until(
 
 
 def event_of_type(events: list[dict[str, Any]], t: str) -> dict[str, Any]:
+    """Return the first event of type ``t``, asserting it exists."""
     for e in events:
         if e["type"] == t:
             return e

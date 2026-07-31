@@ -51,6 +51,7 @@ log_level = "INFO"
 [tool.coverage.run]
 omit = [
   "tests/*",
+  "agui_on_acp/__main__.py",
 ]
 source = ["agui_on_acp"]
 data_file = "coverage-report/.coverage"
@@ -71,6 +72,12 @@ directory = 'coverage-report'
 [tool.coverage.xml]
 output = "coverage-report/coverage-report.xml"
 
+
+[tool.black]
+target-version = ["py312"]
+
+[tool.isort]
+profile = "black"
 
 [tool.pyright]
 typeCheckingMode = "strict"

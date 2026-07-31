@@ -10,6 +10,7 @@ logger = logging.getLogger(__name__)
 
 
 def encode_sse_event(event: AguiEvent) -> str:
+    """Serialize ``event`` to an SSE frame string (``event:`` + ``data:`` lines)."""
     json_str = event.model_dump_json(exclude_none=True)
     return f"event: {event.type.value}\ndata: {json_str}\n\n"
 
@@ -46,11 +47,18 @@ async def event_stream(
         except asyncio.CancelledError:
             logger.info("SSE stream cancelled (client disconnect) for task %s", task_id)
             if on_cancel is not None:
+                # Broad catch: the cancel callback must not re-raise into the
+                # ASGI layer or uvicorn will log a noisy traceback on a routine
+                # disconnect. logger.exception captures the full trace.
                 try:
                     await on_cancel()
-                except Exception:
+                except Exception:  # pylint: disable=broad-exception-caught
                     logger.exception("on_cancel callback failed for task %s", task_id)
             return
-        except Exception:
+        except Exception:  # pylint: disable=broad-exception-caught
+            # Broad catch: the SSE generator is the boundary between the event
+            # queue and the ASGI response — any unhandled exception here would
+            # propagate into Starlette and crash the connection without a clean
+            # error frame. logger.exception captures the full trace.
             logger.exception("SSE stream error for task %s", task_id)
             return

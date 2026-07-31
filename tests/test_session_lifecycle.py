@@ -7,12 +7,11 @@ never changes silently, and a failed resume/load is never papered over by
 minting a new session.
 """
 
-from __future__ import annotations
-
 from typing import Any
 
 import pytest
 
+from agui_on_acp.bridge.acp_to_agui import AcpToAguiBridge
 from tests.conftest import make_stack, teardown_stack
 from tests.fake_agent import (
     capabilities,
@@ -44,6 +43,7 @@ def _prompt_body(sid: str, content: str = "hi") -> dict[str, Any]:
 
 @pytest.mark.asyncio
 async def test_create_session_calls_new_session_and_returns_id():
+    """Create calls ``session/new`` and returns the agent-minted session id."""
     fake, manager, client = await make_stack()
     try:
         fake.script = [text("hi"), end_turn()]
@@ -64,6 +64,7 @@ async def test_create_session_calls_new_session_and_returns_id():
 
 @pytest.mark.asyncio
 async def test_prompt_with_known_thread_id_never_calls_new_or_load():
+    """A prompt on a live session reuses it — no new/load/resume ACP call."""
     fake, manager, client = await make_stack()
     try:
         fake.script = [text("hi"), end_turn()]
@@ -216,8 +217,6 @@ async def test_connect_calls_load_session_with_queue_already_attached(
         active = await manager.create_session(cwd=CWD)
         sid = active.session_id
 
-        from agui_on_acp.bridge.acp_to_agui import AcpToAguiBridge
-
         # Record the order: start_replay must fire before load_session
         # completes (the manager calls start_replay THEN awaits load).
         order: list[str] = []
@@ -243,6 +242,7 @@ async def test_connect_calls_load_session_with_queue_already_attached(
 
 @pytest.mark.asyncio
 async def test_connect_replay_emits_messages_snapshot_including_user_turns():
+    """Replay emits a MESSAGES_SNAPSHOT including user, assistant and tool turns."""
     fake, manager, client = await make_stack(
         capabilities_opts=capabilities(load_session=True)
     )
@@ -277,7 +277,8 @@ async def test_connect_replay_emits_messages_snapshot_including_user_turns():
 
 
 @pytest.mark.asyncio
-async def test_connect_unsupported_loadSession_is_clear_error():
+async def test_connect_unsupported_load_session_is_clear_error():
+    """Connecting when loadSession is unsupported returns a 501 error."""
     fake, manager, client = await make_stack(
         capabilities_opts=capabilities(load_session=False)
     )
@@ -292,11 +293,12 @@ async def test_connect_unsupported_loadSession_is_clear_error():
 
 @pytest.mark.asyncio
 async def test_connect_unknown_session_is_404_not_500():
+    """Connecting to an unknown session id returns 404, not 500."""
     fake, manager, client = await make_stack(
         capabilities_opts=capabilities(load_session=True)
     )
     try:
-        resp = await client.get(f"/ag-ui/sessions/never-created/connect")
+        resp = await client.get("/ag-ui/sessions/never-created/connect")
         assert resp.status_code == 404
         assert "error" in resp.json()
         # No new_session was minted as a fallback.

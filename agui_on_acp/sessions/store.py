@@ -62,7 +62,7 @@ class SessionStore:
             return None
         try:
             data = await asyncio.to_thread(self._read, path)
-        except Exception:
+        except (ValueError, OSError):
             logger.warning("corrupt session record at %s; ignoring", path)
             return None
         cwd = data.get("cwd")

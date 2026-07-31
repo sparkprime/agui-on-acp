@@ -16,8 +16,6 @@ SSE stream, asserting on the translated events. The only thing not real is
 the OS subprocess — replaced by the in-process transport pair.
 """
 
-from __future__ import annotations
-
 import asyncio
 import sys
 import tempfile
@@ -25,23 +23,24 @@ from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from typing import Any
 
+import acp
+import httpx
 import pytest
 import pytest_asyncio
+from httpx import ASGITransport
 
-# Make the repo root importable so `import agui_on_acp` and `import tests`
-# both work from anywhere.
+import agui_on_acp.bridge.acp_to_agui as _bridge_mod
+from agui_on_acp.main import app as fastapi_app
+from agui_on_acp.sessions.manager import SessionManager
+
+# Make the repo root importable so ``import tests`` works from anywhere
+# (``tests`` is not an installed package).  The imports below depend on
+# this path insertion, hence they are intentionally not at module top.
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-import acp
-import httpx
-from httpx import ASGITransport
-
-# Use a short permission TTL in tests so expiry paths don't take 5 minutes.
-import agui_on_acp.bridge.acp_to_agui as _bridge_mod
-from agui_on_acp.main import app as fastapi_app
-from agui_on_acp.sessions.manager import SessionManager
+# pylint: disable=wrong-import-position
 from tests.fake_agent import FakeAcpAgent, FakeSessionStore
 from tests.transport import TransportPair, make_transport_pair
 
@@ -67,11 +66,13 @@ def permissive_cwd_allowlist(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
 
 @pytest.fixture
 def event_loop_policy() -> asyncio.AbstractEventLoopPolicy:
+    """Return the default event loop policy for the test session."""
     return asyncio.DefaultEventLoopPolicy()
 
 
-@pytest_asyncio.fixture
-async def transport_pair() -> AsyncIterator[TransportPair]:
+@pytest_asyncio.fixture(name="transport_pair")
+async def fixture_transport_pair() -> AsyncIterator[TransportPair]:
+    """Create a connected pair of asyncio StreamReader/StreamWriter endpoints."""
     tp = make_transport_pair()
     try:
         yield tp
@@ -81,16 +82,19 @@ async def transport_pair() -> AsyncIterator[TransportPair]:
         tp.agent_writer.close()
         try:
             await asyncio.wait_for(tp.client_writer.wait_closed(), timeout=1.0)
-        except Exception:
+        except (OSError, asyncio.CancelledError):
             pass
         try:
             await asyncio.wait_for(tp.agent_writer.wait_closed(), timeout=1.0)
-        except Exception:
+        except (OSError, asyncio.CancelledError):
             pass
 
 
-@pytest_asyncio.fixture
-async def fake_agent(transport_pair: TransportPair) -> AsyncIterator[FakeAcpAgent]:
+@pytest_asyncio.fixture(name="fake_agent")
+async def fixture_fake_agent(
+    transport_pair: TransportPair,
+) -> AsyncIterator[FakeAcpAgent]:
+    """Create and attach a FakeAcpAgent on the agent side of the transport."""
     agent = FakeAcpAgent(transport_pair, script=[])
     agent.attach()
     try:
@@ -107,12 +111,18 @@ def _patch_runner_spawn(agent: FakeAcpAgent) -> None:
     bridge's ``acp.Client`` callbacks then run against the fake agent
     through real JSON-RPC framing.
     """
+    # Lazy import — this function monkeypatches the class at fixture time,
+    # so importing here (rather than at module top) keeps the patch local.
+    # pylint: disable=import-outside-toplevel
     from agui_on_acp.agent.runner import AgentRunner
 
     async def _fake_spawn(
-        self: AgentRunner, client: acp.Client, env: dict[str, str] | None = None
+        self: AgentRunner, client: acp.Client, _env: dict[str, str] | None = None
     ) -> acp.ClientSideConnection:
-        from acp import ClientSideConnection  # deprecated import path the bridge uses
+        # ``ClientSideConnection`` is a deprecated import path (pyright
+        # doesn't see it in acp's stubs) but the runtime exposes it.
+        # pylint: disable=no-name-in-module,import-outside-toplevel
+        from acp import ClientSideConnection
 
         # ClientSideConnection(to_client, writer, reader): the client WRITES
         # requests into client_writer (which feeds the agent's reader) and
@@ -142,7 +152,7 @@ def _patch_runner_spawn(agent: FakeAcpAgent) -> None:
         if self.conn is not None:
             try:
                 await self.conn.close()
-            except Exception:
+            except (OSError, asyncio.CancelledError):
                 pass
             self.conn = None
         self.process = None
@@ -151,10 +161,11 @@ def _patch_runner_spawn(agent: FakeAcpAgent) -> None:
     AgentRunner.kill = _fake_kill  # type: ignore[assignment]
 
 
-@pytest_asyncio.fixture
-async def session_manager(
+@pytest_asyncio.fixture(name="session_manager")
+async def fixture_session_manager(
     fake_agent: FakeAcpAgent, tmp_path: Path
 ) -> AsyncIterator[SessionManager]:
+    """Create a SessionManager with a temp data_dir and patched runner."""
     manager = SessionManager(agent_command=["fake"], data_dir=str(tmp_path))
     _patch_runner_spawn(fake_agent)
     try:
@@ -163,10 +174,9 @@ async def session_manager(
         await manager.shutdown()
 
 
-@pytest_asyncio.fixture
-async def precreated_session_id(
+@pytest_asyncio.fixture(name="precreated_session_id")
+async def fixture_precreated_session_id(
     session_manager: SessionManager,
-    fake_agent: FakeAcpAgent,
 ) -> AsyncIterator[str]:
     """Pre-create one live session for translation tests.
 
@@ -181,11 +191,15 @@ async def precreated_session_id(
     yield active.session_id
 
 
-@pytest_asyncio.fixture
-async def http_client(
+@pytest_asyncio.fixture(name="http_client")
+async def fixture_http_client(
     session_manager: SessionManager,
-    precreated_session_id: str,
+    # The precreated_session_id fixture must run before http_client so a
+    # live session exists — its return value (the session id) is unused
+    # here but the fixture dependency enforces the setup ordering.
+    precreated_session_id: str,  # pylint: disable=unused-argument
 ) -> AsyncIterator[httpx.AsyncClient]:
+    """Create an httpx AsyncClient against the FastAPI app."""
     fastapi_app.state.session_manager = session_manager
     transport = ASGITransport(app=fastapi_app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -222,18 +236,19 @@ async def make_stack(
         tmp = tempfile.TemporaryDirectory()
         data_dir = tmp.name
     tp = make_transport_pair()
-    agent = FakeAcpAgent(
-        tp, script=script or [], capabilities=capabilities_opts, store=store
-    )
+    agent = FakeAcpAgent(tp, script=script or [], caps=capabilities_opts, store=store)
     agent.attach()
     _patch_runner_spawn(agent)
     manager = SessionManager(agent_command=["fake"], data_dir=data_dir)
     if tmp is not None:
         # Stash for teardown_stack to clean up only when we own it.
-        manager._test_tmp = tmp  # type: ignore[attr-defined]
+        manager._test_tmp = tmp  # type: ignore[attr-defined]  # pylint: disable=protected-access
     fastapi_app.state.session_manager = manager
     transport = ASGITransport(app=fastapi_app)
     client = httpx.AsyncClient(transport=transport, base_url="http://test")
+    # Enter the context manager manually so the client stays open across
+    # the function boundary — teardown_stack calls aclose().
+    # pylint: disable=unnecessary-dunder-call
     await client.__aenter__()
     return agent, manager, client
 
@@ -241,6 +256,7 @@ async def make_stack(
 async def teardown_stack(
     agent: FakeAcpAgent, manager: SessionManager, client: httpx.AsyncClient
 ) -> None:
+    """Tear down a stack built by ``make_stack``."""
     await client.aclose()
     await manager.shutdown()
     await agent.aclose()

@@ -42,6 +42,8 @@ router = APIRouter()
 
 
 class CreateSessionRequest(BaseModel):
+    """Body for ``POST /ag-ui/sessions`` — create a new conversation."""
+
     cwd: str
     mode: str | None = None
     model: str | None = None
@@ -50,6 +52,8 @@ class CreateSessionRequest(BaseModel):
 
 
 class CreateSessionResponse(BaseModel):
+    """Response for ``POST /ag-ui/sessions``."""
+
     sessionId: str
     modes: list[dict[str, str]] | None = None
     models: list[dict[str, str]] | None = None
@@ -87,7 +91,7 @@ async def create_session(
 
 
 @router.get("/ag-ui/sessions/{session_id}/connect")
-async def connect_session(session_id: str, request: Request, cwd: str | None = None):
+async def connect_session(session_id: str, request: Request, _cwd: str | None = None):
     """Connect to (replay) an existing conversation.
 
     GET (not POST): it's a read-only replay of existing state, no body beyond
@@ -95,10 +99,9 @@ async def connect_session(session_id: str, request: Request, cwd: str | None = N
     the replayed history as a ``MESSAGES_SNAPSHOT`` framed by a synthetic
     ``RUN_STARTED`` / ``RUN_FINISHED`` pair.
 
-    ``cwd`` is optional — the bridge resolves it from its durable
-    ``session_id → cwd`` record (written at create time). A client-supplied
-    ``cwd`` query param is accepted for backward compatibility but ignored
-    in favour of the stored record.
+    ``cwd`` is accepted as a query param for backward compatibility but
+    ignored — the bridge resolves it from its durable ``session_id → cwd``
+    record (written at create time).
     """
     manager = request.app.state.session_manager
     # Resolve cwd from the store so the client doesn't need to resend it.
@@ -139,11 +142,12 @@ async def connect_session(session_id: str, request: Request, cwd: str | None = N
 async def list_sessions(
     request: Request, cwd: str | None = None, cursor: str | None = None
 ) -> dict[str, Any]:
+    """List existing sessions (``session/list``, ACP 0.11)."""
     manager = request.app.state.session_manager
     try:
         result = await manager.list_sessions(cwd=cwd, cursor=cursor)
-    except ListUnsupportedError:
-        raise HTTPException(501, "session/list not supported by this agent")
+    except ListUnsupportedError as exc:
+        raise HTTPException(501, "session/list not supported by this agent") from exc
     sessions = [_serialize_session_info(s) for s in result.sessions]
     response: dict[str, Any] = {
         "sessions": sessions,
@@ -154,15 +158,17 @@ async def list_sessions(
 
 @router.delete("/ag-ui/sessions/{session_id}", status_code=204)
 async def delete_session(session_id: str, request: Request) -> None:
+    """Delete a session (``session/delete``, ACP 0.11)."""
     manager = request.app.state.session_manager
     try:
         await manager.delete_session(session_id)
-    except DeleteUnsupportedError:
-        raise HTTPException(501, "session/delete not supported by this agent")
+    except DeleteUnsupportedError as exc:
+        raise HTTPException(501, "session/delete not supported by this agent") from exc
 
 
 @router.get("/ag-ui/capabilities")
 async def get_capabilities(request: Request) -> dict[str, Any]:
+    """Return the agent's session capabilities."""
     manager = request.app.state.session_manager
     caps = await manager.get_capabilities()
     sc = caps.session_capabilities
@@ -185,7 +191,12 @@ def _serialize_session_info(info: Any) -> dict[str, Any]:
     if hasattr(info, "model_dump"):
         try:
             dump = info.model_dump(by_alias=True, mode="json", exclude_none=True)
-        except Exception:
+        except Exception:  # pylint: disable=broad-exception-caught
+            # Best-effort serialization — a non-standard or corrupt SDK model
+            # shouldn't crash the list endpoint; fall back to a string repr.
+            logger.debug(
+                "session_info model_dump failed; using str fallback", exc_info=True
+            )
             dump = None
     result: dict[str, Any]
     if isinstance(dump, dict):

@@ -5,10 +5,9 @@
 removes the persisted record; ``close`` does not (PLAN3 item 6).
 """
 
-from __future__ import annotations
-
 import pytest
 
+from agui_on_acp.sessions.manager import CwdRecordNotFoundError
 from tests.conftest import make_stack, teardown_stack
 from tests.fake_agent import capabilities
 
@@ -17,6 +16,7 @@ CWD = "/tmp/opencode"
 
 @pytest.mark.asyncio
 async def test_list_sessions_proxies_and_reflects_store():
+    """GET /ag-ui/sessions proxies to the agent and supports cwd filtering."""
     fake, manager, client = await make_stack(capabilities_opts=capabilities(list_=True))
     try:
         fake.store.create(CWD)
@@ -61,6 +61,7 @@ async def test_list_sessions_survives_restart():
 
 @pytest.mark.asyncio
 async def test_list_unsupported_is_501():
+    """Listing when session/list is unsupported returns 501."""
     fake, manager, client = await make_stack(
         capabilities_opts=capabilities(list_=False)
     )
@@ -76,8 +77,6 @@ async def test_delete_removes_cwd_record():
     """DELETE removes the session from the agent's list AND drops the
     bridge's own ``session_id → cwd`` record (so it doesn't accumulate
     rows for sessions that no longer exist)."""
-    from agui_on_acp.sessions.manager import CwdRecordNotFoundError
-
     fake, manager, client = await make_stack(
         capabilities_opts=capabilities(list_=True, delete=True)
     )
@@ -106,6 +105,7 @@ async def test_delete_removes_cwd_record():
 
 @pytest.mark.asyncio
 async def test_delete_unsupported_is_501():
+    """Deleting when session/delete is unsupported returns 501."""
     fake, manager, client = await make_stack(
         capabilities_opts=capabilities(delete=False, list_=True)
     )
@@ -119,6 +119,7 @@ async def test_delete_unsupported_is_501():
 
 @pytest.mark.asyncio
 async def test_capabilities_endpoint_reflects_fake_agent_capabilities():
+    """GET /ag-ui/capabilities reflects the agent's advertised capabilities."""
     caps = capabilities(load_session=True, resume=True, list_=True, delete=True)
     fake, manager, client = await make_stack(capabilities_opts=caps)
     try:

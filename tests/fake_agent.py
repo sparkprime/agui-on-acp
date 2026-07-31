@@ -33,8 +33,6 @@ makes these *integration* tests of the translation layer rather than unit
 tests of the bridge class in isolation.
 """
 
-from __future__ import annotations
-
 import asyncio
 import logging
 import uuid
@@ -42,7 +40,9 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, Union, cast
 
 import acp
-import acp.schema as schema
+from acp import schema
+from acp.meta import AGENT_METHODS
+from acp.utils import normalize_result
 
 from tests.transport import TransportPair
 
@@ -100,12 +100,14 @@ class FakeSessionStore:
         self.sessions: dict[str, StoredSession] = {}
 
     def create(self, cwd: str) -> StoredSession:
+        """Mint a new ``StoredSession`` with an auto-incremented id."""
         sid = f"fake-session-{len(self.sessions) + 1}"
         s = StoredSession(session_id=sid, cwd=cwd)
         self.sessions[sid] = s
         return s
 
     def get(self, session_id: str) -> StoredSession:
+        """Return a stored session or raise ``resource_not_found``."""
         s = self.sessions.get(session_id)
         if s is None or s.deleted:
             raise acp.RequestError.resource_not_found(session_id)
@@ -304,6 +306,7 @@ Script = list[ScriptStep]
 
 
 def text(s: str) -> TextStep:
+    """Create a ``TextStep`` for an agent message delta."""
     return TextStep(s)
 
 
@@ -313,58 +316,72 @@ def user_text(s: str) -> TextStep:
 
 
 def tool_start(tid: str, title: str = "tool", **kw: Any) -> ToolStartStep:
+    """Create a ``ToolStartStep``."""
     return ToolStartStep(tool_call_id=tid, title=title, **kw)
 
 
 def tool_progress(tid: str, **kw: Any) -> ToolProgressStep:
+    """Create a ``ToolProgressStep``."""
     return ToolProgressStep(tool_call_id=tid, **kw)
 
 
 def tool_end(tid: str, **kw: Any) -> ToolEndStep:
+    """Create a ``ToolEndStep``."""
     return ToolEndStep(tool_call_id=tid, **kw)
 
 
 def request_permission(tid: str, **kw: Any) -> RequestPermissionStep:
+    """Create a ``RequestPermissionStep``."""
     return RequestPermissionStep(tool_call_id=tid, **kw)
 
 
 def ext_notification(method: str, **params: Any) -> ExtNotificationStep:
+    """Create an ``ExtNotificationStep``."""
     return ExtNotificationStep(method=method, params=dict(params))
 
 
 def end_turn(stop_reason: schema.StopReason = "end_turn") -> EndTurnStep:
+    """Create an ``EndTurnStep``."""
     return EndTurnStep(stop_reason=stop_reason)
 
 
 def sleep(seconds: float) -> SleepStep:
-    return SleepStep(seconds)
+    """Create a ``SleepStep``."""
+    return SleepStep(seconds=seconds)
 
 
 def config_option_update(options: list[dict[str, Any]]) -> ConfigOptionUpdateStep:
+    """Create a ``ConfigOptionUpdateStep``."""
     return ConfigOptionUpdateStep(config_options=options)
 
 
 def usage(used: int, size: int, **kw: Any) -> UsageStep:
+    """Create a ``UsageStep``."""
     return UsageStep(used=used, size=size, **kw)
 
 
 def session_info(**kw: Any) -> SessionInfoStep:
+    """Create a ``SessionInfoStep``."""
     return SessionInfoStep(**kw)
 
 
 def plan(entries: list[dict[str, Any]]) -> PlanStep:
+    """Create a ``PlanStep``."""
     return PlanStep(entries=entries)
 
 
 def plan_removed(plan_id: str) -> PlanRemovedStep:
+    """Create a ``PlanRemovedStep``."""
     return PlanRemovedStep(plan_id=plan_id)
 
 
-def thought(text: str) -> ThoughtStep:
-    return ThoughtStep(text=text)
+def thought(content: str) -> ThoughtStep:
+    """Create a ``ThoughtStep``."""
+    return ThoughtStep(text=content)
 
 
 def elicitation(**kw: Any) -> ElicitationStep:
+    """Create an ``ElicitationStep``."""
     return ElicitationStep(**kw)
 
 
@@ -412,13 +429,13 @@ class FakeAcpAgent:
         self,
         transport: TransportPair,
         script: Script | None = None,
-        capabilities: schema.AgentCapabilities | None = None,
+        caps: schema.AgentCapabilities | None = None,
         store: FakeSessionStore | None = None,
     ) -> None:
         self.transport = transport
         self.script: Script = list(script or [])
         self.conn: acp.AgentSideConnection | None = None
-        self.capabilities = capabilities
+        self.capabilities = caps
         self.store = store if store is not None else FakeSessionStore()
 
         # Recorded calls
@@ -466,7 +483,11 @@ class FakeAcpAgent:
         """Build the ``AgentSideConnection`` over the agent side of the
         in-process transport. Must be called inside a running event loop.
         """
-        from acp import AgentSideConnection  # deprecated but the bridge uses it
+        # ``AgentSideConnection`` is a deprecated import path (pyright doesn't
+        # see it in acp's stubs) but the runtime exposes it and the bridge
+        # uses the same path.
+        # pylint: disable=no-name-in-module,import-outside-toplevel
+        from acp import AgentSideConnection
 
         # use_unstable_protocol=True so set_session_model (marked unstable in
         # the ACP router) is accepted — models a real agent that supports
@@ -484,13 +505,9 @@ class FakeAcpAgent:
         # route it; register the route here so the fake models that. This
         # is a test-only reach-past-the-SDK; delete once the SDK grows the
         # route upstream.
-        from acp.meta import AGENT_METHODS
-
         raw_conn = getattr(self.conn, "_conn", None)
         router = getattr(raw_conn, "_handler", None)
         if router is not None and hasattr(router, "route_request"):
-            from acp.utils import normalize_result
-
             router.route_request(
                 AGENT_METHODS["session_delete"],
                 schema.DeleteSessionRequest,
@@ -501,6 +518,7 @@ class FakeAcpAgent:
         return self.conn
 
     async def aclose(self) -> None:
+        """Close the agent-side connection."""
         if self.conn is not None:
             await self.conn.close()
             self.conn = None
@@ -508,8 +526,10 @@ class FakeAcpAgent:
     # ── acp.Agent Protocol ──────────────────────────────────────────────
 
     def on_connect(self, conn: Any) -> None:
-        # SDK calls this; nothing to do for the fake.
-        pass
+        """SDK lifecycle callback — no-op for the fake."""
+        # conn is unused but the acp.Agent Protocol requires it and pyright
+        # enforces the parameter name.
+        # pylint: disable=unused-argument
 
     async def initialize(
         self,
@@ -518,6 +538,7 @@ class FakeAcpAgent:
         client_info: Any | None = None,
         **kwargs: Any,
     ) -> schema.InitializeResponse:
+        """Record the call and return the fake's capabilities."""
         self.initialize_calls.append(
             {
                 "protocol_version": protocol_version,
@@ -539,6 +560,7 @@ class FakeAcpAgent:
         mcp_servers: list[Any] | None = None,
         **kwargs: Any,
     ) -> schema.NewSessionResponse:
+        """Record the call, mint a stored session, return the typed response."""
         self.new_session_calls.append(
             {
                 "cwd": cwd,
@@ -571,6 +593,7 @@ class FakeAcpAgent:
         mcp_servers: list[Any] | None = None,
         **kwargs: Any,
     ) -> schema.LoadSessionResponse:
+        """Record the call, replay the stored transcript, return the response."""
         self.load_session_calls.append(
             {
                 "cwd": cwd,
@@ -589,15 +612,16 @@ class FakeAcpAgent:
         return schema.LoadSessionResponse()
 
     async def set_session_mode(
-        self, mode_id: str, session_id: str, **kwargs: Any
+        self, mode_id: str, session_id: str, **_kwargs: Any
     ) -> schema.SetSessionModeResponse:
+        """Record the mode change."""
         self.set_mode_calls.append((session_id, mode_id))
         return schema.SetSessionModeResponse()
 
     async def set_config_option(
-        self, config_id: str, session_id: str, value: str | bool, **kwargs: Any
+        self, config_id: str, session_id: str, value: str | bool, **_kwargs: Any
     ) -> schema.SetSessionConfigOptionResponse:
-        # In ACP 0.11+ the model is a config option with config_id == "model".
+        """Record the config-option change (model is a special config_id)."""
         self.set_config_option_calls.append((session_id, config_id, value))
         if config_id == "model":
             self.set_model_calls.append((session_id, str(value)))
@@ -611,8 +635,9 @@ class FakeAcpAgent:
         prompt: list[Any],
         session_id: str,
         message_id: str | None = None,
-        **kwargs: Any,
+        **_kwargs: Any,
     ) -> schema.PromptResponse:
+        """Record the call and run the scripted session_update sequence."""
         rec = _PromptCall(
             session_id=session_id, prompt=list(prompt), message_id=message_id
         )
@@ -630,19 +655,23 @@ class FakeAcpAgent:
             self.prompt_done.set()
         return schema.PromptResponse(stop_reason=stop_reason)
 
-    async def cancel(self, session_id: str, **kwargs: Any) -> None:
+    async def cancel(self, session_id: str, **_kwargs: Any) -> None:
+        """Record the cancel call."""
         self.cancel_calls.append(session_id)
 
     async def ext_method(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        """Record an extension method call."""
         self.ext_method_calls.append((method, params))
         return {}
 
     async def ext_notification(self, method: str, params: dict[str, Any]) -> None:
+        """Record an extension notification."""
         self.ext_notification_calls.append((method, params))
 
     # Other Agent methods the router may route — provide minimal stubs so
     # an unexpected client request doesn't crash the test; they record too.
     async def list_sessions(self, **kwargs: Any) -> schema.ListSessionsResponse:
+        """Return sessions from the store, optionally filtered by cwd."""
         cwd = kwargs.get("cwd")
         sessions: list[schema.SessionInfo] = []
         for s in self.store.sessions.values():
@@ -654,12 +683,14 @@ class FakeAcpAgent:
         return schema.ListSessionsResponse(sessions=sessions)
 
     async def close_session(
-        self, session_id: str, **kwargs: Any
+        self, session_id: str, **_kwargs: Any
     ) -> schema.CloseSessionResponse:
+        """Record the close call."""
         self.close_session_calls.append(session_id)
         return schema.CloseSessionResponse()
 
-    async def fork_session(self, **kwargs: Any) -> schema.ForkSessionResponse:
+    async def fork_session(self, **_kwargs: Any) -> schema.ForkSessionResponse:
+        """Return a forked session with a new id."""
         return schema.ForkSessionResponse(session_id=str(uuid.uuid4()))
 
     async def resume_session(
@@ -670,6 +701,7 @@ class FakeAcpAgent:
         mcp_servers: list[Any] | None = None,
         **kwargs: Any,
     ) -> schema.ResumeSessionResponse:
+        """Record the call and validate the session id against the store."""
         self.resume_session_calls.append(
             {
                 "session_id": session_id,
@@ -685,8 +717,9 @@ class FakeAcpAgent:
         return schema.ResumeSessionResponse()
 
     async def delete_session(
-        self, session_id: str, **kwargs: Any
+        self, session_id: str, **_kwargs: Any
     ) -> schema.DeleteSessionResponse:
+        """Record the call and mark the stored session as deleted."""
         self.delete_session_calls.append(session_id)
         s = self.store.sessions.get(session_id)
         if s is not None:
@@ -694,8 +727,9 @@ class FakeAcpAgent:
         return schema.DeleteSessionResponse()
 
     async def authenticate(
-        self, method_id: str, **kwargs: Any
+        self, _method_id: str, **_kwargs: Any
     ) -> schema.AuthenticateResponse:
+        """Stub — return an empty AuthenticateResponse."""
         return schema.AuthenticateResponse()
 
     # ── Script runner ───────────────────────────────────────────────────

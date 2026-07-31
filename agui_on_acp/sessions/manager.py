@@ -28,6 +28,7 @@ persistence) is what gives the id continuity.
 """
 
 import asyncio
+import base64
 import logging
 import time
 import uuid
@@ -40,7 +41,8 @@ import acp
 from agui_on_acp.agent.acp_protocol import AcpProtocol
 from agui_on_acp.agent.runner import AgentRunner
 from agui_on_acp.agui.events import AguiEvent
-from agui_on_acp.bridge.acp_to_agui import AcpToAguiBridge
+from agui_on_acp.bridge.acp_to_agui import AcpToAguiBridge, serialize_config_options
+from agui_on_acp.config import data_dir as _data_dir_config
 from agui_on_acp.sessions.store import SessionStore
 
 logger = logging.getLogger(__name__)
@@ -155,6 +157,12 @@ class ActiveSession:
 
 
 class SessionManager:
+    """Orchestrates ACP session lifecycle (create / connect / prompt / resume).
+
+    Holds an in-memory ``session_id → ActiveSession`` table and coordinates
+    subprocess spawn, protocol initialisation, and run/permission flows.
+    """
+
     def __init__(
         self,
         agent_command: list[str] | None = None,
@@ -169,8 +177,6 @@ class SessionManager:
         # read by connect/attach (so a client resuming by threadId alone
         # doesn't need to resend cwd), removed on delete_session. ``data_dir``
         # defaults to the configured base; tests inject a temp dir.
-        from agui_on_acp.config import data_dir as _data_dir_config
-
         base = Path(data_dir) if data_dir is not None else Path(_data_dir_config())
         self._store = SessionStore(base)
 
@@ -437,6 +443,7 @@ class SessionManager:
     async def list_sessions(
         self, cwd: str | None = None, cursor: str | None = None
     ) -> acp.schema.ListSessionsResponse:
+        """List sessions, preferring a live subprocess for the cwd."""
         caps = await self.get_capabilities()
         sc = caps.session_capabilities
         if sc is None or not sc.list:
@@ -452,6 +459,7 @@ class SessionManager:
         return await self._probe_call(lambda p: p.list_sessions(cwd=cwd, cursor=cursor))
 
     async def delete_session(self, session_id: str) -> None:
+        """Delete a session from the agent and drop the bridge's cwd record."""
         caps = await self.get_capabilities()
         sc = caps.session_capabilities
         if sc is None or not sc.delete:
@@ -499,8 +507,12 @@ class SessionManager:
         self,
         task_id: str,
         input_data: dict[str, Any],
-        config: dict[str, Any] | None = None,
     ) -> str:
+        """Start a new run on ``task_id``: build the prompt, emit RUN_STARTED.
+
+        Returns the generated ``run_id``. The prompt task runs in the
+        background and emits AG-UI events into the run's queue.
+        """
         active = self._get_active(task_id)
         active.touch()
         run_id = str(uuid.uuid4())
@@ -530,8 +542,6 @@ class SessionManager:
                 prompt.append({"type": "image", "data": att_data, "mimeType": att_mime})
             else:
                 try:
-                    import base64
-
                     decoded = base64.b64decode(att_data).decode(
                         "utf-8", errors="replace"
                     )
@@ -541,7 +551,9 @@ class SessionManager:
                             "text": f"[File: {att_name}]\n```\n{decoded}\n```",
                         }
                     )
-                except Exception:
+                except (ValueError, UnicodeDecodeError):
+                    # base64 decode or utf-8 decode failed — surface a
+                    # readable placeholder instead of crashing the run.
                     prompt.append(
                         {
                             "type": "text",
@@ -560,6 +572,7 @@ class SessionManager:
     async def _run_prompt(
         self, active: ActiveSession, run_id: str, prompt: list[dict[str, Any]]
     ) -> None:
+        """Background task: send the prompt and emit RUN_FINISHED/ RUN_ERROR."""
         queue = active.event_queues.get(run_id)
         if queue is None:
             return
@@ -567,13 +580,14 @@ class SessionManager:
             await active.protocol.prompt(active.session_id, prompt)
             if active.bridge.run_id is not None:
                 active.bridge.finish_run()
-        except Exception as exc:
-            logger.error("Run %s failed: %s", run_id, exc)
-            active.bridge.error_run(str(exc))
+        except Exception:  # pylint: disable=broad-exception-caught
+            logger.exception("Run %s failed", run_id)
+            active.bridge.error_run(f"run {run_id} failed")
 
     def get_event_queue(
         self, task_id: str, run_id: str
     ) -> asyncio.Queue[AguiEvent] | None:
+        """Return the event queue for a run, or None if not found."""
         active = self._sessions.get(task_id)
         if active is None:
             return None
@@ -619,6 +633,7 @@ class SessionManager:
         return run_id
 
     async def cancel_run(self, task_id: str) -> None:
+        """Cancel a run: resolve parked futures as cancelled, send ``session/cancel``."""
         active = self._get_active(task_id)
         # Resolve any parked permission futures as cancelled so
         # request_permission unblocks and the prompt task unwinds instead of
@@ -627,12 +642,14 @@ class SessionManager:
         await active.protocol.cancel(active.session_id)
 
     async def set_mode(self, task_id: str, mode_id: str) -> Any:
+        """Set the agent's mode for a session."""
         active = self._get_active(task_id)
         result = await active.protocol.set_mode(active.session_id, mode_id)
         active.current_mode_id = mode_id
         return result
 
     async def set_model(self, task_id: str, model_id: str) -> None:
+        """Set the agent's model for a session."""
         active = self._get_active(task_id)
         await active.protocol.set_model(active.session_id, model_id)
 
@@ -645,11 +662,13 @@ class SessionManager:
     async def execute_command(
         self, task_id: str, command: str, args: dict[str, Any] | None = None
     ) -> None:
+        """Send a ``session/command`` extension call to the agent."""
         active = self._get_active(task_id)
         args_str = args.get("args", "") if args else ""
         await active.protocol.execute_command(active.session_id, command, args_str)
 
     async def stop(self, task_id: str) -> bool:
+        """Kill a session's subprocess; return False if it was already gone."""
         active = self._sessions.pop(task_id, None)
         if active:
             await active.runner.kill()
@@ -657,17 +676,20 @@ class SessionManager:
         return False
 
     async def destroy(self, task_id: str) -> None:
+        """Remove and kill a session (no-op if already gone)."""
         active = self._sessions.pop(task_id, None)
         if active:
             await active.runner.kill()
 
     async def shutdown(self) -> None:
+        """Destroy all active sessions (used on app shutdown)."""
         await asyncio.gather(
             *(self.destroy(tid) for tid in list(self._sessions.keys())),
             return_exceptions=True,
         )
 
     def _get_active(self, task_id: str) -> ActiveSession:
+        """Return the live ``ActiveSession`` for ``task_id`` or raise ``KeyError``."""
         active = self._sessions.get(task_id)
         if active is None:
             raise KeyError(f"No active session: {task_id}")
@@ -718,26 +740,35 @@ async def _apply_session_options(
     model: str | None,
     config_options: dict[str, Any] | None,
 ) -> None:
-    """Apply mode/model/config_options after a session is created/resumed."""
+    """Apply mode/model/config_options after a session is created/resumed.
+
+    Each set_* call is best-effort — a failure (unsupported mode, invalid
+    value) is non-fatal so the broad ``except Exception`` is intentional;
+    ``exc_info=True`` ensures the full trace is logged without aborting the
+    remaining options.
+    """
     if mode and mode != "default":
         try:
             await protocol.set_mode(session_id, mode)
-        except Exception as exc:
-            logger.warning("Failed to set mode %s: %s", mode, exc)
+        except Exception:  # pylint: disable=broad-exception-caught
+            logger.warning("Failed to set mode %s", mode, exc_info=True)
     if model:
         try:
             await protocol.set_model(session_id, model)
-        except Exception as exc:
-            logger.warning("Failed to set model %s: %s", model, exc)
+        except Exception:  # pylint: disable=broad-exception-caught
+            logger.warning("Failed to set model %s", model, exc_info=True)
     if config_options:
         for config_id, value in config_options.items():
             if config_id == "model":
                 continue
             try:
                 await protocol.set_config_option(session_id, config_id, value)
-            except Exception as exc:
+            except Exception:  # pylint: disable=broad-exception-caught
                 logger.warning(
-                    "Failed to set config option %s=%s: %s", config_id, value, exc
+                    "Failed to set config option %s=%s",
+                    config_id,
+                    value,
+                    exc_info=True,
                 )
 
 
@@ -749,9 +780,6 @@ def _normalize_config_options(options: Any) -> list[dict[str, Any]] | None:
     so the caller can distinguish "empty list" from "absent"."""
     if not options:
         return None
-    # Import lazily to avoid a cycle at import time.
-    from agui_on_acp.bridge.acp_to_agui import serialize_config_options
-
     return serialize_config_options(options)
 
 

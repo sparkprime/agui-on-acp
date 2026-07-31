@@ -16,8 +16,6 @@ a real OS process. The only code NOT exercised here is
 translation.
 """
 
-from __future__ import annotations
-
 import asyncio
 from asyncio import transports as aio_transports
 from typing import Any
@@ -39,29 +37,36 @@ class _PipeTransport(aio_transports.WriteTransport):
         self._closing = False
 
     def write(self, data: bytes) -> None:  # type: ignore[override]
+        """Feed ``data`` into the paired reader (unless closing)."""
         if self._closing:
             return
         self._peer.feed_data(data)
 
     def write_eof(self) -> None:  # type: ignore[override]
+        """Signal end-of-stream to the paired reader."""
         if not self._peer.at_eof():
             self._peer.feed_eof()
 
     def can_write_eof(self) -> bool:  # type: ignore[override]
+        """Always True — the in-memory pipe supports EOF."""
         return True
 
     def close(self) -> None:  # type: ignore[override]
+        """Close the transport and feed EOF to the peer."""
         self._closing = True
         if not self._peer.at_eof():
             self._peer.feed_eof()
 
     def is_closing(self) -> bool:  # type: ignore[override]
+        """Return True if ``close()`` has been called."""
         return self._closing
 
     def abort(self) -> None:  # type: ignore[override]
+        """Abruptly close (same as ``close`` for this transport)."""
         self.close()
 
-    def get_extra_info(self, name: str, default: Any = None) -> Any:  # type: ignore[override]
+    def get_extra_info(self, _name: str, default: Any = None) -> Any:  # type: ignore[override]
+        """Return ``default`` — no extra info available on this transport."""
         return default
 
 

@@ -10,6 +10,8 @@ from typing import Any
 
 import acp
 import acp.schema
+from acp.meta import AGENT_METHODS
+from acp.utils import request_model_from_dict
 
 logger = logging.getLogger(__name__)
 
@@ -26,15 +28,18 @@ class AcpProtocol:
 
     @property
     def conn(self) -> acp.ClientSideConnection:
+        """Return the live connection, raising if the agent hasn't spawned."""
         if self._conn is None:
             raise RuntimeError("AcpProtocol: connection not set (agent not spawned)")
         return self._conn
 
     @conn.setter
     def conn(self, value: acp.ClientSideConnection) -> None:
+        """Set the connection (called by the runner after spawn)."""
         self._conn = value
 
     async def initialize(self) -> Any:
+        """Send the ``initialize`` request and log the agent's identity."""
         self._log.info("initializing connection...")
         result = await self.conn.initialize(
             protocol_version=acp.PROTOCOL_VERSION,
@@ -51,6 +56,7 @@ class AcpProtocol:
     async def new_session(
         self, cwd: str, mcp_servers: list[dict[str, Any]] | None = None
     ) -> Any:
+        """Send ``session/new`` and return the typed response."""
         self._log.info("new session (cwd=%s)", cwd)
         result = await self.conn.new_session(cwd=cwd, mcp_servers=mcp_servers or [])
         session_id = getattr(result, "session_id", result)
@@ -60,6 +66,7 @@ class AcpProtocol:
     async def load_session(
         self, session_id: str, cwd: str, mcp_servers: list[dict[str, Any]] | None = None
     ) -> acp.schema.LoadSessionResponse:
+        """Send ``session/load`` to replay an existing session's history."""
         self._log.info("Loading session %s (cwd=%s)", session_id, cwd)
         return await self.conn.load_session(
             session_id=session_id, cwd=cwd, mcp_servers=mcp_servers or []
@@ -68,6 +75,7 @@ class AcpProtocol:
     async def resume_session(
         self, session_id: str, cwd: str, mcp_servers: list[dict[str, Any]] | None = None
     ) -> acp.schema.ResumeSessionResponse:
+        """Send ``session/resume`` to re-attach to an existing session."""
         self._log.info("Resuming session %s (cwd=%s)", session_id, cwd)
         return await self.conn.resume_session(
             session_id=session_id, cwd=cwd, mcp_servers=mcp_servers or []
@@ -76,22 +84,24 @@ class AcpProtocol:
     async def list_sessions(
         self, cwd: str | None = None, cursor: str | None = None
     ) -> acp.schema.ListSessionsResponse:
+        """Send ``session/list`` (ACP 0.11)."""
         self._log.info("Listing sessions (cwd=%s, cursor=%s)", cwd, cursor)
         return await self.conn.list_sessions(cwd=cwd, cursor=cursor)
 
     async def delete_session(self, session_id: str) -> acp.schema.DeleteSessionResponse:
+        """Send ``session/delete`` (ACP 0.11)."""
         self._log.info("Deleting session %s", session_id)
         return await _request_delete_session(self.conn, session_id)
 
     async def prompt(self, session_id: str, prompt: list[dict[str, Any]]) -> Any:
+        """Send ``session/prompt`` with text/image content blocks."""
         self._log.debug("Sending prompt to session %s", session_id)
-        from acp.schema import ImageContentBlock, TextContentBlock
 
         content_blocks: list[Any] = []
         for item in prompt:
             if item.get("type") == "image":
                 content_blocks.append(
-                    ImageContentBlock(
+                    acp.schema.ImageContentBlock(
                         type="image",
                         data=item.get("data", ""),
                         mime_type=item.get("mimeType", "image/png"),
@@ -99,7 +109,7 @@ class AcpProtocol:
                 )
             else:
                 content_blocks.append(
-                    TextContentBlock(type="text", text=item.get("text", ""))
+                    acp.schema.TextContentBlock(type="text", text=item.get("text", ""))
                 )
         result = await self.conn.prompt(prompt=content_blocks, session_id=session_id)
         return result
@@ -116,6 +126,7 @@ class AcpProtocol:
         await self.conn.cancel(session_id=session_id)
 
     async def set_mode(self, session_id: str, mode_id: str) -> Any:
+        """Send ``session/set_mode``."""
         self._log.info("Setting mode %s for session %s", mode_id, session_id)
         return await self.conn.set_session_mode(mode_id=mode_id, session_id=session_id)
 
@@ -149,6 +160,7 @@ class AcpProtocol:
     async def execute_command(
         self, session_id: str, command: str, args: str | None = None
     ) -> Any:
+        """Send a ``session/command`` extension method call."""
         self._log.info("Executing command /%s for session %s", command, session_id)
         name = command.lstrip("/")
         return await self.conn.ext_method(
@@ -174,9 +186,6 @@ async def _request_delete_session(
     Fragile across SDK versions by design — delete once the SDK grows the
     typed method and ``AcpProtocol.delete_session`` can call it directly.
     """
-    from acp.meta import AGENT_METHODS
-    from acp.utils import request_model_from_dict
-
     raw_conn = getattr(conn, "_conn", conn)
     return await request_model_from_dict(
         raw_conn,

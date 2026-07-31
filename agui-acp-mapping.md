@@ -13,14 +13,48 @@ for places where the translation is **not 1:1** and where the bridge must
 
 ## Conventions
 
-- **AG-UI → ACP** rows describe what the client sends (HTTP `POST /ag-ui`
-  body fields + SSE-stream lifecycle) and what ACP call the bridge issues.
+- **AG-UI → ACP** rows describe what the client sends (HTTP body fields +
+  SSE-stream lifecycle) and what ACP call the bridge issues.
 - **ACP → AG-UI** rows describe what the agent emits and what AG-UI event
   the bridge synthesises.
-- **State held** marks where the bridge keeps something in memory to make
-  a non-1:1 translation work; these are the load-bearing parts of the proxy.
+- **State held** marks where the bridge keeps something in memory (or on
+  disk) to make a non-1:1 translation work; these are the load-bearing
+  parts of the proxy.
 - **ACP 0.11** tags rows whose mapping changed or whose feature was added
   in `agent-client-protocol` 0.11.
+
+---
+
+## The three conversation operations
+
+The bridge splits the AG-UI conversation lifecycle into three explicit
+operations, each backed by a distinct ACP call. This is the central design
+decision; every mapping below respects it.
+
+| Operation | Endpoint | ACP call | Notes |
+|---|---|---|---|
+| **Create** | `POST /ag-ui/sessions` | `session/new` | Spawns a subprocess, mints a fresh `session_id`. The only endpoint that starts a conversation. `cwd` is required (the one genuinely client-decided value). |
+| **Connect** | `GET /ag-ui/sessions/{id}/connect` | `session/load` | Replays the existing transcript as a `MESSAGES_SNAPSHOT`. Spawns a short-lived subprocess for the replay; the bridge's `cwd` record (see Persistent State) supplies `cwd` — the client doesn't resend it. |
+| **Prompt** | `POST /ag-ui` | `session/prompt` (after `session/resume` or reuse of a live session) | **Attach-only.** Never calls `session/new` or `session/load`. If a live `ActiveSession` exists for the `threadId`, reuses it (no ACP call). Otherwise calls `session/resume` — and if resume is unsupported or the id is dead, yields a hard error (409/404), never a silent fallback to create. |
+
+Plus the management side: `GET /ag-ui/sessions` (`session/list`),
+`DELETE /ag-ui/sessions/{id}` (`session/delete`), and
+`GET /ag-ui/capabilities`.
+
+### Error model
+
+Pre-stream failures — anything rejected before an SSE stream opens
+(unknown session id, unsupported capability, cwd not allowed, no user
+message, resume with no pending interrupt) — return plain JSON
+`{"error": "..."}` with an appropriate HTTP status code
+(400/403/404/409/501). No `text/event-stream` content type, no
+`RUN_ERROR` event; a non-SSE content type immediately signals "this isn't
+a stream."
+
+Mid-stream failures — errors that occur after a 200 +
+`text/event-stream` has started (e.g. the agent's `prompt()` raises
+mid-turn) — are surfaced as `RUN_ERROR` SSE events on the already-opened
+stream, where the client is already committed to parsing SSE.
 
 ---
 
@@ -30,26 +64,25 @@ for places where the translation is **not 1:1** and where the bridge must
 
 | AG-UI input | ACP call | Notes |
 |---|---|---|
-| `POST /ag-ui` (fresh, with `messages`) | `session/new` (or `session/load` if `forwardedProps.resumeSessionId`) then `session/prompt` | The run *is* the prompt. AG-UI has no separate "create session" step — the first run for a `threadId` implicitly spawns the agent and creates the ACP session. **State held:** the bridge keeps an `ActiveSession` keyed by `threadId` so the *second* run on the same thread reuses the spawned subprocess instead of respawning. |
-| `POST /ag-ui` with `resume[]` (non-empty) | no new ACP call — resolves a parked `request_permission` Future | The AG-UI client never calls `session/prompt` again on resume; it signals "user decided". The bridge routes the resume entry to `bridge.resolve_permission(interruptId, …)`, which unblocks the *original* `session/prompt` task that was parked mid-turn. **1 ACP turn ↔ N+1 AG-UI runs** when N permission points are hit. |
+| `POST /ag-ui` (fresh, with `messages`) | `session/resume` (or no call if a live `ActiveSession` already exists for the thread) then `session/prompt` | Attach-only — never creates or loads. The caller MUST have created a session first via `POST /ag-ui/sessions`. **State held:** the bridge keeps an `ActiveSession` keyed by `session_id` so the second run on the same thread reuses the spawned subprocess instead of respawning. |
+| `POST /ag-ui` with `resume[]` (non-empty) | no new ACP call — resolves a parked `request_permission` / `create_elicitation` Future | The AG-UI client never calls `session/prompt` again on resume; it signals "user decided". The bridge routes the resume entry to `bridge.resolve_interrupt(interruptId, …)`, which unblocks the *original* `session/prompt` task that was parked mid-turn. **1 ACP turn ↔ N+1 AG-UI runs** when N permission points are hit. |
 | Client TCP disconnect mid-SSE | `session/cancel` | AG-UI has no explicit cancel verb. The bridge detects disconnect as `CancelledError` in the SSE drain and calls `manager.cancel_run` → `session/cancel` + resolves any parked permission Futures as `cancelled`. |
 
 ### `RunAgentInput` fields → ACP
 
 | AG-UI field | ACP effect | Notes |
 |---|---|---|
-| `threadId` | ACP `session_id` (indirectly) | The bridge uses `threadId` as its own `task_id`; the ACP `session_id` is a separate UUID returned by `session/new`. They are **not** the same value. **State held:** `ActiveSession.{task_id, agent_session_id}` mapping. |
+| `threadId` | ACP `session_id` (directly) | `threadId === session_id` — one id, not two. The bridge uses it as the key into `ActiveSession` and the durable `cwd` store. |
 | `runId` | ignored | AG-UI lets the client propose a run id; the bridge ignores it and generates its own UUID per run (so it can rotate run ids across suspend/resume). |
 | `messages[-1].content` | `session/prompt` `prompt[0] = {type:"text", text:…}` | Only the **last** user message is forwarded; AG-UI's full message history is **not** replayed to ACP (the agent keeps its own session history). Attachments are base64-decoded and inlined as text blocks. |
 | `tools` | ignored | AG-UI lets the client declare available tools; ACP agents own their own tool set, so this is dropped. |
 | `state` | ignored | No ACP equivalent. |
 | `context` | ignored | No ACP equivalent. |
-| `forwardedProps.cwd` | `session/new` / `session/load` `cwd` | Drives the agent's working directory. |
-| `forwardedProps.resumeSessionId` | selects `session/load` vs `session/new` | If set, the bridge calls `session/load` with the given id instead of creating a fresh session. |
-| `forwardedProps.mode` | `session/set_mode` (`modeId`) | Issued once, after `session/new`/`load`, before the first prompt. Skipped if the value is the placeholder `"default"`. |
-| `forwardedProps.model` | **ACP 0.11:** `session/set_config_option` (`config_id="model"`) | Renamed in 0.11: the model is no longer its own method (`session/set_model` was removed); it is now one config option among many. The bridge hard-codes `config_id="model"`. |
-| `forwardedProps.agentCommand` | `AgentRunner` spawn args | Per-request override of the binary spawned (default from `--agent-command`). Only honoured on the *first* run for a thread (the subprocess is already running afterwards). |
-| `forwardedProps.mcpServers` | `session/new` / `session/load` `mcp_servers` | The AG-UI `{name: {type, url?, command?, …}}` dict is coerced into ACP's `McpServer` schema: the dict key fills `name`, and `headers` defaults to `[]` for http/sse servers (ACP requires both). Anything already conforming passes through unchanged. |
+| `forwardedProps.mcpServers` | `session/resume` `mcp_servers` | The AG-UI `{name: {type, url?, command?, …}}` dict is coerced into ACP's `McpServer` schema: the dict key fills `name`, and `headers` defaults to `[]` for http/sse servers (ACP requires both). Anything already conforming passes through unchanged. |
+| `forwardedProps.cwd` | ignored | `cwd` is resolved from the bridge's durable `session_id → cwd` record (written at create time). The client no longer needs to resend it; if sent, it is silently ignored in favour of the stored record. |
+| ~~`forwardedProps.resumeSessionId`~~ | (deleted) | No longer read. Connect (the operation that calls `session/load`) is now `GET .../connect`, not a `POST /ag-ui` flag. |
+| ~~`forwardedProps.agentCommand`~~ | (deleted) | Per-request agent-command override was removed; the agent command is server-config only (`--agent-command` / `AGUI_ON_ACP_AGENT_COMMAND`). |
+| ~~`forwardedProps.mode`~~ / ~~`forwardedProps.model`~~ / ~~`forwardedProps.configOptions`~~ | moved to `POST /ag-ui/sessions` body | Mode/model/configOptions are now applied at Create time, not on the prompt path. |
 | `resume[].interruptId` | resolves parked Future keyed by the same id | The id is `=== ACP tool_call_id === AG-UI toolCallId`. One correlation key, three names. |
 | `resume[].status="resolved"` + `payload` | `AllowedOutcome{optionId: payload, outcome:"selected"}` | The `payload` may be a string, a `{optionId}` dict, or null (defaults to `"once"`). **Not 1:1:** the AG-UI payload is normalised to ACP's `optionId` field. |
 | `resume[].status="cancelled"` | `DeniedOutcome{outcome:"cancelled"}` | AG-UI "cancelled" → ACP "cancelled". |
@@ -69,21 +102,21 @@ for places where the translation is **not 1:1** and where the bridge must
 | `CurrentModeUpdate` | `CUSTOM` (`name="agent:mode_update"`) | Renamed. |
 | `AvailableCommandsUpdate` | `CUSTOM` (`name="agent:commands_available"`) | Renamed. |
 | `NewSessionResponse.modes` / `LoadSessionResponse.modes` | `STATE_SNAPSHOT` (`{modes, currentModeId}`) emitted once after `start_run` | **State held:** the modes are read out of the session-create response and stashed on `ActiveSession.modes`, then emitted as a snapshot *after* the run's queue is attached (emitting earlier drops them). |
-| `NewSessionResponse.models` (legacy) / `.availableModels` | `STATE_SNAPSHOT` (`{models}`) | Same deferred-snapshot pattern. |
-| **ACP 0.11:** `NewSessionResponse.configOptions` | `STATE_SNAPSHOT` (`{configOptions}`) | Read out of the session-create response and stashed on `ActiveSession.config_options`, then emitted in the same post-`start_run` snapshot as `modes`/`models`. Each option is serialised to `{id, name, description?, category?, currentValue, type, options?}` (select options carry `{value, name, description?}`); `_meta` is dropped. |
+| **ACP 0.11:** `NewSessionResponse.configOptions` | `STATE_SNAPSHOT` (`{configOptions}`) | Read out of the session-create response and stashed on `ActiveSession.config_options`, then emitted in the same post-`start_run` snapshot as `modes`. Each option is serialised to `{id, name, description?, category?, currentValue, type, options?}`; `_meta` is dropped. |
 | **ACP 0.11:** `ConfigOptionUpdate` | `STATE_SNAPSHOT` (`{configOptions}`) | The notification carries the full set, so this is a replace not a patch — a fresh `STATE_SNAPSHOT` is emitted on every update. |
 | **ACP 0.11:** `UsageUpdate` | `CUSTOM` (`name="agent:usage"`, `value={used, size, cost?}`) | `cost` (when present) is `{amount, currency}`. Clients render a token/cost meter; dedupe upstream. |
 | **ACP 0.11:** `SessionInfoUpdate` | `CUSTOM` (`name="agent:session_info"`, `value={title?, updatedAt?}`) | Carries `title` and `updatedAt`; useful for titling the conversation thread. |
 | **ACP 0.11:** `AgentPlanUpdate` / `AgentPlanContentUpdate` / `AgentPlanRemovedUpdate` | `CUSTOM` (`agent:plan` / `agent:plan_update` / `agent:plan_removed`) | Each variant maps to a `CUSTOM` whose `value` is the plan payload verbatim (`{entries}` / the discriminated plan content / `{id}`). Clients that don't render plans ignore them. |
 | **ACP 0.11:** `AgentThoughtChunk` | `CUSTOM` (`name="agent:thought"`, `value={delta}`) | Agent reasoning streamed as thought deltas; the text message stream is kept clean so clients decide whether to surface reasoning. |
-| `UserMessageChunk` | (dropped) | Echo of the user's own message; not needed (AG-UI client already has it). |
+| `UserMessageChunk` | (dropped in live mode) | In live mode: echo of the user's own message; not needed (AG-UI client already has it). **During replay** (connect): coalesced into the `MESSAGES_SNAPSHOT` as a `role="user"` message (see next row). |
+| **replay** (any `session/update` during `session/load`) | `MESSAGES_SNAPSHOT` (one event) | The entire historical `session/update` stream delivered during `session/load` is coalesced into a single `MESSAGES_SNAPSHOT` event (AG-UI's "replace the whole message list" operation). The bridge redirects its coalescing state machine — agent/user text → `SnapshotMessage{role, content}`, tool calls → `SnapshotMessage{role:"assistant", toolCalls}`, tool results → `SnapshotMessage{role:"tool", toolCallId}` — instead of emitting deltas. Framed by a synthetic `RUN_STARTED`/`RUN_FINISHED` pair so the SSE stream has normal start/end markers. |
 
 ### Permission flow (the big impedance mismatch)
 
 | ACP side | AG-UI side | Notes |
 |---|---|---|
 | `session/request_permission` (a **blocking RPC** the agent calls mid-prompt) | `RUN_FINISHED{outcome:{type:"interrupt", interrupts:[…]}}` then SSE stream **closes** | **Inverted control flow.** ACP blocks; AG-UI ends the run. The bridge reconciles this by parking an `asyncio.Future` and suspending the prompt task at `await future`. **State held:** `_permission_futures: {call_id → Future}`, `_permission_timers: {call_id → TimerHandle}`. |
-| (prompt task parked, no ACP traffic) | new `POST /ag-ui` with `resume[]` | The client decides; the bridge routes the resume entry to `resolve_permission(call_id, …)` which sets the Future's result, waking the parked prompt task. |
+| (prompt task parked, no ACP traffic) | new `POST /ag-ui` with `resume[]` | The client decides; the bridge routes the resume entry to `resolve_interrupt(call_id, …)` which sets the Future's result, waking the parked prompt task. |
 | `AllowedOutcome` / `DeniedOutcome` returned from `request_permission` | (no separate event) | The outcome is folded into the resumed run's event stream — the prompt task continues emitting into the *new* SSE stream. **State held:** `attach_resume_queue` swaps `_queue` to the new run's queue **without** clearing `_open_tool_calls` (the tool call that triggered the permission is still open and continues across the suspend boundary). |
 | (no resume within `PERMISSION_TTL_SECONDS`) | (no event) | **State held:** a `loop.call_later` TTL timer resolves the Future as `cancelled` so the prompt task unwinds instead of leaking the subprocess. The same deadline is published as `Interrupt.expiresAt` so the client's own expiry guard agrees with the server's. |
 
@@ -110,8 +143,8 @@ for places where the translation is **not 1:1** and where the bridge must
 
 | Direction | Mechanism | Status |
 |---|---|---|
-| Server → client (advertise options) | `STATE_SNAPSHOT` with `modes` / `models` / `currentModeId` / `configOptions` | Works for both the legacy `NewSessionResponse.modes`/`.models` fields and the ACP 0.11 `configOptions` field (read at session-create and re-emitted on `ConfigOptionUpdate` notifications). |
-| Client → server (select option) | `forwardedProps.model` → `session/set_config_option(config_id="model")`; `forwardedProps.configOptions` (a `{config_id: value}` dict) → `set_config_option` for each at session-create time | Works at session-create time. |
+| Server → client (advertise options) | `STATE_SNAPSHOT` with `modes` / `models` / `currentModeId` / `configOptions` | Read at Create time from `session/new`'s response, stashed on `ActiveSession`, then emitted as a snapshot after `start_run` attaches the run's queue. Re-emitted on `ConfigOptionUpdate` notifications mid-turn. |
+| Client → server (select option at create) | `POST /ag-ui/sessions` body (`mode`, `model`, `configOptions`) → `session/set_mode` / `set_config_option` | Applied once at Create, before the first prompt. |
 | Mid-session config change | `POST /ag-ui/config` (bridge extension) → `session/set_config_option` per option | AG-UI's `POST /ag-ui` is always a fresh run or a resume; the bridge exposes a separate `POST /ag-ui/config` endpoint (`{threadId, configOptions}`) so clients can switch models / toggle options mid-session without contorting the run contract. Not part of the AG-UI standard. |
 
 ---
@@ -121,8 +154,7 @@ for places where the translation is **not 1:1** and where the bridge must
 | AG-UI name | ACP name | Relationship |
 |---|---|---|
 | `runId` | (none) | bridge-generated UUID, rotated per AG-UI run (so a suspended/resumed turn spans 2+ run ids) |
-| `taskId` | `session_id` | **not equal** — task_id is the bridge's own key; session_id comes from `session/new` |
-| `threadId` | (none) | bridge sets `threadId === taskId` (AG-UI requires it) |
+| `threadId` | `session_id` | **equal** — one id, collapsed from the old two-id (`taskId` vs `agent_session_id`) split. The same value keys the `ActiveSession`, the durable `cwd` store, and every ACP session-scoped call. |
 | `TOOL_CALL_START.toolCallId` | `ToolCallStart.tool_call_id` | equal |
 | `resume[].interruptId` | `request_permission` call_id | **equal** — the single correlation key, also reused as `Interrupt.id` and `Interrupt.toolCallId` |
 | `resume[].payload` | `AllowedOutcome.optionId` | normalised (string / `{optionId}` / null → `"once"`) |
@@ -135,7 +167,9 @@ for places where the translation is **not 1:1** and where the bridge must
 
 | State | Lifetime | Why it's needed |
 |---|---|---|
-| `ActiveSession` (`task_id`, `agent_session_id`, `runner`, `protocol`, `bridge`, `modes`, `models`, `current_mode_id`) | per thread, in-memory only | AG-UI `threadId` ↔ ACP `session_id` are different ids; the agent subprocess must persist across runs on the same thread. |
+| `ActiveSession` (`session_id`, `cwd`, `runner`, `protocol`, `bridge`, `modes`, `models`, `current_mode_id`, `config_options`, `last_active_at`) | per session, in-memory | The agent subprocess must persist across runs on the same thread. `session_id` is the single id for both AG-UI and ACP. |
+| `SessionStore` (`session_id → cwd`, on disk) | durable, survives restart | Written at Create so Connect/Prompt can resolve `cwd` without the client resending it; removed on Delete. |
+| `SessionManager._capabilities` | process lifetime (cached after first probe) | The bridge needs to know what the agent supports (load/resume/list/delete) before any session is created (e.g. `GET /ag-ui/capabilities`). |
 | `bridge._current_message_id`, `_has_open_message` | per run | ACP has no message start/end; the bridge synthesises them. |
 | `bridge._open_tool_calls: set[str]` | per run (and across suspend/resume) | Tracks which tool calls still need a `TOOL_CALL_END`/`RESULT` either at turn end or on resume. Cleared on `start_run`, **preserved** on `attach_resume_queue`. |
 | `bridge._permission_futures: {call_id → Future}` | per parked permission | Bridges ACP's blocking `request_permission` to AG-UI's end-then-resume flow. |
@@ -143,11 +177,13 @@ for places where the translation is **not 1:1** and where the bridge must
 | `bridge._pending_notifications: list[(method, params)]` | session-level, drained on first run | Buffers `ext_notification`s that arrive before any SSE stream exists. |
 | `bridge._queue`, `bridge._run_id` | per AG-UI run | The SSE stream the bridge emits into; swapped on `attach_resume_queue`. |
 | `bridge._cwd` | per session | Resolves relative paths for the `read_text_file` / `write_text_file` callbacks. |
-| `SessionManager._sessions: {task_id → ActiveSession}` | process lifetime | The whole session table; lost on restart (the bridge is intentionally stateless across restarts — clients start a fresh `threadId`). |
+| `bridge._replay_messages`, `_replay_open_tools` | per connect (replay) run | Coalesces the historical `session/update` stream into one `MESSAGES_SNAPSHOT`. |
 
 ---
 
 ## What AG-UI has that ACP doesn't (and vice versa)
+
+### Implemented
 
 | Concept | In AG-UI? | In ACP? | Notes |
 |---|---|---|---|
@@ -162,30 +198,37 @@ for places where the translation is **not 1:1** and where the bridge must
 | Structured user prompts (elicitation) | ✅ `interrupt{reason:"elicitation"}` | ✅ `create_elicitation` (0.11) | maps (reuses the permission suspend/resume plumbing) |
 | Tool approval (HITL) | ✅ `RUN_FINISHED{interrupt}` + `resume` | ✅ `request_permission` | maps (with state held — the hard part) |
 | Modes | ✅ `STATE_SNAPSHOT.modes` | ✅ `NewSessionResponse.modes` / `CurrentModeUpdate` | maps |
-| Models / config options | ✅ `STATE_SNAPSHOT.models` / `.configOptions` | ✅ `configOptions` (0.11) | maps (legacy `models` + 0.11 `configOptions`) |
+| Models / config options | ✅ `STATE_SNAPSHOT.configOptions` | ✅ `configOptions` (0.11) | maps |
 | Mid-session config change | ✅ `POST /ag-ui/config` (bridge ext) | ✅ `set_config_option` | maps (bridge extension endpoint) |
 | Cancel | ⚠️ client disconnect | ✅ `session/cancel` | maps via disconnect detection |
-| Multiple sessions per agent process | ❌ | ✅ `list`/`fork`/`resume`/`close` | **not exposed** (see [§ Multi-session surface](#multi-session-surface)) |
 | File reads/writes by agent | (invisible to client) | ✅ `read_text_file` etc. | bridge handles server-side |
 | Terminals | (invisible to client) | ✅ terminal methods | bridge fabricates ids |
+| Session list | ✅ `GET /ag-ui/sessions` | ✅ `session/list` | maps |
+| Session delete | ✅ `DELETE /ag-ui/sessions/{id}` | ✅ `session/delete` | maps |
+| Session resume (after bridge restart) | ✅ `POST /ag-ui` (attach-only) | ✅ `session/resume` | maps — the bridge resolves `cwd` from its durable store, calls `session/resume`, then `session/prompt` |
+| Transcript replay (connect to existing conversation) | ✅ `MESSAGES_SNAPSHOT` (bridge ext: `GET .../connect`) | ✅ `session/load` | maps — the bridge coalesces the historical `session/update` stream into one `MESSAGES_SNAPSHOT` |
+| Capability discovery | ✅ `GET /ag-ui/capabilities` | ✅ `InitializeResponse.agentCapabilities` | maps — the bridge probes the agent once and caches |
 
----
+### Implementable but not currently implemented
 
-## Out of scope: editor-grade features
+| Concept | In AG-UI? | In ACP? | Notes |
+|---|---|---|---|
+| Session fork | ❌ (no standard surface) | ✅ `session/fork` | ACP defines it; AG-UI has no "fork this thread" operation. The bridge could expose it as a bridge extension (`POST /ag-ui/sessions/{id}/fork`) returning a new `sessionId`, but no client today asks for it. Low value unless a "branch this conversation" UI feature lands. |
+| Session close | ❌ (no standard surface) | ✅ `session/close` | ACP's close frees in-flight agent resources without touching the persisted record. This bridge's teardown is `runner.kill()` (process death already frees everything close would), so there's no functional gap — the bridge's own `stop()` / idle-reaper / connect-disconnect path all kill the subprocess. A typed `close_session` call ahead of kill would let the agent flush final metadata (e.g. opencode writing `updatedAt` to SQLite) — a real but minor benefit. Not implemented. |
+| `additionalDirectories` | ❌ (not surfaced) | ✅ `session/new` / `load` / `resume` param | ACP lets an agent access files outside `cwd` via additional directories. The bridge accepts `mcpServers` but not `additionalDirectories` on Create. Plumbing it through the `POST /ag-ui/sessions` body would be a one-line addition; left out because no client sends it yet. |
+| Cursor-based list pagination | ✅ (`nextCursor` returned) | ✅ `session/list` `cursor` | The endpoint returns `nextCursor` and passes `cursor` through; full pagination is wired but no client exercises it beyond the first page yet. |
 
-ACP 0.11 carries a full editor-integration surface — document sync
-(`document/*`), next-edit-suggestions (`nes/*`), and provider/auth
-management (`providers/*`, `authenticate`, `logout`). These assume a
-long-lived editor session with open documents, and the AG-UI client (a chat
-UI) has nothing to do with them. The bridge's `ext_method` returns `{}`
-for unknown methods and the SDK marks `document_*` / `nes_*` as optional
-routes, so no code change is needed here — this is an explicit non-goal.
+### Would need minor extensions to ACP or AG-UI
 
-## Multi-session surface
+| Concept | Gap | What it'd take |
+|---|---|---|
+| Session title settable from the client | AG-UI has no "rename thread" operation; ACP has `SessionInfoUpdate` (agent → client only) | An ACP method for the client to set `SessionInfo.title`, or a bridge extension endpoint that the agent would need a way to receive (no such ACP call exists today). |
+| Per-session MCP server add/remove mid-conversation | AG-UI has no standard for this; ACP takes `mcpServers` only at `session/new`/`load`/`resume` | An ACP `session/set_mcp_servers` (doesn't exist) or a full re-`resume` with a new server list (works today but is heavy). |
+| Tool progress as a first-class event | AG-UI has no `TOOL_CALL_PROGRESS`; the bridge repurposes `TOOL_CALL_ARGS` with `{"_progress": …}` | An AG-UI spec addition for in-flight tool output, or a `CUSTOM` event with a stable name (the bridge already does the latter via `agent:thought` for reasoning). |
 
-ACP lets one agent process hold many sessions; AG-UI's contract is strictly
-one `threadId` ↔ one bridge-side `ActiveSession` ↔ one ACP `session_id`.
-The additional ACP session ops (`session/fork`, `session/resume`,
-`session/list`, `session/close`) are **not exposed** through AG-UI today —
-they are documented in [`new_acp.md`](new_acp.md) § P6 as a deferred,
-larger surface-area expansion.
+### Out of scope (doesn't make sense for this bridge)
+
+| Concept | Why not |
+|---|---|
+| Editor-grade features (`document/*`, `nes/*`, `providers/*`, `authenticate`, `logout`) | These assume a long-lived editor session with open documents. The AG-UI client is a chat UI with nothing to do with them. The bridge's `ext_method` returns `{}` for unknown methods and the SDK marks `document_*` / `nes_*` as optional routes. Explicit non-goal. |
+| Multiple sessions multiplexed on one ACP subprocess | ACP is designed for this (one process, one `Map<sessionId, Info>`); this bridge deliberately runs one subprocess per session for simplicity. Reusing one connection across many sessions is a deeper architectural change (tracked in `agui_on_acp_changes.md` §4.3 "broader context") — out of scope for the current model. |

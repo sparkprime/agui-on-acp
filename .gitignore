@@ -31,3 +31,4 @@ Thumbs.db
 /tmp/
 bridge.config.json
 *~
+coverage-report

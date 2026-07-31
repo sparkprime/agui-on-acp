@@ -36,6 +36,8 @@ router = APIRouter()
 
 
 class ToolCall(BaseModel):
+    """A tool-call descriptor in an AG-UI message."""
+
     id: str
     type: str = "function"
     function: dict[str, Any] = {}
@@ -143,7 +145,8 @@ async def ag_ui_run(body: RunAgentInput, request: Request):
         active = await manager.attach_for_prompt(thread_id, cwd, fp.get("mcpServers"))
     except ResumeUnsupportedError:
         return _json_error(
-            f"No active session for thread {thread_id} and this agent does not support session/resume",
+            f"No active session for thread {thread_id} and this agent does"
+            " not support session/resume",
             status_code=409,
         )
     except SessionResumeFailedError:
@@ -169,9 +172,9 @@ async def ag_ui_run(body: RunAgentInput, request: Request):
             thread_id,
             {"messages": [{"role": "user", "content": user_message}]},
         )
-    except Exception as exc:
-        logger.error("Failed to start run: %s", exc)
-        return _json_error(str(exc), status_code=500)
+    except Exception:  # pylint: disable=broad-exception-caught
+        logger.exception("Failed to start run for thread %s", thread_id)
+        return _json_error("failed to start run", status_code=500)
 
     # Emit a STATE_SNAPSHOT with available modes/models AFTER start_run has
     # attached the bridge to the run's queue — emitting it before
@@ -187,7 +190,12 @@ async def ag_ui_run(body: RunAgentInput, request: Request):
     if active.current_mode_id:
         snapshot["currentModeId"] = active.current_mode_id
     if snapshot:
-        active.bridge._emit(StateSnapshotEvent(snapshot=snapshot))
+        # Access the bridge's internal emit to inject a state snapshot after
+        # start_run attached the queue — a public ``emit`` method would be
+        # cleaner, but adding one widens the bridge API for this one call.
+        active.bridge._emit(  # pylint: disable=protected-access
+            StateSnapshotEvent(snapshot=snapshot)
+        )
 
     queue = manager.get_event_queue(thread_id, actual_run_id)
     if queue is None:
@@ -204,6 +212,8 @@ class ConfigUpdateRequest(BaseModel):
 
 
 class ConfigUpdateResponse(BaseModel):
+    """Response body for ``POST /ag-ui/config``."""
+
     ok: bool = True
     applied: list[str] = []
 
@@ -231,8 +241,14 @@ async def ag_ui_set_config(body: ConfigUpdateRequest, request: Request):
                 "ok": False,
                 "error": f"No active session for thread {body.threadId}",
             }
-        except Exception as exc:
-            logger.warning("set_config_option %s failed: %s", config_id, exc)
+        except Exception:  # pylint: disable=broad-exception-caught
+            # Non-fatal: a single bad config option shouldn't abort the rest.
+            logger.warning(
+                "set_config_option %s failed for thread %s",
+                config_id,
+                body.threadId,
+                exc_info=True,
+            )
     return ConfigUpdateResponse(applied=applied)
 
 
