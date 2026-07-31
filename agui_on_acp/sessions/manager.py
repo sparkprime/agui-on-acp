@@ -198,7 +198,7 @@ class SessionManager:
             probe_bridge = AcpToAguiBridge("capability-probe")
             runner = AgentRunner("capability-probe", command=self._agent_command)
             try:
-                conn = await runner.spawn(client=probe_bridge)
+                conn = await runner.spawn(client=cast(acp.Client, probe_bridge))
                 protocol = AcpProtocol("capability-probe")
                 protocol.conn = conn
                 result = await protocol.initialize()
@@ -220,7 +220,7 @@ class SessionManager:
         probe_bridge = AcpToAguiBridge("probe")
         runner = AgentRunner("probe", command=self._agent_command)
         try:
-            conn = await runner.spawn(client=probe_bridge)
+            conn = await runner.spawn(client=cast(acp.Client, probe_bridge))
             protocol = AcpProtocol("probe")
             protocol.conn = conn
             await protocol.initialize()
@@ -240,9 +240,8 @@ class SessionManager:
     ) -> ActiveSession:
         """Create a fresh session: ``session/new``."""
         bridge = AcpToAguiBridge("<pending>")
-        bridge.cwd = cwd
         runner = AgentRunner("<pending>", command=self._agent_command)
-        conn = await runner.spawn(client=bridge)
+        conn = await runner.spawn(client=cast(acp.Client, bridge))
         protocol = AcpProtocol("<pending>")
         protocol.conn = conn
 
@@ -344,9 +343,8 @@ class SessionManager:
             await existing.runner.kill()
 
         bridge = AcpToAguiBridge(session_id)
-        bridge.cwd = cwd
         runner = AgentRunner(session_id, command=self._agent_command)
-        conn = await runner.spawn(client=bridge)
+        conn = await runner.spawn(client=cast(acp.Client, bridge))
         protocol = AcpProtocol(session_id)
         protocol.conn = conn
         init_result = await protocol.initialize()
@@ -411,9 +409,8 @@ class SessionManager:
             raise ResumeUnsupportedError(session_id)
 
         bridge = AcpToAguiBridge(session_id)
-        bridge.cwd = cwd
         runner = AgentRunner(session_id, command=self._agent_command)
-        conn = await runner.spawn(client=bridge)
+        conn = await runner.spawn(client=cast(acp.Client, bridge))
         protocol = AcpProtocol(session_id)
         protocol.conn = conn
         init_result = await protocol.initialize()

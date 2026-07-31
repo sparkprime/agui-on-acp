@@ -9,7 +9,6 @@ The bridge satisfies the acp.Client Protocol structurally:
     - request_permission(session_id, tool_call, options) — handles tool approval
     - ext_notification(method, params) — handles _kiro.dev/* extensions
     - ext_method(method, params) — handles vendor extension methods
-    - read_text_file, write_text_file — file operations for the agent
     - create_terminal, terminal_output, etc. — terminal operations
     - create_elicitation, complete_elicitation — ACP 0.11 elicitation (stubbed)
     - on_connect(conn) — called when the connection is established
@@ -85,7 +84,6 @@ import asyncio
 import datetime
 import json
 import logging
-import os
 import uuid
 from typing import Any, cast
 
@@ -194,20 +192,8 @@ class AcpToAguiBridge:
         self._elicitation_futures: dict[str, asyncio.Future[Any]] = {}
         self._elicitation_timers: dict[str, asyncio.TimerHandle] = {}
 
-        # Working directory for file operations (set by session manager)
-        self._cwd: str = ""
-
         # Log collapsing for streaming chunks
         self._content_chunk_count: int = 0
-
-    @property
-    def cwd(self) -> str:
-        """Working directory used to resolve relative file paths."""
-        return self._cwd
-
-    @cwd.setter
-    def cwd(self, value: str) -> None:
-        self._cwd = value
 
     @property
     def run_id(self) -> str | None:
@@ -646,58 +632,6 @@ class AcpToAguiBridge:
         # pylint: disable=unused-argument
         self._log.debug("ext_method called: %s", method)
         return {}
-
-    # ── acp.Client Protocol — File operations ────────────────────────────────
-
-    async def read_text_file(  # pylint: disable=unused-argument
-        self,
-        session_id: str,
-        path: str,
-        line: int | None = None,
-        limit: int | None = None,
-        **_kwargs: Any,
-    ) -> acp.ReadTextFileResponse:
-        # session_id is unused (cwd resolves the path) but the acp.Client
-        # Protocol requires it; the SDK dispatches by keyword.
-        """Read a text file on behalf of the agent."""
-        self._log.debug("read_text_file: %s", path)
-        try:
-            full_path = (
-                os.path.join(self._cwd, path) if not os.path.isabs(path) else path
-            )
-            with open(full_path, "r", encoding="utf-8", errors="replace") as f:
-                if line is not None:
-                    lines = f.readlines()
-                    start = max(0, line - 1)
-                    end = start + (limit or len(lines))
-                    content = "".join(lines[start:end])
-                elif limit is not None:
-                    content = f.read(limit)
-                else:
-                    content = f.read()
-            return acp.ReadTextFileResponse(content=content)
-        except (OSError, UnicodeDecodeError) as exc:
-            logger.exception("read_text_file failed: %s", path)
-            return acp.ReadTextFileResponse(content=f"Error reading file: {exc}")
-
-    async def write_text_file(  # pylint: disable=unused-argument
-        self, session_id: str, path: str, content: str, **_kwargs: Any
-    ) -> acp.WriteTextFileResponse | None:
-        # session_id is unused (cwd resolves the path) but the acp.Client
-        # Protocol requires it; the SDK dispatches by keyword.
-        """Write a text file on behalf of the agent."""
-        self._log.debug("write_text_file: %s", path)
-        try:
-            full_path = (
-                os.path.join(self._cwd, path) if not os.path.isabs(path) else path
-            )
-            os.makedirs(os.path.dirname(full_path), exist_ok=True)
-            with open(full_path, "w", encoding="utf-8") as f:
-                f.write(content)
-            return acp.WriteTextFileResponse()
-        except OSError:
-            logger.exception("write_text_file failed: %s", path)
-            return None
 
     # ── acp.Client Protocol — Terminal operations ────────────────────────────
     # The ``session_id`` and ``terminal_id`` params are required by the

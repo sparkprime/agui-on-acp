@@ -35,6 +35,7 @@ from tests.fake_agent import (
     ext_notification,
     plan,
     plan_removed,
+    read_text_file,
     request_permission,
     session_info,
     sleep,
@@ -1075,3 +1076,37 @@ async def test_create_session_passes_mcp_servers():
         assert found_http, "expected an http MCP server in session/new"
     finally:
         await teardown_stack(fake, manager, client)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Deprecated fs callbacks — honest "unsupported" (method_not_found)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_fs_read_text_file_is_unsupported_returns_method_not_found(
+    fake_agent: FakeAcpAgent, http_client: httpx.AsyncClient
+):
+    """The bridge no longer implements the deprecated ``fs/read_text_file`` /
+    ``fs/write_text_file`` callbacks (removed in ACP v2). It advertises
+    ``clientCapabilities.fs.readTextFile=false`` / ``writeTextFile=false``
+    and provides no callbacks, so the ACP SDK client-side router raises
+    ``method_not_found`` (JSON-RPC -32601) when the agent calls
+    ``read_text_file`` — the capability-honesty story holds end-to-end, and
+    the agent must do its own filesystem I/O. The run itself is unaffected
+    (the unsupported call is surfaced to the agent, not the AG-UI client)."""
+    fake_agent.script = [
+        read_text_file("some/relative/path"),
+        end_turn(),
+    ]
+    async with http_client.stream("POST", "/ag-ui", json=_agui_body()) as resp:
+        events = await read_sse_events(resp)
+
+    assert len(fake_agent.fs_read_errors) == 1
+    err = fake_agent.fs_read_errors[0]
+    assert err.code == -32601
+    assert err.data == {"method": "fs/read_text_file"}
+    # The run completed normally — the unsupported callback is between the
+    # agent and the bridge; the AG-UI client sees a clean RUN_FINISHED.
+    assert events[-1]["type"] == "RUN_FINISHED"
+    assert all(e["type"] != "RUN_ERROR" for e in events)

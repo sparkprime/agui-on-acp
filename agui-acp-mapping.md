@@ -79,10 +79,7 @@ stream, where the client is already committed to parsing SSE.
 | `state` | ignored | No ACP equivalent. |
 | `context` | ignored | No ACP equivalent. |
 | `forwardedProps.mcpServers` | `session/resume` `mcp_servers` | The AG-UI `{name: {type, url?, command?, …}}` dict is coerced into ACP's `McpServer` schema: the dict key fills `name`, and `headers` defaults to `[]` for http/sse servers (ACP requires both). Anything already conforming passes through unchanged. |
-| `forwardedProps.cwd` | ignored | `cwd` is resolved from the bridge's durable `session_id → cwd` record (written at create time). The client no longer needs to resend it; if sent, it is silently ignored in favour of the stored record. |
-| ~~`forwardedProps.resumeSessionId`~~ | (deleted) | No longer read. Connect (the operation that calls `session/load`) is now `GET .../connect`, not a `POST /ag-ui` flag. |
-| ~~`forwardedProps.agentCommand`~~ | (deleted) | Per-request agent-command override was removed; the agent command is server-config only (`--agent-command` / `AGUI_ON_ACP_AGENT_COMMAND`). |
-| ~~`forwardedProps.mode`~~ / ~~`forwardedProps.model`~~ / ~~`forwardedProps.configOptions`~~ | moved to `POST /ag-ui/sessions` body at Create time | Mode/model/configOptions are applied at Create time via the typed `POST /ag-ui/sessions` body. They are *also* re-applied at Prompt time via `forwardedProps` (see "Config & model discovery" below) — the two paths are consistent and use the same field names. The struck-out row refers to the old behaviour where these were *only* read on the prompt path and Create-time had no typed fields. |
+| `forwardedProps.mode` / `.model` / `.configOptions` | `session/set_mode` / `session/set_config_option` (prompt-time) | Applied on `POST /ag-ui` *after* `start_run` attaches the run's queue and *before* the post-`start_run` `STATE_SNAPSHOT` — this is the sanctioned mid-conversation way to change mode/model/config (the bridge-only `POST /ag-ui/config` endpoint was removed in favour of it). Field names match the create-time typed fields on `POST /ag-ui/sessions` for consistency; application is best-effort (a bad option is logged and skipped, never aborting the run). See "Config & model discovery" below. |
 | `resume[].interruptId` | resolves parked Future keyed by the same id | The id is `=== ACP tool_call_id === AG-UI toolCallId`. One correlation key, three names. |
 | `resume[].status="resolved"` + `payload` | `AllowedOutcome{optionId: payload, outcome:"selected"}` | The `payload` may be a string, a `{optionId}` dict, or null (defaults to `"once"`). **Not 1:1:** the AG-UI payload is normalised to ACP's `optionId` field. |
 | `resume[].status="cancelled"` | `DeniedOutcome{outcome:"cancelled"}` | AG-UI "cancelled" → ACP "cancelled". |
@@ -135,7 +132,8 @@ stream, where the client is already committed to parsing SSE.
 
 | ACP | AG-UI | Notes |
 |---|---|---|
-| `read_text_file`, `write_text_file`, `create_terminal`, `terminal_output`, `release_terminal`, `wait_for_terminal_exit`, `kill_terminal` | (no AG-UI event) | These are **server-side callbacks** the bridge handles itself (it reads/writes files under `cwd`, fabricates terminal ids). They never become AG-UI events — they're invisible to the frontend. **State held:** `bridge._cwd` for path resolution. |
+| `read_text_file`, `write_text_file` | (no AG-UI event) | **Not implemented.** The bridge advertises `clientCapabilities.fs.readTextFile=false` / `writeTextFile=false` and provides no callbacks, so the ACP SDK router raises `method_not_found` (JSON-RPC -32601) if the agent calls them — the agent must do its own filesystem I/O. Honest "unsupported" behaviour, consistent with the advertised capability. Both the `fs/*` and terminal surfaces are removed entirely in ACP v2. |
+| `create_terminal`, `terminal_output`, `release_terminal`, `wait_for_terminal_exit`, `kill_terminal` | (no AG-UI event) | **Stubbed.** The bridge fabricates a terminal id / empty output so the SDK's (non-optional) terminal routes resolve instead of erroring; they never become AG-UI events — invisible to the frontend. (Removed entirely in ACP v2.) |
 
 ---
 
@@ -176,7 +174,6 @@ stream, where the client is already committed to parsing SSE.
 | `bridge._permission_timers: {call_id → TimerHandle}` | per parked permission | Server-side TTL cleanup so a never-resumed permission doesn't leak the subprocess. |
 | `bridge._pending_notifications: list[(method, params)]` | session-level, drained on first run | Buffers `ext_notification`s that arrive before any SSE stream exists. |
 | `bridge._queue`, `bridge._run_id` | per AG-UI run | The SSE stream the bridge emits into; swapped on `attach_resume_queue`. |
-| `bridge._cwd` | per session | Resolves relative paths for the `read_text_file` / `write_text_file` callbacks. |
 | `bridge._replay_messages`, `_replay_open_tools` | per connect (replay) run | Coalesces the historical `session/update` stream into one `MESSAGES_SNAPSHOT`. |
 
 ---
@@ -201,7 +198,7 @@ stream, where the client is already committed to parsing SSE.
 | Models / config options | ✅ `STATE_SNAPSHOT.configOptions` | ✅ `configOptions` (0.11) | maps |
 | Mid-session config change | ✅ `POST /ag-ui` `forwardedProps` | ✅ `set_mode` / `set_config_option` | maps (mode/model/configOptions carried in `forwardedProps` on the standard run call) |
 | Cancel | ⚠️ client disconnect | ✅ `session/cancel` | maps via disconnect detection |
-| File reads/writes by agent | (invisible to client) | ✅ `read_text_file` etc. | bridge handles server-side |
+| File reads/writes by agent | (invisible to client) | ❌ (not implemented) | agent must do its own fs I/O — the bridge advertises `readTextFile=false` / `writeTextFile=false` and the SDK returns `method_not_found` if called |
 | Terminals | (invisible to client) | ✅ terminal methods | bridge fabricates ids |
 | Session list | ✅ `GET /ag-ui/sessions` | ✅ `session/list` | maps |
 | Session delete | ✅ `DELETE /ag-ui/sessions/{id}` | ✅ `session/delete` | maps |

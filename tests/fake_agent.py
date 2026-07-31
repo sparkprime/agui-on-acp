@@ -71,6 +71,7 @@ __all__ = [
     "plan_removed",
     "thought",
     "elicitation",
+    "read_text_file",
 ]
 
 
@@ -282,6 +283,20 @@ class ElicitationStep:
     url: str | None = None
 
 
+@dataclass
+class ReadTextFileStep:
+    """Fire ``conn.read_text_file`` against the bridge (the ACP client) and
+    record the outcome. Used to assert the bridge no longer implements the
+    deprecated ``fs/read_text_file`` callback — the call must come back as a
+    JSON-RPC ``method_not_found`` error (the ACP SDK router raises
+    ``RequestError`` when the client lacks the method), matching the
+    ``readTextFile=false`` capability the bridge advertises."""
+
+    path: str = "test.txt"
+    line: int | None = None
+    limit: int | None = None
+
+
 ScriptStep = Union[
     TextStep,
     ToolStartStep,
@@ -298,6 +313,7 @@ ScriptStep = Union[
     PlanRemovedStep,
     ThoughtStep,
     ElicitationStep,
+    ReadTextFileStep,
 ]
 Script = list[ScriptStep]
 
@@ -385,6 +401,13 @@ def elicitation(**kw: Any) -> ElicitationStep:
     return ElicitationStep(**kw)
 
 
+def read_text_file(path: str = "test.txt", **kw: Any) -> ReadTextFileStep:
+    """Create a ``ReadTextFileStep`` (fires ``fs/read_text_file`` at the
+    bridge; the bridge no longer implements it, so this should come back as
+    a ``method_not_found`` error)."""
+    return ReadTextFileStep(path=path, **kw)
+
+
 # ── The fake agent ─────────────────────────────────────────────────────────
 
 
@@ -457,6 +480,11 @@ class FakeAcpAgent:
         self.permission_replies: list[_PermissionReply] = []
         # Elicitation replies the bridge sent back.
         self.elicitation_replies: list[_ElicitationReply] = []
+
+        # fs/read_text_file errors the bridge returned (the bridge no longer
+        # implements the fs callbacks; the SDK raises method_not_found). A
+        # regression that re-implements read_text_file would leave this empty.
+        self.fs_read_errors: list[acp.RequestError] = []
 
         # Per-session state we expose to the bridge's new_session response.
         self.modes: list[dict[str, Any]] | None = None
@@ -851,6 +879,8 @@ class FakeAcpAgent:
                 )
             elif isinstance(step, ElicitationStep):
                 await self._do_elicitation(session_id, step)
+            elif isinstance(step, ReadTextFileStep):
+                await self._do_read_text_file(session_id, step)
             elif isinstance(step, EndTurnStep):
                 stop_reason = step.stop_reason
                 break
@@ -999,6 +1029,27 @@ class FakeAcpAgent:
                 ),
             )
         )
+
+    async def _do_read_text_file(self, session_id: str, step: ReadTextFileStep) -> None:
+        """Fire ``fs/read_text_file`` at the bridge and record the result.
+
+        The bridge no longer implements ``read_text_file``, so the ACP SDK
+        router raises ``method_not_found`` (code -32601); the raised
+        ``acp.RequestError`` is recorded in ``self.fs_read_errors``. If a
+        regression re-introduced the callback, the call would instead return
+        a ``ReadTextFileResponse`` (no exception) and ``fs_read_errors`` would
+        stay empty — failing the regression test.
+        """
+        assert self.conn is not None
+        try:
+            await self.conn.read_text_file(
+                session_id=session_id,
+                path=step.path,
+                line=step.line,
+                limit=step.limit,
+            )
+        except acp.RequestError as exc:
+            self.fs_read_errors.append(exc)
 
     def _build_elicitation_schema(
         self, schema_dict: dict[str, Any] | None
