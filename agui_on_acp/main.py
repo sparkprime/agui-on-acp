@@ -4,6 +4,7 @@ import asyncio
 import logging
 import sys
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Literal
 
 from dotenv import load_dotenv
@@ -22,7 +23,6 @@ from agui_on_acp.config import (
     log_the_config,
     validate_env_vars,
 )
-from agui_on_acp.logging_config import setup_logging
 from agui_on_acp.sessions.manager import SessionManager
 from agui_on_acp.sessions_endpoint import router as sessions_router
 
@@ -34,8 +34,19 @@ load_dotenv()
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
-setup_logging()
+
+# Make Python print fractional seconds in log messages.
+# pylint: disable=unused-argument
+def _log_time_format(self, record: logging.LogRecord, datefmt: str | None = None):  # type: ignore
+    return (
+        datetime.fromtimestamp(record.created)
+        .astimezone()
+        .strftime("%Y-%m-%d %H:%M:%S.%f %z")
+    )
+
+
 logger = logging.getLogger(__name__)
+logging.Formatter.formatTime = _log_time_format
 
 
 async def _idle_reaper(manager: SessionManager) -> None:
@@ -61,7 +72,6 @@ async def _idle_reaper(manager: SessionManager) -> None:
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     """Application lifespan context manager for startup/shutdown."""
-    setup_logging()  # Re-apply after uvicorn's setup
     validate_env_vars()
     log_the_config()
     logger.info("ACP on AGUI v%s", __version__)

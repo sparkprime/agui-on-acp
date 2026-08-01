@@ -5,7 +5,9 @@ the configuration is available as a flag; there is no config file.
 
 Example::
 
-    agui-on-acp --agent-command "opencode acp" --port 8000
+    agui-on-acp run --agent-command "opencode acp" --port 8000
+
+    agui-on-acp example-log-config
 
 The CLI forwards the resolved flag values to the uvicorn worker via
 individual ``AGUI_ON_ACP_*`` environment variables (see
@@ -15,7 +17,10 @@ the built-in default, so the bridge can also be configured purely
 through the environment.
 """
 
+import json
 import os
+import tempfile
+from typing import Any
 
 import click
 import uvicorn
@@ -28,10 +33,44 @@ from agui_on_acp.config import (
     env_var_name,
 )
 
+_DEFAULT_LOG_CONFIG: dict[str, Any] = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "default": {
+            "format": "%(asctime)s - %(name)s:%(lineno)d [%(levelname)s] %(message)s",
+            "datefmt": "%Y-%m-%d %H:%M:%S %z",
+        },
+    },
+    "handlers": {
+        "Console": {
+            "class": "logging.StreamHandler",
+            "formatter": "default",
+            "stream": "ext://sys.stdout",
+            "level": "DEBUG",
+        }
+    },
+    "root": {"level": "INFO", "handlers": ["Console"]},
+    "loggers": {
+        "httpx": {"level": "WARNING"},
+    },
+}
 
-@click.command(
+
+@click.group(
     context_settings={"help_option_names": ["-h", "--help"]},
 )
+def main() -> None:
+    """AG-UI on ACP bridge command-line interface."""
+
+
+@main.command("example-log-config")
+def example_log_config() -> None:
+    """Print the default Python logging dictConfig as JSON (indent=2)."""
+    click.echo(json.dumps(_DEFAULT_LOG_CONFIG, indent=2))
+
+
+@main.command("run")
 @click.option(
     "--agent-command",
     "agent_command_flag",
@@ -88,7 +127,17 @@ from agui_on_acp.config import (
     show_default=True,
     help="Uvicorn log level.",
 )
-def main(
+@click.option(
+    "--log-config-file",
+    "log_config_file",
+    metavar="PATH",
+    help=(
+        "Path to a Python logging dictConfig JSON file passed to uvicorn as "
+        "`log_config`. If omitted, the built-in default config is written to "
+        "a temporary file and used instead."
+    ),
+)
+def run(
     agent_command_flag: str | None,
     backend_port_flag: int,
     host: str,
@@ -96,6 +145,7 @@ def main(
     data_dir_flag: str | None,
     reload: bool,
     log_level: str,
+    log_config_file: str | None,
 ) -> None:
     """Run the AG-UI on ACP bridge server."""
     # Only flags the user actually passed overwrite the environment, so
@@ -123,13 +173,36 @@ def main(
         f"(agent: {' '.join(agent_command())})"
     )
 
-    uvicorn.run(
-        "agui_on_acp.main:app",
-        host=host,
-        port=port,
-        reload=reload,
-        log_level=log_level,
-    )
+    # When no log config file is supplied, materialise the default config
+    # to a temporary JSON file so it can be passed to uvicorn's `log_config`
+    # (a file path is required for reload mode, where the worker is spawned
+    # in a separate process).
+    owns_temp_file = False
+    if log_config_file is None:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            suffix=".json",
+            delete=False,
+        ) as tmp:
+            json.dump(_DEFAULT_LOG_CONFIG, tmp)
+        log_config_file = tmp.name
+        owns_temp_file = True
+
+    try:
+        uvicorn.run(
+            "agui_on_acp.main:app",
+            host=host,
+            port=port,
+            reload=reload,
+            log_level=log_level,
+            log_config=log_config_file,
+        )
+    finally:
+        if owns_temp_file:
+            try:
+                os.unlink(log_config_file)
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":

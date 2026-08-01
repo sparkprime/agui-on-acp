@@ -1,10 +1,12 @@
 # AG-UI on ACP
 
-A fork of https://github.com/namanrajpal/acp-to-agui/
+A fork of https://github.com/namanrajpal/acp-to-agui/ with changes:
 
 - Just the backend (no UI here)
-- pure AG-UI protocol (no side-channel)
-- some bug fixes
+- pure AG-UI protocol (no side-channel for permissions)
+- side channel for session management
+- bug fixes
+- support for more of ACP and AGUI protocol
 - tested with opencode and CopilotKit
 
 `agui-on-acp` is a protocol translator that exposes any
@@ -42,12 +44,14 @@ Any other ACP-compatible binary works too (`kiro-cli acp`,
 ### 3. Start the bridge
 
 ```bash
+export AGUI_ON_ACP_ALLOWED_CWD_PREFIXES=/path/to/project
 agui-on-acp
 ```
 
 Or override defaults (see --help for more options):
 
 ```bash
+export AGUI_ON_ACP_ALLOWED_CWD_PREFIXES=/path/to/project
 agui-on-acp --agent-command "opencode acp" --port 8000
 ```
 
