@@ -170,6 +170,7 @@ class ToolProgressStep:
     tool_call_id: str
     status: schema.ToolCallStatus | None = None
     raw_output: Any = None
+    raw_input: Any = None
 
 
 @dataclass
@@ -809,6 +810,7 @@ class FakeAcpAgent:
                     self._build_tool_call_progress(
                         step.tool_call_id,
                         status=step.status,
+                        raw_input=step.raw_input,
                         raw_output=step.raw_output,
                     ),
                 )

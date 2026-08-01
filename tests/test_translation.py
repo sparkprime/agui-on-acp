@@ -154,6 +154,45 @@ async def test_tool_call_emits_start_args_end_and_result(
 
 
 @pytest.mark.asyncio
+async def test_bash_tool_call_display_name_includes_command(
+    fake_agent: FakeAcpAgent, http_client: httpx.AsyncClient
+):
+    """A bash tool call displays as ``"bash: ls -la"`` (tool name + command),
+    not just ``"bash"``. The bridge defers ``TOOL_CALL_START`` until the
+    first ``ToolCallProgress`` with ``raw_input`` so the displayed name can
+    include the command. The args JSON contains only ``raw_input``
+    (``{command, cwd}``) — no ``kind``/``locations`` from the
+    ``ToolCallStart``, matching what replay delivers."""
+    fake_agent.script = [
+        tool_start(
+            "tc1",
+            title="bash",
+            kind="execute",
+            locations=[{"path": "/tmp", "line": None}],
+        ),
+        tool_progress(
+            "tc1",
+            status="in_progress",
+            raw_input={"command": "ls -la", "cwd": "/tmp"},
+        ),
+        tool_end("tc1", status="completed", raw_output={"output": "total 0"}),
+        end_turn(),
+    ]
+    async with http_client.stream("POST", "/ag-ui", json=_agui_body()) as resp:
+        events = await read_sse_events(resp)
+
+    start = event_of_type(events, "TOOL_CALL_START")
+    assert start["data"]["toolCallName"] == "bash: ls -la"
+
+    args = event_of_type(events, "TOOL_CALL_ARGS")
+    payload = json.loads(args["data"]["delta"])
+    assert payload == {"command": "ls -la", "cwd": "/tmp"}
+    # kind/locations from ToolCallStart are NOT in the args
+    assert "kind" not in payload
+    assert "locations" not in payload
+
+
+@pytest.mark.asyncio
 async def test_tool_call_with_locations_is_json_serializable(
     fake_agent: FakeAcpAgent, http_client: httpx.AsyncClient
 ):
@@ -161,13 +200,25 @@ async def test_tool_call_with_locations_is_json_serializable(
     be JSON-serializable when building the TOOL_CALL_ARGS delta. Previously
     the bridge passed the pydantic models straight into ``json.dumps``,
     raising ``TypeError: Object of type ToolCallLocation is not JSON
-    serializable`` and aborting the run."""
+    serializable`` and aborting the run.
+
+    Args are delivered via ``tool_progress`` (mirroring how real ACP agents
+    like opencode send the full ``raw_input`` in a ``ToolCallProgress``
+    update, not at ``ToolCallStart`` time)."""
     fake_agent.script = [
         tool_start(
             "tc1",
             title="read file",
             kind="read",
             locations=[{"path": "/a/b.txt", "line": 12}],
+        ),
+        tool_progress(
+            "tc1",
+            status="in_progress",
+            raw_input={
+                "kind": "read",
+                "locations": [{"path": "/a/b.txt", "line": 12}],
+            },
         ),
         tool_end("tc1", status="completed", raw_output={"output": "ok"}),
         end_turn(),

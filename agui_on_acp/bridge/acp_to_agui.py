@@ -155,6 +155,21 @@ class AcpToAguiBridge:
         self._current_reasoning_id: str | None = None
         self._has_open_reasoning: bool = False
         self._open_tool_calls: set[str] = set()
+        # Tool calls that have already had their args emitted as a
+        # ``TOOL_CALL_ARGS`` delta. The ag-ui client APPENDS args deltas
+        # (``function.arguments += delta``), so emitting more than once
+        # per tool call produces broken concatenated JSON. opencode sends
+        # multiple ``ToolCallProgress`` updates with ``raw_input`` (one
+        # per progress tick), so without this guard the same args would
+        # be emitted N times.
+        self._tool_args_emitted: set[str] = set()
+        # Tool calls that have received ToolCallStart but not yet their first
+        # raw_input (from ToolCallProgress). The bridge defers emitting
+        # TOOL_CALL_START until the arguments are known so the displayed
+        # name can include a key argument (e.g. "bash: ls -la") — ACP agents
+        # send the tool name ("bash") at ToolCallStart time and the command
+        # ("ls -la") in a subsequent ToolCallProgress.
+        self._pending_tool_starts: dict[str, tuple[str, str | None]] = {}
 
         # Replay-mode state — set by start_replay() / cleared by end_replay().
         # During replay (session/load), the ACP agent re-emits the historical
@@ -176,9 +191,11 @@ class AcpToAguiBridge:
         # pre-snapshot reasoning message renders concatenated at the top.
         self._replay_reasoning_open: bool = False
         # Map an open tool call id → (assistant-message index in
-        # _replay_messages, tool-call index in that message's toolCalls) so
-        # ToolCallProgress (the result) can close it and mint a tool message.
-        self._replay_open_tools: dict[str, tuple[int, int]] = {}
+        # _replay_messages, tool-call index in that message's toolCalls,
+        # original tool name from ToolCallStart) so ToolCallProgress (the
+        # result) can close it and mint a tool message, and the display
+        # name can be derived from the original name + raw_input.
+        self._replay_open_tools: dict[str, tuple[int, int, str]] = {}
 
         # Session-level notification buffer — holds _kiro.dev/* notifications
         # that arrive before any run starts (e.g. during session init).
@@ -222,6 +239,8 @@ class AcpToAguiBridge:
         self._current_reasoning_id = None
         self._has_open_reasoning = False
         self._open_tool_calls.clear()
+        self._tool_args_emitted.clear()
+        self._pending_tool_starts.clear()
 
         self._emit(
             RunStartedEvent(
@@ -1096,7 +1115,18 @@ class AcpToAguiBridge:
         self._append_replay_text("user", text)
 
     def _handle_tool_call_typed(self, update: acp.schema.ToolCallStart) -> None:
-        """Handle ToolCallStart from the SDK."""
+        """Handle ToolCallStart from the SDK.
+
+        In replay mode, delegates to ``_append_replay_tool_start``. In live
+        mode, buffers the tool call — the actual ``TOOL_CALL_START`` event is
+        deferred until the first ``ToolCallProgress`` with ``raw_input``
+        arrives, so the displayed name can include a key argument (e.g.
+        ``"bash: ls -la"``). ACP agents send the tool name (``"bash"``) at
+        ``ToolCallStart`` time and the command in a subsequent
+        ``ToolCallProgress``; emitting ``TOOL_CALL_START`` before the command
+        is known would show just ``"bash"`` with no way to update it later
+        (AG-UI has no tool-call-name-update event).
+        """
         if self._replay_mode:
             self._append_replay_tool_start(update)
             return
@@ -1110,57 +1140,35 @@ class AcpToAguiBridge:
         tool_name = getattr(update, "title", None) or getattr(
             update, "tool_name", "unknown"
         )
-        raw_input = getattr(update, "raw_input", None) or getattr(
-            update, "rawInput", {}
+
+        self._pending_tool_starts[tool_call_id] = (
+            tool_name,
+            self._current_message_id,
         )
 
-        if isinstance(raw_input, dict):
-            cast(dict[str, Any], raw_input).pop("__tool_use_purpose", None)
-
-        self._emit(
-            ToolCallStartEvent(
-                toolCallId=tool_call_id,
-                toolCallName=tool_name,
-                parentMessageId=self._current_message_id,
-            )
-        )
-        self._open_tool_calls.add(tool_call_id)
-
-        # opencode's ACP implementation doesn't populate raw_input for
-        # read/glob/bash — only `kind` ("read"/"search"/"execute") and an
-        # empty `locations` list are available at ToolCallStart time. Enrich
-        # the args delta with what IS available so the renderer isn't a
-        # blank `{}`. When raw_input is populated (e.g. bash's {cwd}), it
-        # passes through unchanged.
-        args_obj: dict[str, Any] = (
-            cast(dict[str, Any], raw_input) if isinstance(raw_input, dict) else {}
-        )
-        kind = getattr(update, "kind", None)
-        locations = getattr(update, "locations", None)
-        if kind:
-            args_obj.setdefault("kind", kind)
-        if locations:
-            args_obj.setdefault(
-                "locations",
-                [
-                    loc.model_dump(mode="json") if hasattr(loc, "model_dump") else loc
-                    for loc in locations
-                ],
-            )
-        args_json = json.dumps(args_obj) if args_obj else "{}"
-        self._emit(
-            ToolCallArgsEvent(
-                toolCallId=tool_call_id,
-                delta=args_json,
-            )
-        )
-        # Approval is driven solely by the ACP request_permission callback,
-        # which emits an interrupt RUN_FINISHED — no policy gate here.
+        # TOOL_CALL_START and TOOL_CALL_ARGS are both deferred to
+        # ToolCallProgress — see _handle_tool_call_update_typed. The ag-ui
+        # client APPENDS TOOL_CALL_ARGS deltas, so emitting partial args
+        # (e.g. just {cwd}) here and the full args later would concatenate
+        # into broken JSON. Approval is driven solely by the ACP
+        # request_permission callback, which emits an interrupt
+        # RUN_FINISHED — no policy gate here.
 
     def _handle_tool_call_update_typed(
         self, update: acp.schema.ToolCallProgress
     ) -> None:
-        """Handle ToolCallProgress from the SDK."""
+        """Handle ToolCallProgress from the SDK.
+
+        ACP agents (e.g. opencode) send tool arguments in two stages:
+        ``ToolCallStart`` carries only the tool name (``"bash"``), then a
+        ``ToolCallProgress`` with ``status="in_progress"`` carries the actual
+        ``raw_input`` (the command, path, etc.). This method flushes the
+        deferred ``TOOL_CALL_START`` (with the display name derived from the
+        command, e.g. ``"bash: ls -la"``) and emits ``TOOL_CALL_ARGS`` in a
+        single delta. On ``completed``/``failed`` it emits ``TOOL_CALL_END``
+        and ``TOOL_CALL_RESULT``. Keeping live and replay consistent: both
+        paths now show ``"bash: ls -la"`` with args ``{command, cwd}``.
+        """
         tool_call_id = str(
             getattr(update, "tool_call_id", None) or getattr(update, "toolCallId", "")
         )
@@ -1172,14 +1180,33 @@ class AcpToAguiBridge:
         result_obj = (
             raw_output if raw_output is not None else getattr(update, "result", None)
         )
+        # raw_input carries the actual tool arguments (command, path, etc.)
+        # on in_progress updates — separate from raw_output (the result).
+        raw_input = getattr(update, "raw_input", None)
 
         if self._replay_mode:
             if status in ("completed", "failed") and tool_call_id:
                 result_str = self._serialize_tool_result(result_obj)
                 self._append_replay_tool_result(tool_call_id, result_str)
+            elif raw_input is not None and tool_call_id:
+                title = getattr(update, "title", None)
+                self._update_replay_tool(tool_call_id, raw_input, title)
             return
 
         if status in ("completed", "failed"):
+            # Flush a pending TOOL_CALL_START if no raw_input arrived first
+            # (rare — the tool completed without streaming args).
+            pending = self._pending_tool_starts.pop(tool_call_id, None)
+            if pending is not None:
+                tool_name, parent_msg_id = pending
+                self._emit(
+                    ToolCallStartEvent(
+                        toolCallId=tool_call_id,
+                        toolCallName=tool_name,
+                        parentMessageId=parent_msg_id,
+                    )
+                )
+                self._open_tool_calls.add(tool_call_id)
             if tool_call_id in self._open_tool_calls:
                 result_str = self._serialize_tool_result(result_obj)
                 self._emit(
@@ -1202,13 +1229,34 @@ class AcpToAguiBridge:
                     )
                 )
                 self._open_tool_calls.discard(tool_call_id)
-        elif result_obj is not None:
+                self._tool_args_emitted.discard(tool_call_id)
+        elif raw_input is not None and tool_call_id not in self._tool_args_emitted:
+            # Flush the deferred TOOL_CALL_START now that raw_input is
+            # available, so the displayed name includes the command (e.g.
+            # "bash: ls -la"). Emitted exactly once — the ag-ui client
+            # appends TOOL_CALL_ARGS deltas, so repeating would concatenate
+            # into broken JSON.
+            if isinstance(raw_input, dict):
+                cast(dict[str, Any], raw_input).pop("__tool_use_purpose", None)
+            pending = self._pending_tool_starts.pop(tool_call_id, None)
+            if pending is not None:
+                tool_name, parent_msg_id = pending
+                self._emit(
+                    ToolCallStartEvent(
+                        toolCallId=tool_call_id,
+                        toolCallName=self._display_tool_name(tool_name, raw_input),
+                        parentMessageId=parent_msg_id,
+                    )
+                )
+                self._open_tool_calls.add(tool_call_id)
+            args_json = json.dumps(raw_input) if raw_input else "{}"
             self._emit(
                 ToolCallArgsEvent(
                     toolCallId=tool_call_id,
-                    delta=json.dumps({"_progress": result_obj}),
+                    delta=args_json,
                 )
             )
+            self._tool_args_emitted.add(tool_call_id)
 
     # ── Dict-based handlers (fallback for raw dict updates) ──────────────────
 
@@ -1236,33 +1284,18 @@ class AcpToAguiBridge:
         )
 
     def _handle_tool_call_dict(self, update: dict[str, Any]) -> None:
-        """Translate tool_call dict to TOOL_CALL_START + TOOL_CALL_ARGS."""
+        """Translate tool_call dict — buffer the tool call until
+        ToolCallProgress delivers raw_input (see _handle_tool_call_typed)."""
         self._close_open_reasoning()
         self._close_open_message()
 
         tool_call_id = update.get("toolCallId", str(uuid.uuid4()))
         tool_name = update.get("title", update.get("toolName", "unknown"))
-        raw_input = update.get("rawInput", {})
 
-        raw_input.pop("__tool_use_purpose", None)
-
-        self._emit(
-            ToolCallStartEvent(
-                toolCallId=tool_call_id,
-                toolCallName=tool_name,
-                parentMessageId=self._current_message_id,
-            )
+        self._pending_tool_starts[tool_call_id] = (
+            tool_name,
+            self._current_message_id,
         )
-        self._open_tool_calls.add(tool_call_id)
-
-        args_json = json.dumps(raw_input)
-        self._emit(
-            ToolCallArgsEvent(
-                toolCallId=tool_call_id,
-                delta=args_json,
-            )
-        )
-        # Approval is driven solely by the ACP request_permission callback.
 
     def _handle_tool_call_update_dict(self, update: dict[str, Any]) -> None:
         """Translate tool_call_update dict to TOOL_CALL_ARGS or TOOL_CALL_END."""
@@ -1272,8 +1305,21 @@ class AcpToAguiBridge:
         result_obj = update.get("raw_output")
         if result_obj is None:
             result_obj = update.get("result")
+        # raw_input carries the actual tool arguments on in_progress updates.
+        raw_input = update.get("raw_input")
 
         if status in ("completed", "failed"):
+            pending = self._pending_tool_starts.pop(tool_call_id, None)
+            if pending is not None:
+                tool_name, parent_msg_id = pending
+                self._emit(
+                    ToolCallStartEvent(
+                        toolCallId=tool_call_id,
+                        toolCallName=tool_name,
+                        parentMessageId=parent_msg_id,
+                    )
+                )
+                self._open_tool_calls.add(tool_call_id)
             if tool_call_id in self._open_tool_calls:
                 result_str = self._serialize_tool_result(result_obj)
                 self._emit(
@@ -1293,13 +1339,29 @@ class AcpToAguiBridge:
                     )
                 )
                 self._open_tool_calls.discard(tool_call_id)
-        elif result_obj is not None:
+                self._tool_args_emitted.discard(tool_call_id)
+        elif raw_input is not None and tool_call_id not in self._tool_args_emitted:
+            if isinstance(raw_input, dict):
+                raw_input.pop("__tool_use_purpose", None)
+            pending = self._pending_tool_starts.pop(tool_call_id, None)
+            if pending is not None:
+                tool_name, parent_msg_id = pending
+                self._emit(
+                    ToolCallStartEvent(
+                        toolCallId=tool_call_id,
+                        toolCallName=self._display_tool_name(tool_name, raw_input),
+                        parentMessageId=parent_msg_id,
+                    )
+                )
+                self._open_tool_calls.add(tool_call_id)
+            args_json = json.dumps(raw_input) if raw_input else "{}"
             self._emit(
                 ToolCallArgsEvent(
                     toolCallId=tool_call_id,
-                    delta=json.dumps({"_progress": result_obj}),
+                    delta=args_json,
                 )
             )
+            self._tool_args_emitted.add(tool_call_id)
 
     # ── Turn end ─────────────────────────────────────────────────────────────
 
@@ -1379,6 +1441,20 @@ class AcpToAguiBridge:
 
     def _close_all_tool_calls(self) -> None:
         """Close all open tool calls."""
+        # Flush any pending tool starts (ToolCallStart received but no
+        # raw_input arrived before the turn ended).
+        for tc_id, (tool_name, parent_msg_id) in list(
+            self._pending_tool_starts.items()
+        ):
+            self._emit(
+                ToolCallStartEvent(
+                    toolCallId=tc_id,
+                    toolCallName=tool_name,
+                    parentMessageId=parent_msg_id,
+                )
+            )
+            self._open_tool_calls.add(tc_id)
+        self._pending_tool_starts.clear()
         for tc_id in list(self._open_tool_calls):
             self._emit(ToolCallEndEvent(toolCallId=tc_id))
             # Synthesize an empty result so CopilotKit's renderer can still
@@ -1455,7 +1531,15 @@ class AcpToAguiBridge:
 
     def _append_replay_tool_start(self, update: acp.schema.ToolCallStart) -> None:
         """Attach a tool call to the current assistant message (creating one
-        if needed) and remember its position so the result can close it."""
+        if needed) and remember its position so the result can close it.
+
+        Only ``raw_input`` is stored as the arguments — ``kind`` and
+        ``locations`` from ``ToolCallStart`` are deliberately NOT added to
+        the args, matching the live path (which emits only ``raw_input`` as
+        ``TOOL_CALL_ARGS``). This keeps live and replay JSON consistent.
+        The display name is finalized in ``_update_replay_tool`` when the
+        full ``raw_input`` arrives from ``ToolCallProgress``.
+        """
         self._close_replay_reasoning()
         tool_call_id = str(
             getattr(update, "tool_call_id", None)
@@ -1465,21 +1549,9 @@ class AcpToAguiBridge:
         raw_input: Any = getattr(update, "raw_input", None) or {}
         if isinstance(raw_input, dict):
             cast(dict[str, Any], raw_input).pop("__tool_use_purpose", None)
-        kind = getattr(update, "kind", None)
-        locations = getattr(update, "locations", None)
         args_obj: dict[str, Any] = (
             cast(dict[str, Any], raw_input) if isinstance(raw_input, dict) else {}
         )
-        if kind:
-            args_obj.setdefault("kind", kind)
-        if locations:
-            args_obj.setdefault(
-                "locations",
-                [
-                    loc.model_dump(mode="json") if hasattr(loc, "model_dump") else loc
-                    for loc in locations
-                ],
-            )
 
         last = self._replay_messages[-1] if self._replay_messages else None
         if last is None or last.role != "assistant":
@@ -1494,7 +1566,43 @@ class AcpToAguiBridge:
         )
         last.toolCalls.append(call)
         idx = len(last.toolCalls) - 1
-        self._replay_open_tools[tool_call_id] = (len(self._replay_messages) - 1, idx)
+        self._replay_open_tools[tool_call_id] = (
+            len(self._replay_messages) - 1,
+            idx,
+            tool_name,
+        )
+
+    def _update_replay_tool(
+        self, tool_call_id: str, raw_input: Any, title: str | None = None
+    ) -> None:
+        """Update the stored tool call's arguments and display name from a
+        ``ToolCallProgress`` update.
+
+        During replay, ``ToolCallStart`` may carry only a partial
+        ``raw_input`` (e.g. ``{cwd}``) and the full arguments arrive in a
+        subsequent ``ToolCallProgress``. The display name is derived from
+        the original tool name (saved at ``ToolCallStart`` time) and the
+        command in ``raw_input`` (e.g. ``"bash: ls -la"``) — NOT from the
+        progress ``title``, which ACP agents like opencode set to the raw
+        command string (``"ls -la"``), losing the tool name. This keeps
+        replay consistent with the live path, which also uses the original
+        name + command. The ``title`` parameter is accepted but unused.
+        """
+        handle = self._replay_open_tools.get(tool_call_id)
+        if handle is None:
+            return
+        msg_idx, tc_idx, original_name = handle
+        msg = self._replay_messages[msg_idx]
+        if not msg.toolCalls or tc_idx >= len(msg.toolCalls):
+            return
+        if isinstance(raw_input, dict):
+            cast(dict[str, Any], raw_input).pop("__tool_use_purpose", None)
+        msg.toolCalls[tc_idx].function["arguments"] = json.dumps(
+            raw_input if raw_input else {}
+        )
+        msg.toolCalls[tc_idx].function["name"] = self._display_tool_name(
+            original_name, raw_input
+        )
 
     def _append_replay_tool_result(self, tool_call_id: str, result_str: str) -> None:
         """Mint a ``role="tool"`` message carrying the tool's result."""
@@ -1530,6 +1638,22 @@ class AcpToAguiBridge:
                 self._log.info("emit %s", event_name)
         except asyncio.QueueFull:
             self._log.error("Event queue full, dropping: %s", event.type)
+
+    @staticmethod
+    def _display_tool_name(tool_name: str, raw_input: Any) -> str:
+        """Build a display name for a tool call by appending a key argument
+        (e.g. the command for bash) to the tool name: ``"bash: ls -la"``.
+
+        Only appends when ``raw_input`` is a dict with a ``command`` key
+        (bash-style tools); other tools (read, edit, glob, etc.) use just
+        the tool name, since their primary argument (file_path, pattern) is
+        already visible in the JSON args.
+        """
+        if isinstance(raw_input, dict):
+            command = raw_input.get("command")
+            if isinstance(command, str) and command:
+                return f"{tool_name}: {command}"
+        return tool_name
 
     @staticmethod
     def _serialize_tool_result(result_obj: Any) -> str:

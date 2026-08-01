@@ -93,8 +93,9 @@ stream, where the client is already committed to parsing SSE.
 | ACP update | AG-UI event(s) | Notes |
 |---|---|---|
 | `AgentMessageChunk` (text delta) | first → `TEXT_MESSAGE_START` + `TEXT_MESSAGE_CONTENT`; subsequent → `TEXT_MESSAGE_CONTENT` only | **Not 1:1:** ACP has only text deltas — no start/end markers. The bridge **synthesises** `START` on the first delta and `END` when a tool call begins or the turn ends. **State held:** `_current_message_id`, `_has_open_message`. |
-| `ToolCallStart` | `TOOL_CALL_START` + `TOOL_CALL_ARGS` (with full args as one JSON delta) | ACP splits "start" from "args"; AG-UI emits both back-to-back. **Not 1:1:** opencode's ACP impl doesn't populate `raw_input` for read/glob/bash — only `kind` and `locations`. The bridge enriches the args delta with `kind`/`locations` so the renderer isn't a blank `{}`. |
-| `ToolCallProgress` (`status=running`, with `raw_output`) | `TOOL_CALL_ARGS` (delta = `{"_progress": raw_output}`) | ACP carries intermediate output under the same `tool_call_update` kind; the bridge repurposes `TOOL_CALL_ARGS` to surface progress (AG-UI has no "tool progress" event). |
+| `ToolCallStart` | (buffered — no immediate event) | **Not 1:1:** ACP agents (e.g. opencode) send the tool name (`"bash"`) at `ToolCallStart` time but the actual arguments (command, path, etc.) in a subsequent `ToolCallProgress`. The bridge buffers the tool call and defers `TOOL_CALL_START` until the first `ToolCallProgress` with `raw_input` arrives, so the displayed name can include a key argument (e.g. `"bash: ls -la"`). AG-UI has no tool-call-name-update event, so the name can't be changed once `TOOL_CALL_START` is emitted. **State held:** `_pending_tool_starts: dict[str, tuple[str, str|None]]` maps `tool_call_id → (tool_name, parent_message_id)`. |
+| `ToolCallProgress` (`status=in_progress`, with `raw_input`) | `TOOL_CALL_START` (flushed from buffer, with display name) + `TOOL_CALL_ARGS` (delta = full `raw_input` as one JSON string) | The actual tool arguments (command, path, etc.) arrive here. The bridge flushes the deferred `TOOL_CALL_START` with `toolCallName = "{name}: {command}"` (e.g. `"bash: ls -la"`) for tools with a `command` key, then emits `TOOL_CALL_ARGS` in a single delta. Args contain only `raw_input` — no `kind`/`locations` from `ToolCallStart` — keeping live and replay JSON consistent. Emitted exactly once per tool call — **state held:** `_tool_args_emitted: set[str]` guards against duplicate emission. |
+| `ToolCallProgress` (`status=running`, with `raw_output`, no `raw_input`) | `TOOL_CALL_ARGS` (delta = `{"_progress": raw_output}`) | ACP carries intermediate output under the same `tool_call_update` kind; the bridge repurposes `TOOL_CALL_ARGS` to surface progress (AG-UI has no "tool progress" event). Only emitted when no `raw_input` is present (the args-vs-progress distinction). |
 | `ToolCallProgress` (`status=completed`/`failed`) | `TOOL_CALL_END` **and** `TOOL_CALL_RESULT` | **1:2 split:** one ACP completion → two AG-UI events. `TOOL_CALL_END` only signals end-of-args-streaming; `TOOL_CALL_RESULT` (with `role="tool"`) is what CopilotKit's runtime listens for to synthesise a `ToolMessage` and flip the renderer from `inProgress` to `complete`. Without both, the renderer hangs. |
 | `CurrentModeUpdate` | `CUSTOM` (`name="agent:mode_update"`) | Renamed. |
 | `AvailableCommandsUpdate` | `CUSTOM` (`name="agent:commands_available"`) | Renamed. |
@@ -104,7 +105,7 @@ stream, where the client is already committed to parsing SSE.
 | **ACP 0.11:** `UsageUpdate` | `CUSTOM` (`name="agent:usage"`, `value={used, size, cost?}`) | `cost` (when present) is `{amount, currency}`. Clients render a token/cost meter; dedupe upstream. |
 | **ACP 0.11:** `SessionInfoUpdate` | `CUSTOM` (`name="agent:session_info"`, `value={title?, updatedAt?}`) | Carries `title` and `updatedAt`; useful for titling the conversation thread. |
 | **ACP 0.11:** `AgentPlanUpdate` / `AgentPlanContentUpdate` / `AgentPlanRemovedUpdate` | `CUSTOM` (`agent:plan` / `agent:plan_update` / `agent:plan_removed`) | Each variant maps to a `CUSTOM` whose `value` is the plan payload verbatim (`{entries}` / the discriminated plan content / `{id}`). Clients that don't render plans ignore them. |
-| **ACP 0.11:** `AgentThoughtChunk` | `REASONING_START` → `REASONING_MESSAGE_START` → `REASONING_MESSAGE_CONTENT` (×N) → `REASONING_MESSAGE_END` → `REASONING_END` | Agent reasoning streamed as thought deltas, now mapped to AG-UI's first-class reasoning event family (was a `CUSTOM agent:thought` escape hatch). The bridge synthesises the phase/message framing: a contiguous run of thought chunks opens one reasoning phase with one reasoning message (multiple `CONTENT` deltas), closed on the same lifecycle triggers that close an open text message (tool call start, turn end, run finish/error). The text-message stream is kept clean so clients decide whether to surface reasoning. Reasoning is **not** folded into the `MESSAGES_SNAPSHOT` on `connect` replay (spec-conformant — AG-UI permits omitting reasoning from snapshots); historical thought chunks emit live during replay. |
+| **ACP 0.11:** `AgentThoughtChunk` | **Live:** `REASONING_START` → `REASONING_MESSAGE_START` → `REASONING_MESSAGE_CONTENT` (×N) → `REASONING_MESSAGE_END` → `REASONING_END` **Replay:** `SnapshotMessage{role:"reasoning"}` in the `MESSAGES_SNAPSHOT` | Agent reasoning streamed as thought deltas, mapped to AG-UI's first-class reasoning event family. The bridge synthesises the phase/message framing: a contiguous run of thought chunks opens one reasoning phase with one reasoning message (multiple `CONTENT` deltas), closed on the same lifecycle triggers that close an open text message (tool call start, text message start, turn end, run finish/error). Both the live and replay paths close reasoning at the same boundaries so thinking renders interleaved with text/tool calls in both views. **State held:** `_current_reasoning_id`, `_has_open_reasoning` (live); `_replay_reasoning_open` (replay). During replay, reasoning is coalesced into `role="reasoning"` `SnapshotMessage`s in transcript order (the `SnapshotMessage` schema was extended to include `role="reasoning"` for this purpose). |
 | `UserMessageChunk` | (dropped in live mode) | In live mode: echo of the user's own message; not needed (AG-UI client already has it). **During replay** (connect): coalesced into the `MESSAGES_SNAPSHOT` as a `role="user"` message (see next row). |
 | **replay** (any `session/update` during `session/load`) | `MESSAGES_SNAPSHOT` (one event) | The entire historical `session/update` stream delivered during `session/load` is coalesced into a single `MESSAGES_SNAPSHOT` event (AG-UI's "replace the whole message list" operation). The bridge redirects its coalescing state machine — agent/user text → `SnapshotMessage{role, content}`, tool calls → `SnapshotMessage{role:"assistant", toolCalls}`, tool results → `SnapshotMessage{role:"tool", toolCallId}` — instead of emitting deltas. Framed by a synthetic `RUN_STARTED`/`RUN_FINISHED` pair so the SSE stream has normal start/end markers. |
 
@@ -163,18 +164,33 @@ stream, where the client is already committed to parsing SSE.
 
 ## State held on the proxy (load-bearing)
 
-| State | Lifetime | Why it's needed |
+The bridge maintains **15 mutable state fields** across three scopes. The root cause is three structural mismatches between ACP and AG-UI:
+
+1. **ACP is frameless, AG-UI is framed.** ACP sends delta chunks without start/end markers. AG-UI requires `START`/`CONTENT`/`END` framing. The bridge synthesises framing from arrival order, which requires tracking what's "open."
+2. **ACP splits tool args across two events, AG-UI appends.** ACP sends partial `raw_input` at `ToolCallStart`, full `raw_input` at `ToolCallProgress`. AG-UI's `TOOL_CALL_ARGS` is append-only. The bridge must defer args emission and deduplicate.
+3. **ACP has no interrupt/resume, AG-UI does.** ACP's `request_permission` is a blocking async call. AG-UI models it as `RUN_FINISHED{outcome:interrupt}` + a later resume run. The bridge parks futures and correlates interrupt IDs.
+
+| State | Scope | Why it's needed |
 |---|---|---|
-| `ActiveSession` (`session_id`, `cwd`, `runner`, `protocol`, `bridge`, `modes`, `models`, `current_mode_id`, `config_options`, `last_active_at`) | per session, in-memory | The agent subprocess must persist across runs on the same thread. `session_id` is the single id for both AG-UI and ACP. |
+| **Live streaming** (reset per run) | | |
+| `_current_message_id`, `_has_open_message` | per run | ACP has no message start/end; the bridge synthesises `TEXT_MESSAGE_START`/`END` framing. |
+| `_current_reasoning_id`, `_has_open_reasoning` | per run | Same framing synthesis for `REASONING_*` events. Closed on text-message start, tool-call start, turn end — so thoughts interleave correctly with text and tool calls (not concatenated into one phase). |
+| `_open_tool_calls: set[str]` | per run (preserved across suspend/resume) | Tracks which tool calls still need `TOOL_CALL_END`/`RESULT`. Cleared on `start_run`, **preserved** on `attach_resume_queue` (the tool call that triggered a permission is still open across the suspend boundary). |
+| `_tool_args_emitted: set[str]` | per run | Guards against emitting `TOOL_CALL_ARGS` more than once per tool call. opencode sends multiple `ToolCallProgress` updates with `raw_input`; the ag-ui client appends deltas, so duplicate emission concatenates into broken JSON. |
+| **Replay** (reset per connect) | | |
+| `_replay_messages: list[SnapshotMessage]` | per connect run | Coalesces the historical `session/update` stream into one `MESSAGES_SNAPSHOT`. Mirrors the live state machine but builds whole messages instead of emitting deltas. |
+| `_replay_reasoning_open: bool` | per connect run | Whether the trailing replay message is an open reasoning message that contiguous thought deltas should append to. Closed by any non-thought chunk so each thought run gets its own `role="reasoning"` message in transcript order. |
+| `_replay_open_tools: dict[str, tuple[int, int]]` | per connect run | Maps a tool call id → (assistant-message index, tool-call index) in `_replay_messages` so `ToolCallProgress` (result) can close it and mint a `role="tool"` message. Also used by `_update_replay_tool` to replace partial args/title from `ToolCallProgress`. |
+| **Session-level** (persists across runs) | | |
+| `ActiveSession` (`session_id`, `cwd`, `runner`, `protocol`, `bridge`, `modes`, `models`, `current_mode_id`, `config_options`, `last_active_at`) | per session, in-memory | The agent subprocess must persist across runs on the same thread. |
 | `SessionStore` (`session_id → cwd`, on disk) | durable, survives restart | Written at Create so Connect/Prompt can resolve `cwd` without the client resending it; removed on Delete. |
-| `SessionManager._capabilities` | process lifetime (cached after first probe) | The bridge needs to know what the agent supports (load/resume/list/delete) before any session is created (e.g. `GET /ag-ui/capabilities`). |
-| `bridge._current_message_id`, `_has_open_message` | per run | ACP has no message start/end; the bridge synthesises them. |
-| `bridge._open_tool_calls: set[str]` | per run (and across suspend/resume) | Tracks which tool calls still need a `TOOL_CALL_END`/`RESULT` either at turn end or on resume. Cleared on `start_run`, **preserved** on `attach_resume_queue`. |
-| `bridge._permission_futures: {call_id → Future}` | per parked permission | Bridges ACP's blocking `request_permission` to AG-UI's end-then-resume flow. |
-| `bridge._permission_timers: {call_id → TimerHandle}` | per parked permission | Server-side TTL cleanup so a never-resumed permission doesn't leak the subprocess. |
-| `bridge._pending_notifications: list[(method, params)]` | session-level, drained on first run | Buffers `ext_notification`s that arrive before any SSE stream exists. |
-| `bridge._queue`, `bridge._run_id` | per AG-UI run | The SSE stream the bridge emits into; swapped on `attach_resume_queue`. |
-| `bridge._replay_messages`, `_replay_open_tools` | per connect (replay) run | Coalesces the historical `session/update` stream into one `MESSAGES_SNAPSHOT`. |
+| `SessionManager._capabilities` | process lifetime (cached after first probe) | The bridge needs to know what the agent supports (load/resume/list/delete) before any session is created. |
+| `_pending_notifications: list[(method, params)]` | session-level, drained on first run | Buffers `ext_notification`s that arrive before any SSE stream exists. |
+| `_permission_futures: {call_id → Future}` | per parked permission | Bridges ACP's blocking `request_permission` to AG-UI's end-then-resume flow. |
+| `_permission_timers: {call_id → TimerHandle}` | per parked permission | Server-side TTL cleanup so a never-resumed permission doesn't leak the subprocess. |
+| `_elicitation_futures: {id → Future}` | per parked elicitation | Same suspend/resume plumbing as permissions, for ACP 0.11 `create_elicitation`. |
+| `_elicitation_timers: {id → TimerHandle}` | per parked elicitation | TTL cleanup for elicitations. |
+| `_queue`, `_run_id` | per AG-UI run | The SSE stream the bridge emits into; swapped on `attach_resume_queue`. |
 
 ---
 
@@ -185,10 +201,10 @@ stream, where the client is already committed to parsing SSE.
 | Concept | In AG-UI? | In ACP? | Notes |
 |---|---|---|---|
 | Streaming text deltas | ✅ `TEXT_MESSAGE_*` | ✅ `AgentMessageChunk` | maps (with synthesised framing) |
-| Streaming tool args | ✅ `TOOL_CALL_ARGS` (delta string) | ✅ `ToolCallStart.raw_input` | maps (one-shot in ACP, chunked in AG-UI) |
+| Streaming tool args | ✅ `TOOL_CALL_ARGS` (append-only delta string) | ✅ `ToolCallStart.raw_input` (partial) + `ToolCallProgress.raw_input` (full) | **Not 1:1:** ACP splits args across two events; AG-UI appends. Bridge defers to `ToolCallProgress` and emits once (guarded by `_tool_args_emitted`). |
 | Tool result | ✅ `TOOL_CALL_RESULT` | ✅ `ToolCallProgress.raw_output` | maps (renamed field) |
 | Tool progress (in-flight output) | ❌ (repurposes `TOOL_CALL_ARGS`) | ✅ `ToolCallProgress` w/ `status=running` | **not 1:1** |
-| Agent reasoning / "thought" | ✅ `REASONING_*` | ✅ `AgentThoughtChunk` | maps (with synthesised phase/message framing — one phase per contiguous run) |
+| Agent reasoning / "thought" | ✅ `REASONING_*` (live) / `role="reasoning"` in `MESSAGES_SNAPSHOT` (replay) | ✅ `AgentThoughtChunk` | **Not 1:1:** Live path synthesises `REASONING_START`/`MESSAGE_START`/`CONTENT`/`END` framing from arrival order; replay coalesces into `role="reasoning"` `SnapshotMessage`s in transcript order. Both paths close reasoning at the same boundaries (text start, tool start, turn end) so thinking interleaves correctly with text and tool calls in both views. |
 | Plans / todos | `CUSTOM agent:plan[_update|_removed]` | ✅ `AgentPlanUpdate` / `…ContentUpdate` / `…RemovedUpdate` | maps (each variant → a `CUSTOM` with the plan payload) |
 | Token usage / cost | `CUSTOM agent:usage` | ✅ `UsageUpdate` | maps (with `{used, size, cost?}`) |
 | Session title / metadata | `CUSTOM agent:session_info` | ✅ `SessionInfoUpdate` | maps |

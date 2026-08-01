@@ -7,8 +7,8 @@ never changes silently, and a failed resume/load is never papered over by
 minting a new session.
 """
 
-from typing import Any
 import json
+from typing import Any
 
 import pytest
 
@@ -344,11 +344,14 @@ async def test_connect_replay_interleaves_reasoning_in_messages_snapshot():
 
 
 @pytest.mark.asyncio
-async def test_connect_replay_tool_call_with_locations_is_json_serializable():
-    """Regression: a replayed ``ToolCallStart`` carrying ``locations`` (a
-    list of ``ToolCallLocation`` pydantic objects) used to crash the replay
-    builder with ``TypeError: Object of type ToolCallLocation is not JSON
-    serializable`` when serializing the tool call's ``arguments``."""
+async def test_connect_replay_tool_call_args_match_live_path():
+    """Replayed tool-call arguments must match what the live path emits —
+    only ``raw_input``, NOT ``kind``/``locations`` from ``ToolCallStart``.
+
+    Previously the replay builder merged ``kind`` and ``locations`` from
+    ``ToolCallStart`` into the args (and the live path did not), causing
+    live and replay to show different JSON for the same tool call. Now
+    both paths use only ``raw_input``, keeping the JSON consistent."""
 
     fake, manager, client = await make_stack(
         capabilities_opts=capabilities(load_session=True)
@@ -363,6 +366,10 @@ async def test_connect_replay_tool_call_with_locations_is_json_serializable():
                 title="read file",
                 kind="read",
                 locations=[{"path": "/a/b.txt", "line": 7}],
+                raw_input={
+                    "kind": "read",
+                    "locations": [{"path": "/a/b.txt", "line": 7}],
+                },
             ),
             tool_end("tc1", raw_output="ok"),
             end_turn(),
@@ -376,15 +383,65 @@ async def test_connect_replay_tool_call_with_locations_is_json_serializable():
             m for m in snaps[0]["data"]["messages"] if m["role"] == "assistant"
         ]
         assert assistant_msgs, "expected an assistant message carrying the tool call"
-        tool_calls: list[dict[str, Any]] = list(assistant_msgs[0].get("toolCalls") or [])
+        tool_calls: list[dict[str, Any]] = list(
+            assistant_msgs[0].get("toolCalls") or []
+        )
         assert tool_calls, "expected the tool call on the assistant message"
         # ``arguments`` is a JSON string; it must round-trip with the
-        # locations as plain dicts (not pydantic objects).
+        # locations as plain dicts (not pydantic objects — the original
+        # regression), and must match exactly what the live path would
+        # emit (just raw_input, no extra kind/locations from ToolCallStart).
         args = json.loads(str(tool_calls[0]["function"]["arguments"]))
         assert args["kind"] == "read"
         assert len(args["locations"]) == 1
         assert args["locations"][0]["path"] == "/a/b.txt"
         assert args["locations"][0]["line"] == 7
+        # The tool name is NOT overwritten by the progress title — it stays
+        # as the original ToolCallStart title (no "command" key → no suffix).
+        assert tool_calls[0]["function"]["name"] == "read file"
+    finally:
+        await teardown_stack(fake, manager, client)
+
+
+@pytest.mark.asyncio
+async def test_connect_replay_bash_tool_call_shows_command_in_name():
+    """A replayed bash tool call displays as ``"bash: ls -la"`` (tool name +
+    command), NOT just the command (which opencode sends as the progress
+    ``title``). The args JSON contains only ``raw_input`` (``{command, cwd}``),
+    matching the live path — no ``kind``/``locations``."""
+
+    fake, manager, client = await make_stack(
+        capabilities_opts=capabilities(load_session=True)
+    )
+    try:
+        active = await manager.create_session(cwd=CWD)
+        sid = active.session_id
+        fake.store.sessions[sid].transcript = [
+            user_text("list files"),
+            tool_start(
+                "tc1",
+                title="bash",
+                kind="execute",
+                raw_input={"command": "ls -la", "cwd": "/tmp"},
+            ),
+            tool_end("tc1", raw_output="total 0"),
+            end_turn(),
+        ]
+        async with client.stream("GET", f"/ag-ui/sessions/{sid}/connect") as resp:
+            assert resp.status_code == 200
+            events = await read_sse_events(resp)
+        snaps = [e for e in events if e["type"] == "MESSAGES_SNAPSHOT"]
+        assert snaps, "expected a MESSAGES_SNAPSHOT from replay"
+        assistant_msgs = [
+            m for m in snaps[0]["data"]["messages"] if m["role"] == "assistant"
+        ]
+        tool_calls = list(assistant_msgs[0].get("toolCalls") or [])
+        assert tool_calls, "expected the tool call"
+        # Display name includes the command: "bash: ls -la"
+        assert tool_calls[0]["function"]["name"] == "bash: ls -la"
+        # Args are just raw_input — no kind/locations
+        args = json.loads(str(tool_calls[0]["function"]["arguments"]))
+        assert args == {"command": "ls -la", "cwd": "/tmp"}
     finally:
         await teardown_stack(fake, manager, client)
 
