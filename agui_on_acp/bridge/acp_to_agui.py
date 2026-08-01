@@ -164,6 +164,17 @@ class AcpToAguiBridge:
         # ``agui_on_acp_changes.md`` §5.1 (Option B).
         self._replay_mode: bool = False
         self._replay_messages: list[SnapshotMessage] = []
+        # Whether the trailing ``_replay_messages`` entry is an open reasoning
+        # message that contiguous ``AgentThoughtChunk`` deltas should append
+        # to. Closed by ``_close_replay_reasoning`` on any non-thought chunk
+        # (assistant text, tool start, tool result, user turn, turn end) so
+        # the next thought opens a fresh reasoning message in transcript
+        # order. Without this, replayed thoughts would all coalesce into a
+        # single leading reasoning message — see the ``MESSAGES_SNAPSHOT``
+        # handler in ``ag-ui/.../client/src/apply/default.ts``: reasoning
+        # absent from the snapshot is preserved in place, so a single
+        # pre-snapshot reasoning message renders concatenated at the top.
+        self._replay_reasoning_open: bool = False
         # Map an open tool call id → (assistant-message index in
         # _replay_messages, tool-call index in that message's toolCalls) so
         # ToolCallProgress (the result) can close it and mint a tool message.
@@ -304,6 +315,7 @@ class AcpToAguiBridge:
         """
         self._replay_mode = True
         self._replay_messages = []
+        self._replay_reasoning_open = False
         self._replay_open_tools = {}
         self._run_id = str(uuid.uuid4())
         self._queue = queue
@@ -328,6 +340,7 @@ class AcpToAguiBridge:
             )
         self._replay_mode = False
         self._replay_messages = []
+        self._replay_reasoning_open = False
         self._replay_open_tools = {}
         self._run_id = None
         self._queue = None
@@ -469,7 +482,10 @@ class AcpToAguiBridge:
             content = getattr(update, "content", None)
             thought_text = getattr(content, "text", "") if content else ""
             if thought_text:
-                self._emit_reasoning_delta(thought_text)
+                if self._replay_mode:
+                    self._append_replay_reasoning(thought_text)
+                else:
+                    self._emit_reasoning_delta(thought_text)
         else:
             # Fallback: try to extract as dict
             if hasattr(update, "model_dump"):
@@ -1011,7 +1027,10 @@ class AcpToAguiBridge:
                 else ""
             )
             if thought_text:
-                self._emit_reasoning_delta(thought_text)
+                if self._replay_mode:
+                    self._append_replay_reasoning(thought_text)
+                else:
+                    self._emit_reasoning_delta(thought_text)
         else:
             self._log.debug("Unhandled session/update kind: %s", kind)
 
@@ -1361,6 +1380,7 @@ class AcpToAguiBridge:
         new message if the last one is a different role (or, for assistant
         messages, already carries tool calls — text after tools opens a fresh
         assistant message)."""
+        self._close_replay_reasoning()
         last = self._replay_messages[-1] if self._replay_messages else None
         if last is not None and last.role == role:
             if role == "assistant" and last.toolCalls:
@@ -1380,11 +1400,35 @@ class AcpToAguiBridge:
         # Nothing to "close" structurally — _append_replay_text handles the
         # transition via the toolCalls check. Drop open tool-call handles
         # whose results never arrived so they don't leak across turns.
+        self._close_replay_reasoning()
         self._replay_open_tools.clear()
+
+    def _append_replay_reasoning(self, text: str) -> None:
+        """Append a thought delta to the current replay reasoning message,
+        opening a new ``role="reasoning"`` ``SnapshotMessage`` when the
+        previous thought run was closed by an intervening non-thought chunk.
+        Contiguous ``AgentThoughtChunk`` deltas coalesce into one message
+        (mirroring the live ``REASONING_*`` state machine), preserving
+        transcript position so the replayed reasoning renders where it
+        occurred instead of concatenated at the top."""
+        if self._replay_reasoning_open and self._replay_messages:
+            last = self._replay_messages[-1]
+            if last.role == "reasoning":
+                last.content = (last.content or "") + text
+                return
+        msg = SnapshotMessage(id=str(uuid.uuid4()), role="reasoning", content=text)
+        self._replay_messages.append(msg)
+        self._replay_reasoning_open = True
+
+    def _close_replay_reasoning(self) -> None:
+        """Mark the current replay reasoning message closed so the next
+        thought delta opens a fresh one."""
+        self._replay_reasoning_open = False
 
     def _append_replay_tool_start(self, update: acp.schema.ToolCallStart) -> None:
         """Attach a tool call to the current assistant message (creating one
         if needed) and remember its position so the result can close it."""
+        self._close_replay_reasoning()
         tool_call_id = str(
             getattr(update, "tool_call_id", None)
             or getattr(update, "toolCallId", str(uuid.uuid4()))
@@ -1422,6 +1466,7 @@ class AcpToAguiBridge:
         """Mint a ``role="tool"`` message carrying the tool's result."""
         # Drop the open-tool handle; the result closes it.
         self._replay_open_tools.pop(tool_call_id, None)
+        self._close_replay_reasoning()
         self._replay_messages.append(
             SnapshotMessage(
                 id=f"{tool_call_id}-result",

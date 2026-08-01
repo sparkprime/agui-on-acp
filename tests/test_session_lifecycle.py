@@ -17,6 +17,7 @@ from tests.fake_agent import (
     capabilities,
     end_turn,
     text,
+    thought,
     tool_end,
     tool_start,
     user_text,
@@ -272,6 +273,71 @@ async def test_connect_replay_emits_messages_snapshot_including_user_turns():
         # The tool call result is a tool-role message.
         assert "tool" in roles
         assert fake.load_session_calls[0]["session_id"] == sid
+    finally:
+        await teardown_stack(fake, manager, client)
+
+
+@pytest.mark.asyncio
+async def test_connect_replay_interleaves_reasoning_in_messages_snapshot():
+    """Replayed reasoning appears interleaved in the MESSAGES_SNAPSHOT at the
+    position it occurred, not concatenated into a single leading message.
+
+    Regression: the bridge used to emit REASONING_* delta events during
+    replay (ahead of the MESSAGES_SNAPSHOT, which excluded reasoning), so
+    the ag-ui client preserved the streamed reasoning in place — rendering
+    every thought concatenated at the top of the transcript. The fix
+    coalesces AgentThoughtChunk into ``role="reasoning"`` SnapshotMessages
+    in transcript order, and the snapshot carrying reasoning makes the
+    client drop any streamed copy (see default.ts MESSAGES_SNAPSHOT handler).
+    """
+    fake, manager, client = await make_stack(
+        capabilities_opts=capabilities(load_session=True)
+    )
+    try:
+        active = await manager.create_session(cwd=CWD)
+        sid = active.session_id
+        fake.store.sessions[sid].transcript = [
+            user_text("do thing A and B"),
+            thought("thinking about A"),
+            text("doing A"),
+            tool_start("tc1", title="bash"),
+            tool_end("tc1", raw_output="ok"),
+            thought("thinking about B"),
+            text("doing B"),
+            end_turn(),
+        ]
+        async with client.stream("GET", f"/ag-ui/sessions/{sid}/connect") as resp:
+            assert resp.status_code == 200
+            events = await read_sse_events(resp)
+        snaps = [e for e in events if e["type"] == "MESSAGES_SNAPSHOT"]
+        assert snaps, "expected a MESSAGES_SNAPSHOT from replay"
+        msgs = snaps[0]["data"]["messages"]
+        roles = [m["role"] for m in msgs]
+
+        # Two distinct reasoning messages — NOT one concatenated block.
+        reasoning = [m for m in msgs if m["role"] == "reasoning"]
+        assert len(reasoning) == 2, f"expected 2 reasoning msgs, got {len(reasoning)}"
+        assert reasoning[0]["content"] == "thinking about A"
+        assert reasoning[1]["content"] == "thinking about B"
+
+        # Ordering: user, reasoning(A), assistant(A, carries the tool call),
+        # tool(result), reasoning(B), assistant(B). Each thought sits where
+        # it occurred — not concatenated at the top.
+        assert roles == [
+            "user",
+            "reasoning",
+            "assistant",
+            "tool",
+            "reasoning",
+            "assistant",
+        ], f"unexpected ordering: {roles}"
+
+        # No REASONING_* delta events should have been emitted during replay
+        # — reasoning travels only in the snapshot now.
+        reasoning_events = [e for e in events if e["type"].startswith("REASONING_")]
+        assert (
+            reasoning_events == []
+        ), f"replay must not emit REASONING_* deltas: {reasoning_events}"
     finally:
         await teardown_stack(fake, manager, client)
 
