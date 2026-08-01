@@ -19,6 +19,7 @@ design-v2), cancel, disconnect, permission TTL expiry, and error paths.
 
 import asyncio
 import contextlib
+import json
 from typing import Any, cast
 
 import httpx
@@ -150,6 +151,39 @@ async def test_tool_call_emits_start_args_end_and_result(
     assert result["data"]["toolCallId"] == "tc1"
     assert result["data"]["content"] == "file-contents"
     assert result["data"]["role"] == "tool"
+
+
+@pytest.mark.asyncio
+async def test_tool_call_with_locations_is_json_serializable(
+    fake_agent: FakeAcpAgent, http_client: httpx.AsyncClient
+):
+    """Regression: ``ToolCallLocation`` pydantic objects in ``locations`` must
+    be JSON-serializable when building the TOOL_CALL_ARGS delta. Previously
+    the bridge passed the pydantic models straight into ``json.dumps``,
+    raising ``TypeError: Object of type ToolCallLocation is not JSON
+    serializable`` and aborting the run."""
+    fake_agent.script = [
+        tool_start(
+            "tc1",
+            title="read file",
+            kind="read",
+            locations=[{"path": "/a/b.txt", "line": 12}],
+        ),
+        tool_end("tc1", status="completed", raw_output={"output": "ok"}),
+        end_turn(),
+    ]
+    async with http_client.stream("POST", "/ag-ui", json=_agui_body()) as resp:
+        events = await read_sse_events(resp)
+
+    args = event_of_type(events, "TOOL_CALL_ARGS")
+    # The delta must be a JSON string carrying the locations as plain dicts
+    # (not pydantic objects — the regression that raised TypeError).
+
+    payload = json.loads(args["data"]["delta"])
+    assert payload["kind"] == "read"
+    assert len(payload["locations"]) == 1
+    assert payload["locations"][0]["path"] == "/a/b.txt"
+    assert payload["locations"][0]["line"] == 12
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -793,6 +827,51 @@ async def test_reasoning_closed_when_tool_call_starts(
     # Reasoning closes before the tool call opens.
     assert end_idx < tool_start_idx
     assert msg_end_idx < end_idx
+
+
+@pytest.mark.asyncio
+async def test_reasoning_closed_when_text_starts(
+    fake_agent: FakeAcpAgent, http_client: httpx.AsyncClient
+):
+    """A reasoning block is closed when a text message starts, so thoughts
+    that arrive before and after text are in *separate* reasoning messages
+    — not concatenated into one. Mirrors the replay path's
+    ``_close_replay_reasoning`` call in ``_append_replay_text``."""
+    fake_agent.script = [
+        thought("think before text"),
+        text("assistant reply"),
+        thought("think after text"),
+        text("second reply"),
+        end_turn(),
+    ]
+    async with http_client.stream("POST", "/ag-ui", json=_agui_body()) as resp:
+        events = await read_sse_events(resp)
+    types = [e["type"] for e in events]
+
+    # Two separate reasoning phases (one per thought run).
+    assert types.count("REASONING_START") == 2
+    assert types.count("REASONING_MESSAGE_START") == 2
+    assert types.count("REASONING_MESSAGE_END") == 2
+    assert types.count("REASONING_END") == 2
+
+    # The first REASONING_END must appear before the first TEXT_MESSAGE_START,
+    # and the second REASONING_START must appear after the first
+    # TEXT_MESSAGE_END — proving interleaving, not concatenation.
+    first_reasoning_end = types.index("REASONING_END")
+    first_text_start = types.index("TEXT_MESSAGE_START")
+    assert (
+        first_reasoning_end < first_text_start
+    ), "reasoning must close before text starts (interleaved, not concatenated)"
+
+    first_text_end = types.index("TEXT_MESSAGE_END")
+    second_reasoning_start = types.index("REASONING_START", first_reasoning_end + 1)
+    assert (
+        second_reasoning_start > first_text_end
+    ), "second reasoning must open after first text ends"
+
+    # Two separate text messages (text closes when reasoning opens).
+    assert types.count("TEXT_MESSAGE_START") == 2
+    assert types.count("TEXT_MESSAGE_END") == 2
 
 
 # ─────────────────────────────────────────────────────────────────────────────

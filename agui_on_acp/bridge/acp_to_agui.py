@@ -1051,6 +1051,16 @@ class AcpToAguiBridge:
             self._append_replay_text("assistant", text)
             return
 
+        # Close any open reasoning phase before streaming text — mirrors
+        # the replay path's `_append_replay_text` calling
+        # `_close_replay_reasoning`. Without this, a thought that arrives
+        # before text stays open across the text boundary, so the next
+        # thought appends to the *same* reasoning message (both are in one
+        # phase), and the single concatenated reasoning renders before (or
+        # after, depending on arrival order) the tool calls instead of
+        # interleaved with them.
+        self._close_open_reasoning()
+
         if not self._has_open_message:
             msg_id = str(uuid.uuid4())
             self._current_message_id = msg_id
@@ -1130,7 +1140,13 @@ class AcpToAguiBridge:
         if kind:
             args_obj.setdefault("kind", kind)
         if locations:
-            args_obj.setdefault("locations", locations)
+            args_obj.setdefault(
+                "locations",
+                [
+                    loc.model_dump(mode="json") if hasattr(loc, "model_dump") else loc
+                    for loc in locations
+                ],
+            )
         args_json = json.dumps(args_obj) if args_obj else "{}"
         self._emit(
             ToolCallArgsEvent(
@@ -1202,6 +1218,9 @@ class AcpToAguiBridge:
         text = content.get("text", "")
         if not text:
             return
+
+        # See _handle_agent_message_chunk_typed for why.
+        self._close_open_reasoning()
 
         if not self._has_open_message:
             msg_id = str(uuid.uuid4())
@@ -1330,8 +1349,17 @@ class AcpToAguiBridge:
         message (tool call start, turn end, run finish/error). Mirrors the
         text-message state machine with the addition of the outer phase
         bracket AG-UI requires for reasoning.
+
+        Also closes any open text message before opening the reasoning
+        phase — mirrors the replay path where ``_append_replay_text`` and
+        ``_append_replay_reasoning`` create separate messages for text and
+        reasoning chunks. Without this, a text chunk that arrives between
+        two thoughts would append to the *same* assistant message, and the
+        reasoning would appear separated from the tool calls instead of
+        interleaved with them.
         """
         if not self._has_open_reasoning:
+            self._close_open_message()
             msg_id = str(uuid.uuid4())
             self._current_reasoning_id = msg_id
             self._has_open_reasoning = True
@@ -1445,7 +1473,13 @@ class AcpToAguiBridge:
         if kind:
             args_obj.setdefault("kind", kind)
         if locations:
-            args_obj.setdefault("locations", locations)
+            args_obj.setdefault(
+                "locations",
+                [
+                    loc.model_dump(mode="json") if hasattr(loc, "model_dump") else loc
+                    for loc in locations
+                ],
+            )
 
         last = self._replay_messages[-1] if self._replay_messages else None
         if last is None or last.role != "assistant":
