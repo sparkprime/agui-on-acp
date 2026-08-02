@@ -25,7 +25,7 @@ class AguiEventType(str, Enum):
     TOOL_CALL_ARGS = "TOOL_CALL_ARGS"
     TOOL_CALL_END = "TOOL_CALL_END"
     TOOL_CALL_RESULT = "TOOL_CALL_RESULT"
-    STATE_UPDATE = "STATE_UPDATE"
+    STATE_DELTA = "STATE_DELTA"
     STATE_SNAPSHOT = "STATE_SNAPSHOT"
     CUSTOM = "CUSTOM"
     MESSAGES_SNAPSHOT = "MESSAGES_SNAPSHOT"
@@ -229,11 +229,19 @@ class ToolCallResultEvent(BaseAguiEvent):
     role: Literal["tool"] = "tool"
 
 
-class StateUpdateEvent(BaseAguiEvent):
-    """An incremental state update (partial merge)."""
+class StateDeltaEvent(BaseAguiEvent):
+    """An incremental state update as a JSON Patch (RFC 6902) delta.
 
-    type: Literal[AguiEventType.STATE_UPDATE] = AguiEventType.STATE_UPDATE
-    state: dict[str, Any]  # arbitrary JSON state
+    Canonical AG-UI ``STATE_DELTA`` carries a `delta` of JSON Patch
+    operations (``ag-ui/sdks/typescript/packages/core/src/events.ts``:
+    `delta: z.array(z.any())`). Only the changed paths are touched; the
+    rest of the state the client is holding is left alone — the
+    "STATE_SNAPSHOT merge trap" (a partial snapshot wiping unrelated keys)
+    is struct avoided by using deltas for every incremental update.
+    """
+
+    type: Literal[AguiEventType.STATE_DELTA] = AguiEventType.STATE_DELTA
+    delta: list[dict[str, Any]]
 
 
 class StateSnapshotEvent(BaseAguiEvent):
@@ -314,7 +322,7 @@ AguiEvent = (
     | ToolCallArgsEvent
     | ToolCallEndEvent
     | ToolCallResultEvent
-    | StateUpdateEvent
+    | StateDeltaEvent
     | StateSnapshotEvent
     | CustomEvent
     | MessagesSnapshotEvent

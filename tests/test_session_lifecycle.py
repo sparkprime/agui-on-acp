@@ -21,10 +21,14 @@ from tests.conftest import make_stack, teardown_stack
 from tests.fake_agent import (
     capabilities,
     end_turn,
+    plan,
+    plan_removed,
+    session_info,
     text,
     thought,
     tool_end,
     tool_start,
+    usage,
     user_text,
 )
 from tests.sse_helpers import read_sse_events
@@ -446,6 +450,99 @@ async def test_connect_replay_bash_tool_call_shows_command_in_name():
         # Args are just raw_input — no kind/locations
         args = json.loads(str(tool_calls[0]["function"]["arguments"]))
         assert args == {"command": "ls -la", "cwd": "/tmp"}
+    finally:
+        await teardown_stack(fake, manager, client)
+
+
+@pytest.mark.asyncio
+async def test_connect_replay_survives_plan_usage_session_info_in_state_snapshot():
+    """Replayed plan/usage/session_info updates survive reconnect as a
+    ``STATE_SNAPSHOT`` — the proposal's headline bug fix.
+
+    Before the fix these were ``CUSTOM`` fire-and-forget events that the
+    replay accumulator's catch-all silently dropped, so disconnecting and
+    reconnecting mid-session wiped the todo list, the token meter, and the
+    session title. Now the bridge emits ``STATE_DELTA`` for each, the
+    accumulator folds them into its state dict, and ``end_replay`` emits
+    one ``STATE_SNAPSHOT`` carrying the merged state alongside the
+    ``MESSAGES_SNAPSHOT``.
+    """
+    fake, manager, client = await make_stack(
+        capabilities_opts=capabilities(load_session=True)
+    )
+    try:
+        active = await manager.create_session(cwd=CWD)
+        sid = active.session_id
+        fake.store.sessions[sid].transcript = [
+            user_text("do thing"),
+            plan(
+                entries=[
+                    {"content": "step one", "priority": "high", "status": "pending"},
+                    {"content": "step two", "priority": "low", "status": "completed"},
+                ]
+            ),
+            usage(used=4200, size=200000, cost={"amount": 0.03, "currency": "USD"}),
+            session_info(title="My chat", updated_at="2026-01-01T00:00:00Z"),
+            text("done"),
+            end_turn(),
+        ]
+        async with client.stream("GET", f"/ag-ui/sessions/{sid}/connect") as resp:
+            assert resp.status_code == 200
+            events = await read_sse_events(resp)
+        snaps = [e for e in events if e["type"] == "STATE_SNAPSHOT"]
+        assert snaps, "expected a STATE_SNAPSHOT from replay carrying state"
+        state = snaps[-1]["data"]["snapshot"]
+        # Plan survives reconnect, keyed under "default" (legacy no-id plan).
+        assert "plans" in state
+        assert state["plans"]["default"]["type"] == "items"
+        assert len(state["plans"]["default"]["entries"]) == 2
+        assert state["plans"]["default"]["entries"][0]["content"] == "step one"
+        # Usage meter survives.
+        assert state["usage"]["used"] == 4200
+        assert state["usage"]["size"] == 200000
+        assert state["usage"]["cost"]["amount"] == 0.03
+        # Session title survives.
+        assert state["sessionInfo"]["title"] == "My chat"
+        assert state["sessionInfo"]["updatedAt"] == "2026-01-01T00:00:00Z"
+        # No CUSTOM agent:plan/usage/session_info leak out during replay.
+        custom_names = [e["data"]["name"] for e in events if e["type"] == "CUSTOM"]
+        assert "agent:plan" not in custom_names
+        assert "agent:usage" not in custom_names
+        assert "agent:session_info" not in custom_names
+        # The STATE_SNAPSHOT precedes the MESSAGES_SNAPSHOT (state baseline
+        # applied before the transcript renders).
+        types = [e["type"] for e in events]
+        assert types.index("STATE_SNAPSHOT") < types.index("MESSAGES_SNAPSHOT")
+    finally:
+        await teardown_stack(fake, manager, client)
+
+
+@pytest.mark.asyncio
+async def test_connect_replay_plan_removed_clears_plan_in_state():
+    """A replayed ``AgentPlanRemovedUpdate`` removes the plan from the
+    replayed state — `remove` ops fold correctly, not just `replace`."""
+    fake, manager, client = await make_stack(
+        capabilities_opts=capabilities(load_session=True)
+    )
+    try:
+        active = await manager.create_session(cwd=CWD)
+        sid = active.session_id
+        fake.store.sessions[sid].transcript = [
+            plan(entries=[{"content": "x", "priority": "high", "status": "pending"}]),
+            plan_removed("plan-1"),
+            end_turn(),
+        ]
+        async with client.stream("GET", f"/ag-ui/sessions/{sid}/connect") as resp:
+            events = await read_sse_events(resp)
+        snaps = [e for e in events if e["type"] == "STATE_SNAPSHOT"]
+        assert snaps
+        plans = snaps[-1]["data"]["snapshot"]["plans"]
+        # The legacy "default" plan was set, then "plan-1" was removed — but
+        # "plan-1" was never added (the only plan update was the legacy
+        # no-id one under "default"). The remove of a non-existent path is a
+        # lenient no-op, so "default" survives.
+        assert "default" in plans
+        assert "plan-1" not in plans
     finally:
         await teardown_stack(fake, manager, client)
 

@@ -248,7 +248,16 @@ def _resolve_session_options(
 
 def _emit_state_snapshot(active: ActiveSession) -> None:
     """Emit a ``STATE_SNAPSHOT`` advertising the session's modes/models/
-    config options on the run's queue.
+    config options AND the bridge's evolving plan/usage/sessionInfo state
+    on the run's queue.
+
+    This establishes the full state baseline at run start: mode/model/
+    configOptions (the diff-driven config surface) plus plans/usage/
+    sessionInfo (the evolving current-value state the bridge tracks across
+    runs within a session). Pre-populating the latter three paths (even as
+    ``{}``/``None`` on the first run) keeps the mid-turn STATE_DELTA
+    `replace` ops spec-correct under a strict RFC 6902 applier — see
+    ``proposals/plan-usage-session-info-as-state.md``.
 
     Must be called AFTER ``start_run`` / ``attach_resume_queue`` attached the
     bridge's emit queue — emitting earlier drops the event (the bridge's
@@ -265,13 +274,16 @@ def _emit_state_snapshot(active: ActiveSession) -> None:
         snapshot["configOptions"] = active.config_options
     if active.current_mode_id:
         snapshot["currentModeId"] = active.current_mode_id
-    if snapshot:
-        # Accessing the bridge's internal ``_emit`` is intentional here
-        # rather than widening the bridge API with a public snapshot
-        # emitter for this one call site.
-        active.bridge._emit(  # pylint: disable=protected-access  # pyright: ignore[reportPrivateUsage]
-            StateSnapshotEvent(snapshot=snapshot)
-        )
+    # Bridge-tracked evolving state (plans/usage/sessionInfo). Always
+    # included — even when empty — so the paths the mid-turn STATE_DELTA
+    # deltas `replace` exist from the very first run.
+    snapshot.update(active.bridge.extra_state())
+    # Accessing the bridge's internal ``_emit`` is intentional here
+    # rather than widening the bridge API with a public snapshot
+    # emitter for this one call site.
+    active.bridge._emit(  # pylint: disable=protected-access  # pyright: ignore[reportPrivateUsage]
+        StateSnapshotEvent(snapshot=snapshot)
+    )
 
 
 def _sse_response(

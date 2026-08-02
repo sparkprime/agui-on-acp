@@ -106,7 +106,7 @@ import datetime
 import json
 import logging
 import uuid
-from typing import Any, cast
+from typing import Any, Callable, cast
 
 import acp
 import acp.schema
@@ -125,6 +125,7 @@ from agui_on_acp.agui.events import (
     RunErrorEvent,
     RunFinishedEvent,
     RunStartedEvent,
+    StateDeltaEvent,
     StateSnapshotEvent,
     TextMessageContentEvent,
     TextMessageEndEvent,
@@ -134,7 +135,10 @@ from agui_on_acp.agui.events import (
     ToolCallResultEvent,
     ToolCallStartEvent,
 )
-from agui_on_acp.bridge.snapshot_accumulator import MessageSnapshotAccumulator
+from agui_on_acp.bridge.snapshot_accumulator import (
+    MessageSnapshotAccumulator,
+    _escape_pointer_token,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -231,10 +235,53 @@ class AcpToAguiBridge:
         # Log collapsing for streaming chunks
         self._content_chunk_count: int = 0
 
+        # Evolving AG-UI ``state`` extras — plan / usage / sessionInfo.
+        # Persistent across runs within a session (not reset at start_run:
+        # the todo list, token meter, and session title persist turn to
+        # turn). The handlers below update these AND emit a STATE_DELTA so
+        # the client converges; ``extra_state()`` exposes the current
+        # values so the run-start STATE_SNAPSHOT baseline (see
+        # ``agui_endpoint._emit_state_snapshot``) pre-populates the paths
+        # the deltas will later `replace`, keeping the wire stream
+        # spec-correct under a strict RFC 6902 applier.
+        self._plans: dict[str, Any] = {}
+        self._usage: dict[str, Any] | None = None
+        self._session_info: dict[str, Any] | None = None
+
+        # Callbacks the bridge invokes when the agent changes a value that
+        # the bridge is too low-level to own itself — i.e. fields on
+        # ``ActiveSession`` (``current_mode_id``, ``config_options``). The
+        # bridge emits the wire event; the manager-side callback refreshes
+        # the diff baseline so the next run's ``state`` diff doesn't
+        # redundantly re-fire a ``set_*`` for a value the agent already
+        # changed. ``None`` when no manager has wired them up (probe /
+        # capability-probe bridges) — the wire event still goes out.
+        self.on_mode_changed: Callable[[str], None] | None = None
+        self.on_config_options_changed: (
+            Callable[[list[dict[str, Any]]], None] | None
+        ) = None
+
     @property
     def run_id(self) -> str | None:
         """The current run id, or None when no run is active."""
         return self._run_id
+
+    def extra_state(self) -> dict[str, Any]:
+        """Return the evolving ``state`` extras (plans / usage / sessionInfo)
+        the bridge tracks for the run-start STATE_SNAPSHOT baseline.
+
+        All three keys are always present (empty/None when nothing has
+        arrived yet) so the path each STATE_DELTA `replace` touches exists
+        from the very first run — keeping the wire stream spec-correct under
+        a strict RFC 6902 applier. These persist across runs within a
+        session; they're only reset when a new bridge (i.e. a new session)
+        is constructed.
+        """
+        return {
+            "plans": dict(self._plans),
+            "usage": self._usage,
+            "sessionInfo": self._session_info,
+        }
 
     # ── Run lifecycle ────────────────────────────────────────────────────────
 
@@ -366,8 +413,16 @@ class AcpToAguiBridge:
 
     def end_replay(self) -> None:
         """Finish a replay: close any dangling frames, flip replay off,
-        and emit the coalesced ``MESSAGES_SNAPSHOT`` + a closing
-        ``RUN_FINISHED`` on the real queue."""
+        and emit the coalesced ``STATE_SNAPSHOT`` + ``MESSAGES_SNAPSHOT`` +
+        a closing ``RUN_FINISHED`` on the real queue.
+
+        The ``STATE_SNAPSHOT`` carries the state the accumulator folded from
+        the replayed ``STATE_DELTA``/``STATE_SNAPSHOT`` stream — this is what
+        fixes the reconnect bug where plan/usage/session_info used to vanish
+        (they were ``CUSTOM`` fire-and-forget events the catch-all silently
+        dropped). It precedes the ``MESSAGES_SNAPSHOT`` so a client applies
+        the state baseline before rendering the transcript.
+        """
         if not self._replay_mode:
             return
         run_id = self._run_id
@@ -379,6 +434,10 @@ class AcpToAguiBridge:
         # RUN_FINISHED go on the real queue, not back into the accumulator.
         self._replay_mode = False
         accumulator = self._replay_accumulator
+        if accumulator is not None:
+            state = accumulator.state_snapshot()
+            if state:
+                self._emit(StateSnapshotEvent(snapshot=state))
         self._emit(
             MessagesSnapshotEvent(
                 messages=accumulator.snapshot() if accumulator else []
@@ -463,6 +522,13 @@ class AcpToAguiBridge:
             self._handle_tool_call_update_typed(update)
         elif isinstance(update, acp.schema.CurrentModeUpdate):
             mode_id = getattr(update, "mode_id", "") or getattr(update, "modeId", "")
+            # Refresh the bridge-side diff baseline so the next run's
+            # ``state.mode`` diff doesn't fight/overwrite an autonomous
+            # agent-side mode change (the proposal's current_mode_id
+            # staleness fix). Mode itself is deferred to a follow-up
+            # STATE_DELTA pass; for now it stays a CUSTOM event.
+            if mode_id and self.on_mode_changed is not None:
+                self.on_mode_changed(mode_id)  # pylint: disable=not-callable
             self._emit(
                 CustomEvent(
                     name="agent:mode_update",
@@ -479,17 +545,23 @@ class AcpToAguiBridge:
             )
         elif isinstance(update, acp.schema.ConfigOptionUpdate):
             # ACP 0.11: the notification carries the full set of config
-            # options and their current values — emit a STATE_SNAPSHOT that
-            # replaces whatever the client previously held.
+            # options and their current values. Emitted as a STATE_DELTA
+            # (replace ``/configOptions``) — NOT a partial STATE_SNAPSHOT —
+            # so a mid-turn update doesn't wipe the plan/usage/sessionInfo
+            # the client is also holding (the "STATE_SNAPSHOT merge trap").
+            options = serialize_config_options(getattr(update, "config_options", []))
             self._emit(
-                StateSnapshotEvent(
-                    snapshot={
-                        "configOptions": serialize_config_options(
-                            getattr(update, "config_options", [])
-                        )
-                    }
+                StateDeltaEvent(
+                    delta=[
+                        {"op": "replace", "path": "/configOptions", "value": options}
+                    ]
                 )
             )
+            # Refresh the bridge-side diff baseline (same class of staleness
+            # fix as current_mode_id) so the next run's ``state.configOptions``
+            # diff is stable against agent-driven changes.
+            if self.on_config_options_changed is not None:
+                self.on_config_options_changed(options)
         elif isinstance(update, acp.schema.UsageUpdate):
             value: dict[str, Any] = {
                 "used": getattr(update, "used", 0),
@@ -498,33 +570,70 @@ class AcpToAguiBridge:
             cost = getattr(update, "cost", None)
             if cost is not None:
                 value["cost"] = _model_to_dict(cost)
-            self._emit(CustomEvent(name="agent:usage", value=value))
-        elif isinstance(update, acp.schema.SessionInfoUpdate):
+            self._usage = value
             self._emit(
-                CustomEvent(
-                    name="agent:session_info",
-                    value=_model_to_dict(update),
+                StateDeltaEvent(
+                    delta=[{"op": "replace", "path": "/usage", "value": value}]
+                )
+            )
+        elif isinstance(update, acp.schema.SessionInfoUpdate):
+            # ACP allows ``title``/``updatedAt`` to be set to null to clear —
+            # preserve the nulls explicitly (model_dump(exclude_none=True)
+            # would drop them, hiding the "cleared" signal from the client).
+            title = getattr(update, "title", None)
+            updated_at = getattr(update, "updated_at", None) or getattr(
+                update, "updatedAt", None
+            )
+            value = {"title": title, "updatedAt": updated_at}
+            self._session_info = value
+            self._emit(
+                StateDeltaEvent(
+                    delta=[{"op": "replace", "path": "/sessionInfo", "value": value}]
                 )
             )
         elif isinstance(update, acp.schema.AgentPlanUpdate):
+            entries = _model_to_dict(getattr(update, "entries", []))
+            value = {"type": "items", "entries": entries}
+            self._plans["default"] = value
             self._emit(
-                CustomEvent(
-                    name="agent:plan",
-                    value={"entries": _model_to_dict(getattr(update, "entries", []))},
+                StateDeltaEvent(
+                    delta=[
+                        {
+                            "op": "replace",
+                            "path": "/plans/default",
+                            "value": value,
+                        }
+                    ]
                 )
             )
         elif isinstance(update, acp.schema.AgentPlanContentUpdate):
+            plan = _model_to_dict(getattr(update, "plan", None))
+            plan_id = ""
+            if isinstance(plan, dict):
+                plan_id = str(plan.get("id", ""))
+            self._plans[plan_id] = plan
             self._emit(
-                CustomEvent(
-                    name="agent:plan_update",
-                    value=_model_to_dict(getattr(update, "plan", None)),
+                StateDeltaEvent(
+                    delta=[
+                        {
+                            "op": "replace",
+                            "path": f"/plans/{_escape_pointer_token(plan_id)}",
+                            "value": plan,
+                        }
+                    ]
                 )
             )
         elif isinstance(update, acp.schema.AgentPlanRemovedUpdate):
+            plan_id = str(getattr(update, "id", ""))
+            self._plans.pop(plan_id, None)
             self._emit(
-                CustomEvent(
-                    name="agent:plan_removed",
-                    value={"id": getattr(update, "id", "")},
+                StateDeltaEvent(
+                    delta=[
+                        {
+                            "op": "remove",
+                            "path": f"/plans/{_escape_pointer_token(plan_id)}",
+                        }
+                    ]
                 )
             )
         elif isinstance(update, acp.schema.AgentThoughtChunk):
@@ -1020,24 +1129,28 @@ class AcpToAguiBridge:
         elif kind == "turn_end":
             self._handle_turn_end()
         elif kind == "current_mode_update":
+            mode_id = update.get("modeId", update.get("mode_id", ""))
+            if mode_id and self.on_mode_changed is not None:
+                self.on_mode_changed(mode_id)  # pylint: disable=not-callable
             self._emit(
                 CustomEvent(
                     name="agent:mode_update",
-                    value={"modeId": update.get("modeId", update.get("mode_id", ""))},
+                    value={"modeId": mode_id},
                 )
             )
         elif kind == "config_option_update":
+            options = serialize_config_options(
+                update.get("configOptions", update.get("config_options", []))
+            )
             self._emit(
-                StateSnapshotEvent(
-                    snapshot={
-                        "configOptions": serialize_config_options(
-                            update.get(
-                                "configOptions", update.get("config_options", [])
-                            )
-                        )
-                    }
+                StateDeltaEvent(
+                    delta=[
+                        {"op": "replace", "path": "/configOptions", "value": options}
+                    ]
                 )
             )
+            if self.on_config_options_changed is not None:
+                self.on_config_options_changed(options)
         elif kind == "usage_update":
             value: dict[str, Any] = {
                 "used": update.get("used", 0),
@@ -1045,24 +1158,60 @@ class AcpToAguiBridge:
             }
             if update.get("cost") is not None:
                 value["cost"] = update.get("cost")
-            self._emit(CustomEvent(name="agent:usage", value=value))
-        elif kind == "session_info_update":
-            self._emit(CustomEvent(name="agent:session_info", value=update))
-        elif kind == "plan":
+            self._usage = value
             self._emit(
-                CustomEvent(
-                    name="agent:plan",
-                    value={"entries": update.get("entries", [])},
+                StateDeltaEvent(
+                    delta=[{"op": "replace", "path": "/usage", "value": value}]
+                )
+            )
+        elif kind == "session_info_update":
+            value = {
+                "title": update.get("title"),
+                "updatedAt": update.get("updatedAt", update.get("updated_at")),
+            }
+            self._session_info = value
+            self._emit(
+                StateDeltaEvent(
+                    delta=[{"op": "replace", "path": "/sessionInfo", "value": value}]
+                )
+            )
+        elif kind == "plan":
+            entries = update.get("entries", [])
+            value = {"type": "items", "entries": entries}
+            self._plans["default"] = value
+            self._emit(
+                StateDeltaEvent(
+                    delta=[{"op": "replace", "path": "/plans/default", "value": value}]
                 )
             )
         elif kind == "plan_update":
+            plan = update.get("plan", update)
+            plan_id = ""
+            if isinstance(plan, dict):
+                plan_id = str(plan.get("id", ""))
+            self._plans[plan_id] = plan
             self._emit(
-                CustomEvent(name="agent:plan_update", value=update.get("plan", update))
+                StateDeltaEvent(
+                    delta=[
+                        {
+                            "op": "replace",
+                            "path": f"/plans/{_escape_pointer_token(plan_id)}",
+                            "value": plan,
+                        }
+                    ]
+                )
             )
         elif kind == "plan_removed":
+            plan_id = str(update.get("id", ""))
+            self._plans.pop(plan_id, None)
             self._emit(
-                CustomEvent(
-                    name="agent:plan_removed", value={"id": update.get("id", "")}
+                StateDeltaEvent(
+                    delta=[
+                        {
+                            "op": "remove",
+                            "path": f"/plans/{_escape_pointer_token(plan_id)}",
+                        }
+                    ]
                 )
             )
         elif kind == "agent_thought_chunk":

@@ -25,6 +25,7 @@ from agui_on_acp.agui.events import (
     RunFinishedEvent,
     RunStartedEvent,
     SnapshotMessage,
+    StateDeltaEvent,
     StateSnapshotEvent,
     TextMessageContentEvent,
     TextMessageEndEvent,
@@ -276,13 +277,132 @@ def test_add_user_text_separates_from_non_user_trailing():
     ]
 
 
-def test_run_custom_state_events_are_no_op():
-    """``RUN_*``, ``CUSTOM``, and ``STATE_*`` events fold to nothing."""
+def test_run_custom_events_are_message_no_op():
+    """``RUN_*`` and ``CUSTOM`` events fold to no messages. ``STATE_*`` is
+    covered separately below — it folds into the state dict, not messages."""
     acc = MessageSnapshotAccumulator()
     acc.fold(RunStartedEvent(runId="r1", taskId="t1", threadId="t1"))
-    acc.fold(CustomEvent(name="agent:usage", value={"used": 1}))
-    acc.fold(StateSnapshotEvent(snapshot={"modes": []}))
+    acc.fold(CustomEvent(name="agent:mode_update", value={"modeId": "build"}))
     acc.fold(RunFinishedEvent(runId="r1", taskId="t1", threadId="t1"))
+    assert not acc.snapshot()
+
+
+def test_state_delta_replaces_usage_and_session_info():
+    """``STATE_DELTA`` `replace` ops fold into the accumulator's state dict
+    — this is what makes plan/usage/session_info survive replay
+    (the proposal's headline reconnect bug fix)."""
+    acc = MessageSnapshotAccumulator()
+    acc.fold(
+        StateDeltaEvent(
+            delta=[
+                {"op": "replace", "path": "/usage", "value": {"used": 99, "size": 1000}}
+            ]
+        )
+    )
+    acc.fold(
+        StateDeltaEvent(
+            delta=[
+                {
+                    "op": "replace",
+                    "path": "/sessionInfo",
+                    "value": {"title": "chat", "updatedAt": "2026-01-01T00:00:00Z"},
+                }
+            ]
+        )
+    )
+    state = acc.state_snapshot()
+    assert state["usage"] == {"used": 99, "size": 1000}
+    assert state["sessionInfo"] == {
+        "title": "chat",
+        "updatedAt": "2026-01-01T00:00:00Z",
+    }
+    # Baseline keys that no delta touched are still present.
+    assert state["plans"] == {}
+
+
+def test_state_delta_plan_replace_and_remove():
+    """Plan replace/remove ops fold into ``state.plans`` keyed by id."""
+    acc = MessageSnapshotAccumulator()
+    acc.fold(
+        StateDeltaEvent(
+            delta=[
+                {
+                    "op": "replace",
+                    "path": "/plans/default",
+                    "value": {"type": "items", "entries": [{"content": "x"}]},
+                }
+            ]
+        )
+    )
+    acc.fold(
+        StateDeltaEvent(
+            delta=[
+                {
+                    "op": "replace",
+                    "path": "/plans/plan-2",
+                    "value": {"type": "items", "id": "plan-2", "entries": []},
+                }
+            ]
+        )
+    )
+    state = acc.state_snapshot()
+    assert set(state["plans"].keys()) == {"default", "plan-2"}
+    # remove one
+    acc.fold(StateDeltaEvent(delta=[{"op": "remove", "path": "/plans/plan-2"}]))
+    state = acc.state_snapshot()
+    assert set(state["plans"].keys()) == {"default"}
+
+
+def test_state_delta_first_replace_on_missing_path_is_lenient():
+    """A `replace` on a path that doesn't exist yet (no prior baseline
+    snapshot) is treated as `add` — the applier is lenient like the
+    reference client's fast-json-patch, so a client that hasn't seen a
+    baseline still converges."""
+    acc = MessageSnapshotAccumulator()
+    # /plans/custom never seeded (the baseline seeds {} but no keys inside).
+    acc.fold(
+        StateDeltaEvent(
+            delta=[
+                {
+                    "op": "replace",
+                    "path": "/plans/custom",
+                    "value": {"type": "markdown", "content": "# hi"},
+                }
+            ]
+        )
+    )
+    state = acc.state_snapshot()
+    assert state["plans"]["custom"] == {"type": "markdown", "content": "# hi"}
+
+
+def test_state_snapshot_replaces_state_wholesale():
+    """A folded ``STATE_SNAPSHOT`` replaces the accumulated state (merged
+    with the seed baseline so plan/usage/sessionInfo paths stay defined)."""
+    acc = MessageSnapshotAccumulator()
+    acc.fold(
+        StateDeltaEvent(
+            delta=[{"op": "replace", "path": "/usage", "value": {"used": 5}}]
+        )
+    )
+    acc.fold(StateSnapshotEvent(snapshot={"configOptions": [{"id": "model"}]}))
+    state = acc.state_snapshot()
+    # The snapshot replaced usage (it omitted it) — but the seed baseline
+    # keeps the plans/usage/sessionInfo paths defined for later deltas.
+    assert state["configOptions"] == [{"id": "model"}]
+    assert state["plans"] == {}
+    assert state["usage"] is None
+    assert state["sessionInfo"] is None
+
+
+def test_state_events_do_not_mint_messages():
+    """``STATE_DELTA`` / ``STATE_SNAPSHOT`` fold into state, never messages."""
+    acc = MessageSnapshotAccumulator()
+    acc.fold(StateSnapshotEvent(snapshot={"modes": []}))
+    acc.fold(
+        StateDeltaEvent(
+            delta=[{"op": "replace", "path": "/usage", "value": {"used": 1}}]
+        )
+    )
     assert not acc.snapshot()
 
 

@@ -687,12 +687,13 @@ async def test_state_snapshot_advertises_config_options():
 
 
 @pytest.mark.asyncio
-async def test_config_option_update_notification_emits_state_snapshot(
+async def test_config_option_update_notification_emits_state_delta(
     fake_agent: FakeAcpAgent, http_client: httpx.AsyncClient
 ):
-    """A mid-turn ``ConfigOptionUpdate`` notification is surfaced as a fresh
-    STATE_SNAPSHOT carrying the updated ``configOptions`` (replace, not
-    patch)."""
+    """A mid-turn ``ConfigOptionUpdate`` notification is surfaced as a
+    ``STATE_DELTA`` (JSON Patch `replace` of ``/configOptions``), NOT a
+    partial ``STATE_SNAPSHOT`` — so it doesn't wipe the plan/usage/sessionInfo
+    the client is also holding (the "STATE_SNAPSHOT merge trap")."""
     fake_agent.script = [
         config_option_update(
             [
@@ -712,17 +713,25 @@ async def test_config_option_update_notification_emits_state_snapshot(
     ]
     async with http_client.stream("POST", "/ag-ui", json=_agui_body()) as resp:
         events = await read_sse_events(resp)
-    snaps = [e for e in events if e["type"] == "STATE_SNAPSHOT"]
-    model_snap = [
-        s
-        for s in snaps
-        if "configOptions" in s["data"]["snapshot"]
-        and s["data"]["snapshot"]["configOptions"][0]["id"] == "model"
+    deltas = [e for e in events if e["type"] == "STATE_DELTA"]
+    config_deltas = [
+        d for d in deltas if d["data"]["delta"][0]["path"] == "/configOptions"
     ]
-    assert model_snap, "expected a STATE_SNAPSHOT from the ConfigOptionUpdate"
-    assert model_snap[-1]["data"]["snapshot"]["configOptions"][0]["currentValue"] == (
-        "claude-y"
-    )
+    assert config_deltas, "expected a STATE_DELTA replacing /configOptions"
+    op = config_deltas[-1]["data"]["delta"][0]
+    assert op["op"] == "replace"
+    assert op["value"][0]["id"] == "model"
+    assert op["value"][0]["currentValue"] == "claude-y"
+    # No STATE_SNAPSHOT carries configOptions mid-turn anymore.
+    config_snaps = [
+        s
+        for s in events
+        if s["type"] == "STATE_SNAPSHOT"
+        and "configOptions" in s["data"]["snapshot"]
+        and any(o["id"] == "model" for o in s["data"]["snapshot"]["configOptions"])
+        and s["data"]["snapshot"]["configOptions"][0]["currentValue"] == "claude-y"
+    ]
+    assert not config_snaps, "ConfigOptionUpdate must not emit a STATE_SNAPSHOT"
 
 
 @pytest.mark.asyncio
@@ -769,54 +778,71 @@ async def test_create_session_applies_config_options():
 
 
 @pytest.mark.asyncio
-async def test_usage_update_becomes_custom_agent_usage(
+async def test_usage_update_becomes_state_delta(
     fake_agent: FakeAcpAgent, http_client: httpx.AsyncClient
 ):
-    """A UsageUpdate notification becomes an ``agent:usage`` CUSTOM event."""
+    """A UsageUpdate notification becomes a ``STATE_DELTA`` replacing
+    ``/usage`` (not a ``CUSTOM agent:usage`` event)."""
     fake_agent.script = [
         usage(used=4200, size=200000, cost={"amount": 0.03, "currency": "USD"}),
         end_turn(),
     ]
     async with http_client.stream("POST", "/ag-ui", json=_agui_body()) as resp:
         events = await read_sse_events(resp)
-    customs = [
-        e
-        for e in events
-        if e["type"] == "CUSTOM" and e["data"]["name"] == "agent:usage"
+    deltas = [
+        d
+        for d in events
+        if d["type"] == "STATE_DELTA" and d["data"]["delta"][0]["path"] == "/usage"
     ]
-    assert customs, "expected an agent:usage CUSTOM event"
-    val = customs[-1]["data"]["value"]
+    assert deltas, "expected a STATE_DELTA replacing /usage"
+    val = deltas[-1]["data"]["delta"][0]["value"]
     assert val["used"] == 4200
     assert val["size"] == 200000
     assert val["cost"]["amount"] == 0.03
     assert val["cost"]["currency"] == "USD"
+    # No CUSTOM agent:usage is emitted anymore.
+    assert not [
+        e
+        for e in events
+        if e["type"] == "CUSTOM" and e["data"]["name"] == "agent:usage"
+    ]
 
 
 @pytest.mark.asyncio
-async def test_session_info_update_becomes_custom(
+async def test_session_info_update_becomes_state_delta(
     fake_agent: FakeAcpAgent, http_client: httpx.AsyncClient
 ):
-    """A SessionInfoUpdate notification becomes an ``agent:session_info`` event."""
+    """A SessionInfoUpdate notification becomes a ``STATE_DELTA`` replacing
+    ``/sessionInfo`` (not a ``CUSTOM agent:session_info`` event)."""
     fake_agent.script = [
         session_info(title="My conversation", updated_at="2026-01-01T00:00:00Z"),
         end_turn(),
     ]
     async with http_client.stream("POST", "/ag-ui", json=_agui_body()) as resp:
         events = await read_sse_events(resp)
-    customs = [
+    deltas = [
+        d
+        for d in events
+        if d["type"] == "STATE_DELTA"
+        and d["data"]["delta"][0]["path"] == "/sessionInfo"
+    ]
+    assert deltas, "expected a STATE_DELTA replacing /sessionInfo"
+    val = deltas[-1]["data"]["delta"][0]["value"]
+    assert val["title"] == "My conversation"
+    assert val["updatedAt"] == "2026-01-01T00:00:00Z"
+    assert not [
         e
         for e in events
         if e["type"] == "CUSTOM" and e["data"]["name"] == "agent:session_info"
     ]
-    assert customs, "expected an agent:session_info CUSTOM event"
-    assert customs[-1]["data"]["value"]["title"] == "My conversation"
 
 
 @pytest.mark.asyncio
-async def test_plan_update_and_removed_become_custom(
+async def test_plan_update_and_removed_become_state_delta(
     fake_agent: FakeAcpAgent, http_client: httpx.AsyncClient
 ):
-    """AgentPlanUpdate and AgentPlanRemovedUpdate become CUSTOM events."""
+    """AgentPlanUpdate and AgentPlanRemovedUpdate become ``STATE_DELTA``
+    ops on ``/plans/default`` and ``/plans/<id>`` (not CUSTOM events)."""
     fake_agent.script = [
         plan(
             entries=[
@@ -829,14 +855,27 @@ async def test_plan_update_and_removed_become_custom(
     ]
     async with http_client.stream("POST", "/ag-ui", json=_agui_body()) as resp:
         events = await read_sse_events(resp)
+    plan_deltas = [
+        d
+        for d in events
+        if d["type"] == "STATE_DELTA"
+        and d["data"]["delta"][0]["path"].startswith("/plans/")
+    ]
+    assert len(plan_deltas) == 2, f"expected 2 plan STATE_DELTAs, got {plan_deltas}"
+    # First: replace /plans/default with the items plan.
+    replace = plan_deltas[0]["data"]["delta"][0]
+    assert replace["op"] == "replace"
+    assert replace["path"] == "/plans/default"
+    assert replace["value"]["type"] == "items"
+    assert len(replace["value"]["entries"]) == 2
+    # Second: remove /plans/plan-1.
+    remove = plan_deltas[1]["data"]["delta"][0]
+    assert remove["op"] == "remove"
+    assert remove["path"] == "/plans/plan-1"
+    # No CUSTOM agent:plan* events are emitted anymore.
     names = [e["data"]["name"] for e in events if e["type"] == "CUSTOM"]
-    assert "agent:plan" in names
-    assert "agent:plan_removed" in names
-    customs = [e for e in events if e["type"] == "CUSTOM"]
-    plan_evt = next(e for e in customs if e["data"]["name"] == "agent:plan")
-    assert len(plan_evt["data"]["value"]["entries"]) == 2
-    removed_evt = next(e for e in customs if e["data"]["name"] == "agent:plan_removed")
-    assert removed_evt["data"]["value"]["id"] == "plan-1"
+    assert "agent:plan" not in names
+    assert "agent:plan_removed" not in names
 
 
 @pytest.mark.asyncio

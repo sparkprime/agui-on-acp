@@ -48,7 +48,7 @@ from agui_on_acp.sessions.store import SessionStore
 logger = logging.getLogger(__name__)
 
 
-# ── Exceptions ─────────────────────────────────────────────────────────────
+# ── Exceptions ─────────────────────────────────────────────────────────────────
 
 
 class SessionManagerError(Exception):
@@ -286,6 +286,7 @@ class SessionManager:
             current_mode_id=current_mode_id,
             config_options=config_opts,
         )
+        _attach_state_callbacks(active)
         self._sessions[session_id] = active
         # Persist the ``session_id → cwd`` record so connect/attach can
         # resolve cwd without the client resending it.
@@ -386,6 +387,7 @@ class SessionManager:
             protocol=protocol,
             bridge=bridge,
         )
+        _attach_state_callbacks(active)
         self._sessions[session_id] = active
         logger.info("session connected (replayed) → %s", session_id)
         return active, replay_queue
@@ -443,6 +445,7 @@ class SessionManager:
             protocol=protocol,
             bridge=bridge,
         )
+        _attach_state_callbacks(active)
         self._sessions[session_id] = active
         logger.info("session resumed for prompt → %s", session_id)
         return active
@@ -787,6 +790,36 @@ TaskManager = SessionManager
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
+
+
+def _attach_state_callbacks(active: ActiveSession) -> None:
+    """Wire the bridge's state-change callbacks to refresh ``ActiveSession``
+    fields the bridge is too low-level to own directly.
+
+    The bridge emits the wire event (``STATE_DELTA`` for config options, a
+    ``CUSTOM`` ``agent:mode_update`` for mode) and *also* invokes these
+    callbacks so the manager-side diff baseline (``active.current_mode_id``
+    and ``active.config_options``) reflects agent-driven changes. Without
+    this, an autonomous agent-side mode/config change would leave the
+    baseline stale, and the next run's ``state`` diff would silently
+    fight/overwrite it (the proposal's current_mode_id staleness bug, and
+    its config-options twin — same class of bug, fixed together).
+    """
+    bridge = active.bridge
+
+    def _on_mode_changed(mode_id: str) -> None:
+        active.current_mode_id = mode_id
+
+    def _on_config_options_changed(
+        options: list[dict[str, Any]],
+    ) -> None:
+        active.config_options = options
+
+    bridge.on_mode_changed = _on_mode_changed  # type: ignore[assignment]
+    bridge.on_config_options_changed = _on_config_options_changed  # type: ignore[assignment]
+
+
+# ── Helpers (session meta extraction / option application) ────────────────
 
 
 def _extract_session_meta(

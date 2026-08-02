@@ -64,6 +64,41 @@ the full rationale.
 
 For the full bidirectional field mapping and impedance-mismatch notes, see [agui-acp-mapping.md](agui-acp-mapping.md).
 
+## Evolving state: plan / usage / sessionInfo
+
+Beyond config (mode/model/configOptions), the bridge routes three more
+ACP update kinds through AG-UI's native `state` channel rather than
+`CUSTOM` fire-and-forget events:
+
+- `AgentPlanUpdate` / `AgentPlanContentUpdate` / `AgentPlanRemovedUpdate` →
+  `STATE_DELTA` JSON Patch ops on `/plans/<id>` (legacy no-id plan under the
+  `"default"` sentinel).
+- `UsageUpdate` → `STATE_DELTA` `replace /usage` (a running token/cost
+  counter).
+- `SessionInfoUpdate` → `STATE_DELTA` `replace /sessionInfo` (title +
+  timestamp, with null-clear semantics preserved).
+- `ConfigOptionUpdate` → `STATE_DELTA` `replace /configOptions` (was a
+  partial `STATE_SNAPSHOT`; moved to a delta so it no longer wipes
+  plan/usage/sessionInfo — the "STATE_SNAPSHOT merge trap").
+
+The bridge tracks the current values (`_plans` / `_usage` / `_session_info`,
+persistent across runs within a session) and includes them in the
+post-`start_run` `STATE_SNAPSHOT` baseline, so the first per-field
+`STATE_DELTA` `replace` is valid under a strict RFC 6902 applier. A
+`CurrentModeUpdate` (still a `CUSTOM` event for now) likewise refreshes
+`ActiveSession.current_mode_id` via an `on_mode_changed` callback so the
+next run's `state.mode` diff doesn't fight an autonomous agent-side mode
+change; `ConfigOptionUpdate` does the same for `active.config_options` via
+`on_config_options_changed`.
+
+This also fixes a reconnect bug: during `session/load` replay the
+`MessageSnapshotAccumulator` folds `STATE_SNAPSHOT`/`STATE_DELTA` into a
+parallel `_state` dict (a lenient RFC 6902 applier, like the reference
+client's `fast-json-patch`) and `end_replay()` emits one `STATE_SNAPSHOT`
+from it alongside the `MESSAGES_SNAPSHOT` — so the todo list, token meter,
+and session title survive disconnect/reconnect instead of vanishing. See
+`proposals/plan-usage-session-info-as-state.md`.
+
 ## Persistent State
 
 The backend ACP server holds the majority of the state.  Additional state, per session, is held
