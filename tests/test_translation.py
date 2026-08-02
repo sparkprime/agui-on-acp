@@ -301,6 +301,15 @@ async def test_permission_request_interrupts_run_then_resume_resolves(
     assert interrupt["toolCallId"] == "perm1"
     assert interrupt["reason"] == "tool_call"
     assert interrupt["expiresAt"] is not None
+    # `responseSchema` carries a JSON Schema enum of the option ids so a
+    # generic AG-UI client can render the resume-payload contract from the
+    # wire event alone (proposal: permission-response-schema.md).
+    assert interrupt["responseSchema"] == {
+        "type": "string",
+        "enum": ["once", "always", "reject"],
+    }
+    # `metadata.options` still carries the labels/kind enrichment.
+    assert interrupt["metadata"]["options"][0]["name"] == "Allow once"
 
     # "before-approval" text was streamed, "after-approval" was not yet.
     r1_text = "".join(

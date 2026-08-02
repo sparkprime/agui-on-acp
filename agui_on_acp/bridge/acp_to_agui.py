@@ -604,6 +604,24 @@ class AcpToAguiBridge:
             else:
                 serialized_options.append(str(opt))
 
+        # Build a JSON Schema enum of the option ids so a generic AG-UI
+        # client can render the resume-payload contract (and the choice)
+        # from the wire event alone, without needing this bridge's private
+        # `metadata.options` convention. Falls back to `None` (the field's
+        # default) if `options` was empty/malformed — emitting a schema
+        # with an empty `enum` would be unsatisfiable. See
+        # `proposals/permission-response-schema.md`.
+        option_ids: list[str] = []
+        for opt in serialized_options:
+            if isinstance(opt, dict):
+                opt_dict = cast(dict[str, Any], opt)
+                option_id = opt_dict.get("optionId")
+                if option_id:
+                    option_ids.append(str(option_id))
+        response_schema: dict[str, Any] | None = (
+            {"type": "string", "enum": option_ids} if option_ids else None
+        )
+
         # Compute an expiry deadline shared by the interrupt and the Future TTL
         # so the AG-UI client guard (agent.ts:407-411) and our server-side
         # cleanup agree.
@@ -619,6 +637,7 @@ class AcpToAguiBridge:
             reason="tool_call",
             toolCallId=tool_call_id,
             message=f"Permission required: {tool_name}",
+            responseSchema=response_schema,
             expiresAt=expires_at_iso,
             metadata={
                 "toolName": tool_name,

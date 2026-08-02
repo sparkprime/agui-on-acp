@@ -15,7 +15,7 @@ of AG-UI events. This is the standard AG-UI server contract:
 
 import asyncio
 import logging
-from typing import Any
+from typing import Any, cast
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -235,11 +235,14 @@ def _resolve_session_options(
     three config keys are now load-bearing).
     """
     state = body.state
-    mode = state.get("mode")
-    model = state.get("model")
-    config_options = state.get("configOptions")
-    if not isinstance(config_options, dict):
-        config_options = None
+    mode: str | None = state.get("mode")
+    model: str | None = state.get("model")
+    config_options_raw = state.get("configOptions")
+    config_options: dict[str, Any] | None = (
+        cast(dict[str, Any], config_options_raw)
+        if isinstance(config_options_raw, dict)
+        else None
+    )
     return mode, model, config_options
 
 
@@ -263,7 +266,10 @@ def _emit_state_snapshot(active: ActiveSession) -> None:
     if active.current_mode_id:
         snapshot["currentModeId"] = active.current_mode_id
     if snapshot:
-        active.bridge._emit(  # pylint: disable=protected-access
+        # Accessing the bridge's internal ``_emit`` is intentional here
+        # rather than widening the bridge API with a public snapshot
+        # emitter for this one call site.
+        active.bridge._emit(  # pylint: disable=protected-access  # pyright: ignore[reportPrivateUsage]
             StateSnapshotEvent(snapshot=snapshot)
         )
 
