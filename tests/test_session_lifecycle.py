@@ -7,11 +7,15 @@ never changes silently, and a failed resume/load is never papered over by
 minting a new session.
 """
 
+import asyncio
 import json
 from typing import Any
 
+import acp
 import pytest
+from acp import schema as acp_schema
 
+from agui_on_acp.agui.events import AguiEvent, MessagesSnapshotEvent
 from agui_on_acp.bridge.acp_to_agui import AcpToAguiBridge
 from tests.conftest import make_stack, teardown_stack
 from tests.fake_agent import (
@@ -475,3 +479,199 @@ async def test_connect_unknown_session_is_404_not_500():
         assert fake.new_session_calls == []
     finally:
         await teardown_stack(fake, manager, client)
+
+
+# ── Dict-fallback replay regression ───────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_dict_fallback_replay_folds_tool_call_and_update():
+    """Regression for the silently-dropped-dict-tool-call-update bug.
+
+    The legacy ``_handle_session_update_dict`` had a replay-redirect guard
+    that listed ``tool_call`` and ``tool_call_update`` in its ``kind in
+    (...)`` tuple but only actually handled ``agent_message_chunk`` /
+    ``user_message_chunk`` / ``turn_end`` inside it. A dict-shaped
+    ``tool_call``/``tool_call_update`` arriving during a dict-fallback
+    replay entered the guarded block, matched no inner ``elif``, and
+    returned — silently swallowed with no snapshot entry.
+
+    The convergence deletes that guard entirely: the dict handlers now
+    call the same shared ``_process_*`` methods as the typed path, and
+    ``_emit()`` folds the resulting events into the replay accumulator.
+    This test drives the bridge directly with raw dict updates (the
+    dict-fallback path) during replay and asserts the tool call and its
+    result appear in the ``MESSAGES_SNAPSHOT`` — which would have failed
+    against the pre-convergence code.
+    """
+    bridge = AcpToAguiBridge(task_id="t1")
+    queue: asyncio.Queue[AguiEvent] = asyncio.Queue()
+    bridge.start_replay(queue)
+
+    # A dict-shaped tool_call + tool_call_update sequence (the
+    # dict-fallback path — no typed schema objects involved).
+    await bridge.session_update(
+        "t1",
+        {"sessionUpdate": "agent_message_chunk", "content": {"text": "running bash"}},
+    )
+    await bridge.session_update(
+        "t1",
+        {"sessionUpdate": "tool_call", "toolCallId": "tc1", "title": "bash"},
+    )
+    await bridge.session_update(
+        "t1",
+        {
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "tc1",
+            "status": "in_progress",
+            "raw_input": {"command": "ls -la", "cwd": "/tmp"},
+        },
+    )
+    await bridge.session_update(
+        "t1",
+        {
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "tc1",
+            "status": "completed",
+            "raw_output": {"output": "total 0"},
+        },
+    )
+    await bridge.session_update("t1", {"sessionUpdate": "turn_end"})
+
+    bridge.end_replay()
+
+    # Drain the real queue — RUN_STARTED, MESSAGES_SNAPSHOT, RUN_FINISHED.
+    events: list[AguiEvent] = []
+    while not queue.empty():
+        events.append(queue.get_nowait())
+    types = [e.type.value for e in events]
+    assert types[0] == "RUN_STARTED"
+    assert "MESSAGES_SNAPSHOT" in types
+    assert types[-1] == "RUN_FINISHED"
+
+    snap = next(e for e in events if isinstance(e, MessagesSnapshotEvent))
+    msgs = snap.messages
+    roles = [m.role for m in msgs]
+    assert roles == ["assistant", "tool"], f"unexpected roles: {roles}"
+
+    assistant = msgs[0]
+    assert assistant.content == "running bash"
+    assert assistant.toolCalls is not None
+    assert len(assistant.toolCalls) == 1
+    call = assistant.toolCalls[0]
+    assert call.id == "tc1"
+    # Display name derived from tool name + command (live path behaviour
+    # inherited by replay via the shared _process_tool_call_update).
+    assert call.function["name"] == "bash: ls -la"
+    assert json.loads(call.function["arguments"]) == {
+        "command": "ls -la",
+        "cwd": "/tmp",
+    }
+
+    tool_msg = msgs[1]
+    assert tool_msg.role == "tool"
+    assert tool_msg.toolCallId == "tc1"
+    assert tool_msg.content == "total 0"
+
+
+@pytest.mark.asyncio
+async def test_dict_fallback_replay_user_message_chunk():
+    """A dict-shaped ``user_message_chunk`` during replay coalesces into a
+    ``role="user"`` ``SnapshotMessage`` (the legacy replay-redirect guard
+    handled this case, but the convergence moves it to a dedicated
+    ``_handle_user_message_chunk_dict`` shim — this locks that in)."""
+    bridge = AcpToAguiBridge(task_id="t1")
+    queue: asyncio.Queue[AguiEvent] = asyncio.Queue()
+    bridge.start_replay(queue)
+
+    await bridge.session_update(
+        "t1",
+        {"sessionUpdate": "user_message_chunk", "content": {"text": "please help"}},
+    )
+    await bridge.session_update(
+        "t1",
+        {"sessionUpdate": "agent_message_chunk", "content": {"text": "sure"}},
+    )
+    await bridge.session_update("t1", {"sessionUpdate": "turn_end"})
+
+    bridge.end_replay()
+
+    events: list[AguiEvent] = []
+    while not queue.empty():
+        events.append(queue.get_nowait())
+    snap = next(e for e in events if isinstance(e, MessagesSnapshotEvent))
+    roles = [m.role for m in snap.messages]
+    assert roles == ["user", "assistant"]
+    assert snap.messages[0].content == "please help"
+    assert snap.messages[1].content == "sure"
+
+
+@pytest.mark.asyncio
+async def test_replay_tool_call_with_raw_input_only_at_start_has_nonempty_args():
+    """A tool call that carries its full ``raw_input`` at ``ToolCallStart``
+    time (and never sends a ``ToolCallProgress`` with ``raw_input``) still
+    shows non-empty args in the replay snapshot.
+
+    The old replay path (``_append_replay_tool_start``) used
+    ``ToolCallStart.raw_input`` as the initial args; the converged path
+    inherits the live path's deferred-start behaviour, which originally
+    discarded ``ToolCallStart.raw_input`` entirely — producing empty args
+    for agents that send args only at start time. The fix stores
+    ``ToolCallStart.raw_input`` as a fallback in ``_pending_tool_starts``
+    and flushes it as ``TOOL_CALL_ARGS`` at completion when no
+    ``ToolCallProgress.raw_input`` arrived first. This test locks that in
+    for both the typed and dict paths.
+    """
+
+    for label, start_update in (
+        (
+            "typed",
+            acp_schema.ToolCallStart(
+                session_update="tool_call",
+                tool_call_id="tc1",
+                title="bash",
+                status="pending",
+                raw_input={"command": "ls -la", "cwd": "/tmp"},
+            ),
+        ),
+        (
+            "dict",
+            {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "tc1",
+                "title": "bash",
+                "raw_input": {"command": "ls -la", "cwd": "/tmp"},
+            },
+        ),
+    ):
+        bridge = AcpToAguiBridge(task_id="t1")
+        queue: asyncio.Queue[AguiEvent] = asyncio.Queue()
+        bridge.start_replay(queue)
+
+        await bridge.session_update("t1", start_update)
+        # Completion with raw_output only — NO ToolCallProgress with raw_input.
+        await bridge.session_update(
+            "t1",
+            acp.schema.ToolCallProgress(
+                session_update="tool_call_update",
+                tool_call_id="tc1",
+                status="completed",
+                raw_output={"output": "total 0"},
+            ),
+        )
+        await bridge.session_update("t1", {"sessionUpdate": "turn_end"})
+        bridge.end_replay()
+
+        events: list[AguiEvent] = []
+        while not queue.empty():
+            events.append(queue.get_nowait())
+        snap = next(e for e in events if isinstance(e, MessagesSnapshotEvent))
+        assistant = next(m for m in snap.messages if m.role == "assistant")
+        assert assistant.toolCalls is not None
+        call = assistant.toolCalls[0]
+        # Display name includes the command (derived from the start-time
+        # raw_input fallback).
+        assert call.function["name"] == "bash: ls -la", f"[{label}] name"
+        # Args are non-empty — the fix.
+        args = json.loads(call.function["arguments"])
+        assert args == {"command": "ls -la", "cwd": "/tmp"}, f"[{label}] args"

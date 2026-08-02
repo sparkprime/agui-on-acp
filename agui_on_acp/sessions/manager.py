@@ -259,11 +259,21 @@ class SessionManager:
         runner.task_id = session_id
 
         modes, models, current_mode_id, config_opts = _extract_session_meta(result)
-        applied_mode = await _apply_session_options(
+        applied = await _apply_session_options(
             protocol, session_id, mode, model, config_options
         )
-        if applied_mode is not None:
-            current_mode_id = applied_mode
+        if applied.mode is not None:
+            current_mode_id = applied.mode
+        # Reflect the applied values into the advertised config-options
+        # baseline so the first prompt's diff (against ``state``) is stable —
+        # without this, a client that sets ``model`` at create time and then
+        # echoes the same value back via ``state.model`` would trigger a
+        # redundant ``set_config_option`` on every run.
+        if applied.model is not None and config_opts:
+            _set_option_value_in_list(config_opts, "model", applied.model)
+        if applied.config_options and config_opts:
+            for cid, value in applied.config_options.items():
+                _set_option_value_in_list(config_opts, cid, value)
 
         active = ActiveSession(
             session_id=session_id,
@@ -580,6 +590,9 @@ class SessionManager:
             if active.bridge.run_id is not None:
                 active.bridge.finish_run()
         except Exception:  # pylint: disable=broad-exception-caught
+            # Mid-run failure: the stream is already open, so surface the
+            # error as a RUN_ERROR event rather than propagating into the
+            # ASGI layer. logger.exception captures the full trace.
             logger.exception("Run %s failed", run_id)
             active.bridge.error_run(f"run {run_id} failed")
 
@@ -593,7 +606,12 @@ class SessionManager:
         return active.event_queues.get(run_id)
 
     async def resume_run(
-        self, task_id: str, resume_entries: list[dict[str, Any]]
+        self,
+        task_id: str,
+        resume_entries: list[dict[str, Any]],
+        mode: str | None = None,
+        model: str | None = None,
+        config_options: dict[str, Any] | None = None,
     ) -> str:
         """Resume a prompt task suspended at a permission interrupt.
 
@@ -601,6 +619,15 @@ class SessionManager:
         RUN_STARTED without resetting tool-call state), then resolves the
         parked permission Future(s) from the resume entries. The prompt task
         wakes from ``await future`` and continues emitting into the new queue.
+
+        After resolving the interrupts (so the permission decision the user
+        is resolving settles under the mode that was active when the agent
+        asked), the same diff-and-apply step as the fresh-prompt path runs for
+        ``mode``/``model``/``configOptions``. This is what lets a client
+        change settings on a resume run — the AG-UI ``state`` channel is
+        resent on every run, resume included, so the bridge diffs against the
+        last-applied baseline and only fires ``set_*`` calls for actual
+        changes (see ``apply_session_options``).
 
         Returns the new run_id. Raises ``KeyError`` if the session is unknown
         or ``ValueError`` if there are no pending interrupts to resume.
@@ -623,11 +650,22 @@ class SessionManager:
 
         # Resolve each resume entry against its parked future. The bridge
         # dispatches by id across both the permission and elicitation tables.
+        # This happens BEFORE the config apply so the permission decision
+        # settles under the mode that was active when the agent asked — a
+        # deliberate in-bridge sequencing choice (neither ACP nor the
+        # transport requires it; see proposals/state-based-session-config.md).
         for entry in resume_entries:
             interrupt_id = str(entry.get("interruptId", ""))
             status = str(entry.get("status", ""))
             payload = entry.get("payload")
             active.bridge.resolve_interrupt(interrupt_id, status, payload)
+
+        # Apply any mode/model/configOptions carried via ``state`` (with the
+        # same diff-and-apply as the fresh-prompt path). Safe to fire
+        # concurrently with the just-woken prompt task — the transport
+        # multiplexes bidirectional RPCs by request id.
+        if mode is not None or model is not None or config_options is not None:
+            await self.apply_session_options(task_id, mode, model, config_options)
 
         return run_id
 
@@ -664,27 +702,48 @@ class SessionManager:
         mode: str | None,
         model: str | None,
         config_options: dict[str, Any] | None,
-    ) -> None:
-        """Apply mode/model/configOptions mid-session (best-effort).
+    ) -> bool:
+        """Apply mode/model/configOptions mid-session (best-effort, diff-driven).
 
-        Used by the prompt path (``POST /ag-ui`` ``forwardedProps``) to
-        change mode/model/config mid-conversation. Shares the create-time
-        ``_apply_session_options`` helper's best-effort policy: each
-        ``set_*`` call is wrapped in its own try/except so one bad option
-        doesn't abort the rest. A successful ``set_mode`` updates
-        ``active.current_mode_id`` so the post-``start_run`` ``STATE_SNAPSHOT``
-        reflects the new mode.
+        Used by the prompt path (``POST /ag-ui`` ``state`` — with
+        ``forwardedProps`` as a deprecation fallback) to change
+        mode/model/config mid-conversation. Because AG-UI ``state`` is resent
+        on every run (including resumes where nothing changed), this diffs
+        the requested values against the bridge's last-applied baseline
+        (``active.current_mode_id`` / ``active.config_options``) and only
+        issues ``set_*`` calls for fields that actually differ. A successful
+        apply refreshes the baseline so the next run that resends the same
+        ``state`` diffs to "no change".
+
+        Shares the create-time ``_apply_session_options`` helper's best-effort
+        policy: each ``set_*`` call is wrapped in its own try/except so one
+        bad option doesn't abort the rest.
+
+        Returns ``True`` if any ``set_*`` call was attempted (i.e. the diff
+        was non-empty), ``False`` if the incoming values matched the baseline
+        and nothing was applied.
         """
         active = self._get_active(task_id)
-        applied_mode = await _apply_session_options(
+        diff_mode, diff_model, diff_opts = _diff_session_options(
+            active, mode, model, config_options
+        )
+        if diff_mode is None and diff_model is None and not diff_opts:
+            return False
+        applied = await _apply_session_options(
             active.protocol,
             active.session_id,
-            mode,
-            model,
-            config_options,
+            diff_mode,
+            diff_model,
+            diff_opts,
         )
-        if applied_mode is not None:
-            active.current_mode_id = applied_mode
+        # Refresh the baseline so the next run's diff is stable.
+        if applied.mode is not None:
+            active.current_mode_id = applied.mode
+        if applied.model is not None:
+            _set_option_value(active, "model", applied.model)
+        for config_id, value in applied.config_options.items():
+            _set_option_value(active, config_id, value)
+        return applied.any
 
     async def execute_command(
         self, task_id: str, command: str, args: dict[str, Any] | None = None
@@ -760,13 +819,33 @@ def _extract_session_meta(
     return modes, models, current_mode_id, config_opts
 
 
+@dataclass
+class _AppliedSessionOptions:
+    """Result of ``_apply_session_options``: which values were actually
+    pushed to the agent (each ``set_*`` that succeeded). Callers use this
+    to refresh their diff baseline (``ActiveSession.current_mode_id`` /
+    ``config_options``) so a subsequent run that resends the same ``state``
+    diffs to "no change" instead of redundantly re-applying."""
+
+    mode: str | None = None
+    model: str | None = None
+    config_options: dict[str, Any] = field(default_factory=dict[str, Any])
+
+    @property
+    def any(self) -> bool:
+        """True if at least one value was successfully applied."""
+        return (
+            self.mode is not None or self.model is not None or bool(self.config_options)
+        )
+
+
 async def _apply_session_options(
     protocol: AcpProtocol,
     session_id: str,
     mode: str | None,
     model: str | None,
     config_options: dict[str, Any] | None,
-) -> str | None:
+) -> _AppliedSessionOptions:
     """Apply mode/model/config_options after a session is created/resumed
     (create-time) or mid-conversation (prompt-time via
     ``SessionManager.apply_session_options``).
@@ -776,28 +855,35 @@ async def _apply_session_options(
     ``exc_info=True`` ensures the full trace is logged without aborting the
     remaining options.
 
-    Returns the mode id that was successfully applied (or ``None`` if no
-    mode was applied / the call failed), so the caller can update its
-    ``current_mode_id`` tracker to match.
+    Returns the values that were successfully pushed (a ``str | None`` for
+    ``mode``/``model`` and a ``{config_id: value}`` dict for the rest), so
+    the caller can update its baseline trackers to match. Failed ``set_*``
+    calls are omitted from the result — their baseline stays unchanged, so
+    the next run's diff will retry them.
     """
-    applied_mode: str | None = None
+    applied = _AppliedSessionOptions()
     if mode and mode != "default":
         try:
             await protocol.set_mode(session_id, mode)
-            applied_mode = mode
+            applied.mode = mode
         except Exception:  # pylint: disable=broad-exception-caught
             logger.warning("Failed to set mode %s", mode, exc_info=True)
     if model:
         try:
             await protocol.set_model(session_id, model)
+            applied.model = model
         except Exception:  # pylint: disable=broad-exception-caught
             logger.warning("Failed to set model %s", model, exc_info=True)
     if config_options:
         for config_id, value in config_options.items():
             if config_id == "model":
+                # "model" is handled by the dedicated ``set_model`` path above;
+                # a "model" entry inside ``configOptions`` is intentionally
+                # skipped to avoid a duplicate ``set_config_option`` call.
                 continue
             try:
                 await protocol.set_config_option(session_id, config_id, value)
+                applied.config_options[config_id] = value
             except Exception:  # pylint: disable=broad-exception-caught
                 logger.warning(
                     "Failed to set config option %s=%s",
@@ -805,7 +891,89 @@ async def _apply_session_options(
                     value,
                     exc_info=True,
                 )
-    return applied_mode
+    return applied
+
+
+def _current_option_value(active: ActiveSession, config_id: str) -> Any:
+    """Return the ``currentValue`` recorded on ``ActiveSession.config_options``
+    for ``config_id`` (or ``None`` when the option isn't advertised). This is
+    the diff baseline for config options — including ``model``, which is
+    sugar over the ``"model"`` config option."""
+    if not active.config_options:
+        return None
+    for opt in active.config_options:
+        if opt.get("id") == config_id:
+            return opt.get("currentValue")
+    return None
+
+
+def _set_option_value(active: ActiveSession, config_id: str, value: Any) -> None:
+    """Update the ``currentValue`` of an advertised config option in place.
+
+    Used after a successful ``set_config_option`` to refresh the diff baseline
+    so the next run that resends the same ``state`` diffs to "no change".
+    Options the agent never advertised (no matching entry) are left
+    untracked — the bridge will re-apply them on each run that requests them,
+    which is an acceptable edge (the client is setting an option the agent
+    doesn't surface)."""
+    if active.config_options:
+        _set_option_value_in_list(active.config_options, config_id, value)
+
+
+def _set_option_value_in_list(
+    options: list[dict[str, Any]] | None, config_id: str, value: Any
+) -> None:
+    """List-flavoured variant of ``_set_option_value`` for the create-time
+    path, which refreshes the advertised options list before the
+    ``ActiveSession`` is constructed."""
+    if not options:
+        return
+    for opt in options:
+        if opt.get("id") == config_id:
+            opt["currentValue"] = value
+            return
+
+
+def _diff_session_options(
+    active: ActiveSession,
+    mode: str | None,
+    model: str | None,
+    config_options: dict[str, Any] | None,
+) -> tuple[str | None, str | None, dict[str, Any]]:
+    """Diff requested mode/model/configOptions against the bridge's last-applied
+    baseline (``active.current_mode_id`` / ``active.config_options``) and
+    return only the subset that actually changed.
+
+    Returns ``(mode, model, config_options)`` where each element is ``None`` /
+    empty when nothing changed, so the caller can skip the corresponding
+    ``set_*`` calls entirely. This is needed specifically because AG-UI
+    ``state`` (unlike ``forwardedProps``) is resent on every single run —
+    without diffing, unchanged state would trigger a redundant ``set_*``
+    round-trip per turn.
+
+    ``mode == "default"`` is treated as "no mode requested" (mirroring
+    ``_apply_session_options``). The ``"model"`` entry inside
+    ``config_options`` is excluded from the config-options diff — it's handled
+    by the dedicated ``model`` scalar (sugar over ``set_config_option("model")``).
+    """
+    requested_mode = mode if (mode and mode != "default") else None
+    if requested_mode is not None and active.current_mode_id == requested_mode:
+        requested_mode = None
+
+    requested_model = model if model else None
+    if requested_model is not None and (
+        _current_option_value(active, "model") == requested_model
+    ):
+        requested_model = None
+
+    changed_opts: dict[str, Any] = {}
+    if config_options:
+        for config_id, value in config_options.items():
+            if config_id == "model":
+                continue
+            if _current_option_value(active, config_id) != value:
+                changed_opts[config_id] = value
+    return requested_mode, requested_model, changed_opts
 
 
 def _normalize_config_options(options: Any) -> list[dict[str, Any]] | None:

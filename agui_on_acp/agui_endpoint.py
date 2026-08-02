@@ -25,6 +25,7 @@ from agui_on_acp.agui.events import AguiEvent, StateSnapshotEvent
 from agui_on_acp.agui.sse import event_stream
 from agui_on_acp.config import is_cwd_allowed
 from agui_on_acp.sessions.manager import (
+    ActiveSession,
     CwdRecordNotFoundError,
     ResumeUnsupportedError,
     SessionResumeFailedError,
@@ -105,11 +106,25 @@ async def ag_ui_run(body: RunAgentInput, request: Request):
             status_code=400,
         )
 
+    # Mode/model/configOptions are read from AG-UI's native ``state`` channel —
+    # persisted client-side, resent on every run (fresh prompt and resume
+    # alike) via ``agent.setState()`` / CopilotKit's ``useCoAgent``. The bridge
+    # diffs against its last-applied baseline and only fires ``set_*`` for
+    # actual changes, so unchanged ``state`` resent on every run is a no-op.
+    # ``forwardedProps.mcpServers`` is NOT pulled in here — it's a create/
+    # resume-time session parameter, not a per-turn UI setting, and has no
+    # ``STATE_SNAPSHOT`` round-trip (see proposals/state-based-session-config.md).
+    mode, model, config_options = _resolve_session_options(body)
+
     # ── Resume path ──────────────────────────────────────────────────────
     if body.resume:
         try:
             actual_run_id = await manager.resume_run(
-                thread_id, [r.model_dump() for r in body.resume]
+                thread_id,
+                [r.model_dump() for r in body.resume],
+                mode=mode,
+                model=model,
+                config_options=config_options,
             )
         except KeyError:
             return _json_error(
@@ -173,30 +188,71 @@ async def ag_ui_run(body: RunAgentInput, request: Request):
             {"messages": [{"role": "user", "content": user_message}]},
         )
     except Exception:  # pylint: disable=broad-exception-caught
+        # Any failure to start the run (agent down, transport error, etc.)
+        # is reported to the client as a 500 rather than crashing the
+        # endpoint; the full stack trace is logged for server-side diagnosis.
         logger.exception("Failed to start run for thread %s", thread_id)
         return _json_error("failed to start run", status_code=500)
 
-    # Apply mode/model/configOptions carried in ``forwardedProps`` BEFORE
-    # emitting the STATE_SNAPSHOT — this is the sanctioned AG-UI mechanism
-    # for changing mode/model/config mid-conversation (the bridge-only
-    # ``POST /ag-ui/config`` endpoint was removed in favour of this). It
-    # reuses the same best-effort policy as create-time application
+    # Apply mode/model/configOptions (from ``state`` — resolved above) BEFORE
+    # emitting the STATE_SNAPSHOT. This is the sanctioned AG-UI mechanism for
+    # changing mode/model/config mid-conversation: the bridge diffs against
+    # its last-applied baseline and only fires ``set_*`` for actual changes,
+    # so unchanged ``state`` resent on every run is a no-op. It reuses the
+    # same best-effort policy as create-time application
     # (``_apply_session_options``): a single bad option is logged and
     # skipped, never aborting the run. Must run after ``start_run`` attached
     # the run's queue to the bridge — if the agent reflects a mode/config
     # change back as a ``session/update`` notification it needs a live queue
     # to land in (same ordering constraint as the snapshot below).
-    await manager.apply_session_options(
-        thread_id,
-        fp.get("mode"),
-        fp.get("model"),
-        fp.get("configOptions"),
-    )
+    await manager.apply_session_options(thread_id, mode, model, config_options)
 
     # Emit a STATE_SNAPSHOT with available modes/models AFTER start_run has
     # attached the bridge to the run's queue — emitting it before
     # start_run (the previous placement) dropped it because the bridge's
     # _queue was still None.
+    _emit_state_snapshot(active)
+
+    queue = manager.get_event_queue(thread_id, actual_run_id)
+    if queue is None:
+        return _json_error("No event queue for run", status_code=500)
+
+    return _sse_response(queue, thread_id, manager)
+
+
+def _resolve_session_options(
+    body: RunAgentInput,
+) -> tuple[str | None, str | None, dict[str, Any] | None]:
+    """Pull mode/model/configOptions from AG-UI's native ``state`` channel.
+
+    ``state`` is persisted client-side (set once via ``agent.setState()``,
+    resent on every run, fresh prompt or resume) — it's the AG-UI mechanism
+    designed for exactly this "set it once, it round-trips" usage pattern
+    (see ``CopilotKit``'s ``useCoAgent({ state, setState })``). The bridge
+    reads only ``state.mode`` / ``state.model`` / ``state.configOptions``;
+    every other ``state`` key is ignored as opaque, client-owned domain data
+    (consistent with the prior blanket ``state | ignored`` policy — only the
+    three config keys are now load-bearing).
+    """
+    state = body.state
+    mode = state.get("mode")
+    model = state.get("model")
+    config_options = state.get("configOptions")
+    if not isinstance(config_options, dict):
+        config_options = None
+    return mode, model, config_options
+
+
+def _emit_state_snapshot(active: ActiveSession) -> None:
+    """Emit a ``STATE_SNAPSHOT`` advertising the session's modes/models/
+    config options on the run's queue.
+
+    Must be called AFTER ``start_run`` / ``attach_resume_queue`` attached the
+    bridge's emit queue — emitting earlier drops the event (the bridge's
+    ``_queue`` is still ``None``). Accessing the bridge's internal ``_emit``
+    is intentional here rather than widening the bridge API with a public
+    snapshot emitter for this one call site.
+    """
     snapshot: dict[str, Any] = {}
     if active.modes:
         snapshot["modes"] = active.modes
@@ -207,18 +263,9 @@ async def ag_ui_run(body: RunAgentInput, request: Request):
     if active.current_mode_id:
         snapshot["currentModeId"] = active.current_mode_id
     if snapshot:
-        # Access the bridge's internal emit to inject a state snapshot after
-        # start_run attached the queue — a public ``emit`` method would be
-        # cleaner, but adding one widens the bridge API for this one call.
         active.bridge._emit(  # pylint: disable=protected-access
             StateSnapshotEvent(snapshot=snapshot)
         )
-
-    queue = manager.get_event_queue(thread_id, actual_run_id)
-    if queue is None:
-        return _json_error("No event queue for run", status_code=500)
-
-    return _sse_response(queue, thread_id, manager)
 
 
 def _sse_response(

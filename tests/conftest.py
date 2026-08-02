@@ -27,6 +27,12 @@ import acp
 import httpx
 import pytest
 import pytest_asyncio
+
+# ``ClientSideConnection`` is a deprecated import path that pylint cannot
+# resolve from acp's stubs, but the runtime exposes it and the bridge relies
+# on the same symbol.
+# pylint: disable=no-name-in-module
+from acp import ClientSideConnection
 from httpx import ASGITransport
 
 import agui_on_acp.bridge.acp_to_agui as _bridge_mod
@@ -119,11 +125,6 @@ def _patch_runner_spawn(agent: FakeAcpAgent) -> None:
     async def _fake_spawn(
         self: AgentRunner, client: acp.Client, _env: dict[str, str] | None = None
     ) -> acp.ClientSideConnection:
-        # ``ClientSideConnection`` is a deprecated import path (pyright
-        # doesn't see it in acp's stubs) but the runtime exposes it.
-        # pylint: disable=no-name-in-module,import-outside-toplevel
-        from acp import ClientSideConnection
-
         # ClientSideConnection(to_client, writer, reader): the client WRITES
         # requests into client_writer (which feeds the agent's reader) and
         # READS responses from client_reader (which the agent's writer feeds).

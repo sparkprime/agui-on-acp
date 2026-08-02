@@ -267,16 +267,17 @@ class AssistantToolCall(BaseModel):
 class SnapshotMessage(BaseModel):
     """One message in a ``MESSAGES_SNAPSHOT`` event.
 
-    ``role`` matches the AG-UI ``Message`` schema
-    (``ag-ui/.../core/src/types.ts:117-179``): user/assistant/tool/system/
-    developer, plus ``reasoning`` so a replayed transcript can carry
-    ``AgentThoughtChunk`` content in its correct interleaved position
-    rather than as a separate pre-snapshot stream (which the ag-ui client
-    would render concatenated at the top — see the ``MESSAGES_SNAPSHOT``
-    handler in ``ag-ui/.../client/src/apply/default.ts``: when the snapshot
-    carries no reasoning, streamed reasoning is preserved in place). Only
-    ``role="tool"`` messages carry ``toolCallId``; assistant messages may
-    carry ``toolCalls``.
+    ``role`` matches the AG-UI ``Message`` discriminated union
+    (``ag-ui/.../core/src/types.ts:161-169``), which already defines
+    ``reasoning`` as one of its variants (``ReasoningMessageSchema``) —
+    this is not a bridge-local addition. Using it lets a replayed
+    transcript carry ``AgentThoughtChunk`` content in its correct
+    interleaved position rather than as a separate pre-snapshot stream
+    (which the ag-ui client would render concatenated at the top — see
+    the ``MESSAGES_SNAPSHOT`` handler in ``ag-ui/.../client/src/apply/
+    default.ts``: when the snapshot carries no reasoning, streamed
+    reasoning is preserved in place). Only ``role="tool"`` messages carry
+    ``toolCallId``; assistant messages may carry ``toolCalls``.
     """
 
     id: str

@@ -40,7 +40,12 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, Union, cast
 
 import acp
-from acp import schema
+
+# ``AgentSideConnection`` is a deprecated import path that pylint/pyright
+# cannot resolve from acp's stubs, but the runtime exposes it and the bridge
+# relies on the same symbol.
+# pylint: disable=no-name-in-module
+from acp import AgentSideConnection, schema
 from acp.meta import AGENT_METHODS
 from acp.utils import normalize_result
 
@@ -519,12 +524,6 @@ class FakeAcpAgent:
         """Build the ``AgentSideConnection`` over the agent side of the
         in-process transport. Must be called inside a running event loop.
         """
-        # ``AgentSideConnection`` is a deprecated import path (pyright doesn't
-        # see it in acp's stubs) but the runtime exposes it and the bridge
-        # uses the same path.
-        # pylint: disable=no-name-in-module,import-outside-toplevel
-        from acp import AgentSideConnection
-
         # use_unstable_protocol=True so set_session_model (marked unstable in
         # the ACP router) is accepted — models a real agent that supports
         # models. Without it the router rejects session/set_model with

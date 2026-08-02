@@ -75,6 +75,27 @@ Sequencing rules
    ``start_run()`` / ``attach_resume_queue()`` is called — otherwise
    session-init notifications would be lost (no SSE stream exists yet).
 
+Live / replay convergence
+-------------------------
+
+There is exactly **one** implementation of the sequencing rules above —
+the live one. During ``session/load`` replay the bridge flips
+``_replay_mode`` on and ``_emit()`` folds each event into a
+``MessageSnapshotAccumulator`` instead of putting it on the SSE queue;
+``end_replay()`` emits one ``MESSAGES_SNAPSHOT`` from the accumulator.
+Replay is no longer a parallel state machine that has to be kept in sync
+by hand — it is a pure consequence of intercepting the live stream's
+output. A future sequencing fix in the live handlers automatically applies
+to replay too, since there is nothing replay-specific left to fix.
+
+The single retained live/replay behavioural difference is
+``UserMessageChunk``: AG-UI's ``TextMessageStartEvent.role`` is hardcoded
+``"assistant"``, so there is no wire event to fold for a user chunk.
+``_handle_user_message_chunk_typed``/``_dict`` call
+``_replay_accumulator.add_user_text`` directly during replay and drop the
+chunk in live mode (the AG-UI client already holds its own user message).
+This is a deliberate product decision, not a duplicated sequencing rule.
+
 For the full ACP ↔ AG-UI field mapping (including the interrupt/resume
 permission flow and every dropped ACP 0.11 variant) see
 ``docs/agui-acp-mapping.md``.
@@ -92,7 +113,6 @@ import acp.schema
 
 from agui_on_acp.agui.events import (
     AguiEvent,
-    AssistantToolCall,
     CustomEvent,
     Interrupt,
     InterruptOutcome,
@@ -105,7 +125,6 @@ from agui_on_acp.agui.events import (
     RunErrorEvent,
     RunFinishedEvent,
     RunStartedEvent,
-    SnapshotMessage,
     StateSnapshotEvent,
     TextMessageContentEvent,
     TextMessageEndEvent,
@@ -115,6 +134,7 @@ from agui_on_acp.agui.events import (
     ToolCallResultEvent,
     ToolCallStartEvent,
 )
+from agui_on_acp.bridge.snapshot_accumulator import MessageSnapshotAccumulator
 
 logger = logging.getLogger(__name__)
 
@@ -168,34 +188,22 @@ class AcpToAguiBridge:
         # TOOL_CALL_START until the arguments are known so the displayed
         # name can include a key argument (e.g. "bash: ls -la") — ACP agents
         # send the tool name ("bash") at ToolCallStart time and the command
-        # ("ls -la") in a subsequent ToolCallProgress.
-        self._pending_tool_starts: dict[str, tuple[str, str | None]] = {}
+        # ("ls -la") in a subsequent ToolCallProgress. The tuple also stores
+        # the ``raw_input`` from ``ToolCallStart`` (if any) as a fallback for
+        # args + display name when no ``ToolCallProgress.raw_input`` arrives
+        # before completion.
+        self._pending_tool_starts: dict[str, tuple[str, str | None, Any]] = {}
 
         # Replay-mode state — set by start_replay() / cleared by end_replay().
         # During replay (session/load), the ACP agent re-emits the historical
         # session/update stream; instead of translating to delta events the
-        # bridge coalesces the chunks back into whole messages and emits a
-        # single MESSAGES_SNAPSHOT. See ``docs/agui-acp-mapping.md`` and
-        # ``agui_on_acp_changes.md`` §5.1 (Option B).
+        # bridge folds the same AG-UI events the live state machine would
+        # have emitted into a ``MessageSnapshotAccumulator`` and emits a
+        # single ``MESSAGES_SNAPSHOT`` from ``end_replay``. There is no
+        # second, parallel state machine — ``_emit()`` is the single fold
+        # point. See ``docs/agui-acp-mapping.md`` and the module docstring.
         self._replay_mode: bool = False
-        self._replay_messages: list[SnapshotMessage] = []
-        # Whether the trailing ``_replay_messages`` entry is an open reasoning
-        # message that contiguous ``AgentThoughtChunk`` deltas should append
-        # to. Closed by ``_close_replay_reasoning`` on any non-thought chunk
-        # (assistant text, tool start, tool result, user turn, turn end) so
-        # the next thought opens a fresh reasoning message in transcript
-        # order. Without this, replayed thoughts would all coalesce into a
-        # single leading reasoning message — see the ``MESSAGES_SNAPSHOT``
-        # handler in ``ag-ui/.../client/src/apply/default.ts``: reasoning
-        # absent from the snapshot is preserved in place, so a single
-        # pre-snapshot reasoning message renders concatenated at the top.
-        self._replay_reasoning_open: bool = False
-        # Map an open tool call id → (assistant-message index in
-        # _replay_messages, tool-call index in that message's toolCalls,
-        # original tool name from ToolCallStart) so ToolCallProgress (the
-        # result) can close it and mint a tool message, and the display
-        # name can be derived from the original name + raw_input.
-        self._replay_open_tools: dict[str, tuple[int, int, str]] = {}
+        self._replay_accumulator: MessageSnapshotAccumulator | None = None
 
         # Session-level notification buffer — holds _kiro.dev/* notifications
         # that arrive before any run starts (e.g. during session init).
@@ -262,7 +270,16 @@ class AcpToAguiBridge:
             self._pending_notifications.clear()
 
     def finish_run(self) -> None:
-        """Explicitly finish the current run (e.g. on turn_end)."""
+        """Explicitly finish the current run (e.g. on turn_end).
+
+        During replay this is also called per historical ``turn_end`` and
+        from ``end_replay``: it closes any dangling message / reasoning /
+        tool-call frames (folding harmlessly into the replay accumulator)
+        and emits a ``RUN_FINISHED`` (also folded harmlessly). ``_run_id``
+        is preserved across replay turns so ``end_replay`` can still
+        reference it for the final on-the-wire ``RUN_FINISHED``; it is only
+        nulled in live mode.
+        """
         self._close_open_reasoning()
         self._close_open_message()
         self._close_all_tool_calls()
@@ -272,7 +289,8 @@ class AcpToAguiBridge:
                     runId=self._run_id, taskId=self.task_id, threadId=self.task_id
                 )
             )
-        self._run_id = None
+        if not self._replay_mode:
+            self._run_id = None
 
     def error_run(self, message: str, code: str | None = None) -> None:
         """Emit RUN_ERROR and close the run."""
@@ -325,42 +343,54 @@ class AcpToAguiBridge:
             self._pending_notifications.clear()
 
     def start_replay(self, queue: asyncio.Queue[AguiEvent]) -> None:
-        """Begin a replay run — coalesce the historical session/update
-        stream delivered during ``session/load`` into a single
+        """Begin a replay run — fold the historical session/update stream
+        delivered during ``session/load`` into a single
         ``MESSAGES_SNAPSHOT`` instead of delta events.
 
-        Emits a synthetic ``RUN_STARTED`` so the SSE stream has normal
-        start framing; ``end_replay`` emits the snapshot + ``RUN_FINISHED``.
+        Emits a synthetic ``RUN_STARTED`` on the real queue *before*
+        flipping ``_replay_mode`` on, so subsequent ``_emit`` calls fold
+        into the accumulator. ``end_replay`` flips replay back off, emits
+        the snapshot + a closing ``RUN_FINISHED`` on the real queue.
         """
-        self._replay_mode = True
-        self._replay_messages = []
-        self._replay_reasoning_open = False
-        self._replay_open_tools = {}
         self._run_id = str(uuid.uuid4())
         self._queue = queue
+        # _replay_mode is still False here → RUN_STARTED goes on the real
+        # queue, not into the accumulator.
         self._emit(
             RunStartedEvent(
                 runId=self._run_id, taskId=self.task_id, threadId=self.task_id
             )
         )
+        self._replay_mode = True
+        self._replay_accumulator = MessageSnapshotAccumulator()
 
     def end_replay(self) -> None:
-        """Finish a replay: emit the coalesced ``MESSAGES_SNAPSHOT`` and a
-        closing ``RUN_FINISHED``."""
+        """Finish a replay: close any dangling frames, flip replay off,
+        and emit the coalesced ``MESSAGES_SNAPSHOT`` + a closing
+        ``RUN_FINISHED`` on the real queue."""
         if not self._replay_mode:
             return
-        self._close_replay_assistant()
-        self._emit(MessagesSnapshotEvent(messages=list(self._replay_messages)))
-        if self._run_id:
+        run_id = self._run_id
+        # finish_run closes dangling message/reasoning/tool-call frames
+        # and emits a RUN_FINISHED — all folded harmlessly into the
+        # accumulator. It does NOT null _run_id during replay.
+        self.finish_run()
+        # Flip replay off BEFORE emitting the bracket so the snapshot +
+        # RUN_FINISHED go on the real queue, not back into the accumulator.
+        self._replay_mode = False
+        accumulator = self._replay_accumulator
+        self._emit(
+            MessagesSnapshotEvent(
+                messages=accumulator.snapshot() if accumulator else []
+            )
+        )
+        if run_id is not None:
             self._emit(
                 RunFinishedEvent(
-                    runId=self._run_id, taskId=self.task_id, threadId=self.task_id
+                    runId=run_id, taskId=self.task_id, threadId=self.task_id
                 )
             )
-        self._replay_mode = False
-        self._replay_messages = []
-        self._replay_reasoning_open = False
-        self._replay_open_tools = {}
+        self._replay_accumulator = None
         self._run_id = None
         self._queue = None
 
@@ -501,10 +531,7 @@ class AcpToAguiBridge:
             content = getattr(update, "content", None)
             thought_text = getattr(content, "text", "") if content else ""
             if thought_text:
-                if self._replay_mode:
-                    self._append_replay_reasoning(thought_text)
-                else:
-                    self._emit_reasoning_delta(thought_text)
+                self._process_thought_delta(thought_text)
         else:
             # Fallback: try to extract as dict
             if hasattr(update, "model_dump"):
@@ -951,41 +978,22 @@ class AcpToAguiBridge:
     # ── Fallback dict-based session/update handling ──────────────────────────
 
     def _handle_session_update_dict(self, update: dict[str, Any]) -> None:
-        """Handle session/update when received as a raw dict (fallback)."""
+        """Handle session/update when received as a raw dict (fallback).
+
+        During replay the per-kind handlers below call the shared
+        ``_process_*`` methods, which call ``_emit()`` — and ``_emit()``
+        already folds into the replay accumulator when ``_replay_mode`` is
+        set. There is no replay-redirect branch here: the same code path
+        serves both live and replay, which is the whole point of the
+        convergence (the legacy dict-fallback replay-redirect block used
+        to silently swallow dict-shaped ``tool_call``/``tool_call_update``
+        updates during replay — that gap is now structurally closed).
+        """
         kind = update.get("sessionUpdate") or update.get("session_update")
-        if self._replay_mode and kind in (
-            "agent_message_chunk",
-            "user_message_chunk",
-            "tool_call",
-            "tool_call_update",
-            "turn_end",
-        ):
-            # Redirect to the replay coalescer so a dict-delivered replay
-            # also produces a single MESSAGES_SNAPSHOT (typed path is the
-            # norm; this keeps the legacy fallback consistent).
-            if kind == "agent_message_chunk":
-                content = update.get("content", {})
-                text = (
-                    cast(dict[str, Any], content).get("text", "")
-                    if isinstance(content, dict)
-                    else ""
-                )
-                if text:
-                    self._append_replay_text("assistant", text)
-            elif kind == "user_message_chunk":
-                content = update.get("content", {})
-                text = (
-                    cast(dict[str, Any], content).get("text", "")
-                    if isinstance(content, dict)
-                    else ""
-                )
-                if text:
-                    self._append_replay_text("user", text)
-            elif kind == "turn_end":
-                pass  # end_replay closes everything; no per-turn action
-            return
         if kind == "agent_message_chunk":
             self._handle_agent_message_chunk_dict(update)
+        elif kind == "user_message_chunk":
+            self._handle_user_message_chunk_dict(update)
         elif kind == "tool_call":
             self._handle_tool_call_dict(update)
         elif kind == "tool_call_update":
@@ -1046,10 +1054,7 @@ class AcpToAguiBridge:
                 else ""
             )
             if thought_text:
-                if self._replay_mode:
-                    self._append_replay_reasoning(thought_text)
-                else:
-                    self._emit_reasoning_delta(thought_text)
+                self._process_thought_delta(thought_text)
         else:
             self._log.debug("Unhandled session/update kind: %s", kind)
 
@@ -1065,33 +1070,7 @@ class AcpToAguiBridge:
             text = getattr(content, "text", "") or ""
         if not text:
             return
-
-        if self._replay_mode:
-            self._append_replay_text("assistant", text)
-            return
-
-        # Close any open reasoning phase before streaming text — mirrors
-        # the replay path's `_append_replay_text` calling
-        # `_close_replay_reasoning`. Without this, a thought that arrives
-        # before text stays open across the text boundary, so the next
-        # thought appends to the *same* reasoning message (both are in one
-        # phase), and the single concatenated reasoning renders before (or
-        # after, depending on arrival order) the tool calls instead of
-        # interleaved with them.
-        self._close_open_reasoning()
-
-        if not self._has_open_message:
-            msg_id = str(uuid.uuid4())
-            self._current_message_id = msg_id
-            self._has_open_message = True
-            self._emit(TextMessageStartEvent(messageId=msg_id))
-
-        self._emit(
-            TextMessageContentEvent(
-                messageId=self._current_message_id,  # type: ignore[arg-type]
-                delta=text,
-            )
-        )
+        self._process_text_delta(text)
 
     def _handle_user_message_chunk_typed(
         self, update: acp.schema.UserMessageChunk
@@ -1102,7 +1081,8 @@ class AcpToAguiBridge:
         During replay: coalesce into a ``SnapshotMessage(role="user")`` so
         the client's transcript is hydrated with what the user said, not just
         the agent's replies. Outside replay: dropped — the live AG-UI client
-        already holds its own user message.
+        already holds its own user message. This is the single retained
+        live/replay behavioural difference (see the module docstring).
         """
         if not self._replay_mode:
             return
@@ -1112,27 +1092,24 @@ class AcpToAguiBridge:
             text = getattr(content, "text", "") or ""
         if not text:
             return
-        self._append_replay_text("user", text)
+        self._close_open_reasoning()
+        assert self._replay_accumulator is not None
+        self._replay_accumulator.add_user_text(text)
 
     def _handle_tool_call_typed(self, update: acp.schema.ToolCallStart) -> None:
         """Handle ToolCallStart from the SDK.
 
-        In replay mode, delegates to ``_append_replay_tool_start``. In live
-        mode, buffers the tool call — the actual ``TOOL_CALL_START`` event is
+        Buffers the tool call — the actual ``TOOL_CALL_START`` event is
         deferred until the first ``ToolCallProgress`` with ``raw_input``
         arrives, so the displayed name can include a key argument (e.g.
         ``"bash: ls -la"``). ACP agents send the tool name (``"bash"``) at
         ``ToolCallStart`` time and the command in a subsequent
         ``ToolCallProgress``; emitting ``TOOL_CALL_START`` before the command
         is known would show just ``"bash"`` with no way to update it later
-        (AG-UI has no tool-call-name-update event).
+        (AG-UI has no tool-call-name-update event). ``raw_input`` from
+        ``ToolCallStart`` (if present) is stored as a fallback for args +
+        display name when no ``ToolCallProgress.raw_input`` arrives.
         """
-        if self._replay_mode:
-            self._append_replay_tool_start(update)
-            return
-        self._close_open_reasoning()
-        self._close_open_message()
-
         tool_call_id = str(
             getattr(update, "tool_call_id", None)
             or getattr(update, "toolCallId", str(uuid.uuid4()))
@@ -1140,19 +1117,8 @@ class AcpToAguiBridge:
         tool_name = getattr(update, "title", None) or getattr(
             update, "tool_name", "unknown"
         )
-
-        self._pending_tool_starts[tool_call_id] = (
-            tool_name,
-            self._current_message_id,
-        )
-
-        # TOOL_CALL_START and TOOL_CALL_ARGS are both deferred to
-        # ToolCallProgress — see _handle_tool_call_update_typed. The ag-ui
-        # client APPENDS TOOL_CALL_ARGS deltas, so emitting partial args
-        # (e.g. just {cwd}) here and the full args later would concatenate
-        # into broken JSON. Approval is driven solely by the ACP
-        # request_permission callback, which emits an interrupt
-        # RUN_FINISHED — no policy gate here.
+        raw_input = getattr(update, "raw_input", None)
+        self._process_tool_call_start(tool_call_id, tool_name, raw_input)
 
     def _handle_tool_call_update_typed(
         self, update: acp.schema.ToolCallProgress
@@ -1166,8 +1132,7 @@ class AcpToAguiBridge:
         deferred ``TOOL_CALL_START`` (with the display name derived from the
         command, e.g. ``"bash: ls -la"``) and emits ``TOOL_CALL_ARGS`` in a
         single delta. On ``completed``/``failed`` it emits ``TOOL_CALL_END``
-        and ``TOOL_CALL_RESULT``. Keeping live and replay consistent: both
-        paths now show ``"bash: ls -la"`` with args ``{command, cwd}``.
+        and ``TOOL_CALL_RESULT``.
         """
         tool_call_id = str(
             getattr(update, "tool_call_id", None) or getattr(update, "toolCallId", "")
@@ -1183,30 +1148,198 @@ class AcpToAguiBridge:
         # raw_input carries the actual tool arguments (command, path, etc.)
         # on in_progress updates — separate from raw_output (the result).
         raw_input = getattr(update, "raw_input", None)
+        self._process_tool_call_update(
+            tool_call_id=tool_call_id,
+            status=status,
+            raw_input=raw_input,
+            result_obj=result_obj,
+        )
 
-        if self._replay_mode:
-            if status in ("completed", "failed") and tool_call_id:
-                result_str = self._serialize_tool_result(result_obj)
-                self._append_replay_tool_result(tool_call_id, result_str)
-            elif raw_input is not None and tool_call_id:
-                title = getattr(update, "title", None)
-                self._update_replay_tool(tool_call_id, raw_input, title)
+    # ── Dict-based handlers (fallback for raw dict updates) ──────────────────
+    #
+    # These are thin extraction shims: they pull normalised primitives out of
+    # the raw dict and delegate to the same shared ``_process_*`` methods the
+    # typed handlers use. The shared methods call ``_emit()``, which already
+    # folds into the replay accumulator during replay — so there is no
+    # replay-redirect branch to keep in sync (the legacy one silently
+    # swallowed dict-shaped ``tool_call``/``tool_call_update`` updates during
+    # replay; that bug is now structurally closed).
+
+    def _handle_agent_message_chunk_dict(self, update: dict[str, Any]) -> None:
+        """Translate agent_message_chunk dict — thin shim over
+        ``_process_text_delta``."""
+        content = update.get("content", {})
+        text = (
+            cast(dict[str, Any], content).get("text", "")
+            if isinstance(content, dict)
+            else ""
+        )
+        if not text:
             return
+        self._process_text_delta(text)
 
+    def _handle_user_message_chunk_dict(self, update: dict[str, Any]) -> None:
+        """Translate user_message_chunk dict — thin shim over the replay
+        accumulator's ``add_user_text`` (dropped in live mode, matching the
+        typed path)."""
+        if not self._replay_mode:
+            return
+        content = update.get("content", {})
+        text = (
+            cast(dict[str, Any], content).get("text", "")
+            if isinstance(content, dict)
+            else ""
+        )
+        if not text:
+            return
+        self._close_open_reasoning()
+        assert self._replay_accumulator is not None
+        self._replay_accumulator.add_user_text(text)
+
+    def _handle_tool_call_dict(self, update: dict[str, Any]) -> None:
+        """Translate tool_call dict — thin shim over
+        ``_process_tool_call_start``."""
+        tool_call_id = update.get("toolCallId", str(uuid.uuid4()))
+        tool_name = update.get("title", update.get("toolName", "unknown"))
+        raw_input = update.get("raw_input")
+        self._process_tool_call_start(tool_call_id, tool_name, raw_input)
+
+    def _handle_tool_call_update_dict(self, update: dict[str, Any]) -> None:
+        """Translate tool_call_update dict — thin shim over
+        ``_process_tool_call_update``."""
+        tool_call_id = update.get("toolCallId", "")
+        status = update.get("status", "")
+        # Prefer raw_output (ACP field); fall back to result for legacy dicts.
+        result_obj = update.get("raw_output")
+        if result_obj is None:
+            result_obj = update.get("result")
+        # raw_input carries the actual tool arguments on in_progress updates.
+        raw_input = update.get("raw_input")
+        self._process_tool_call_update(
+            tool_call_id=tool_call_id,
+            status=status,
+            raw_input=raw_input,
+            result_obj=result_obj,
+        )
+
+    # ── Shared processing primitives (typed + dict) ──────────────────────────
+    #
+    # The actual state-machine logic lives here — one implementation per
+    # update kind, shared by the typed and dict-fallback extraction shims
+    # above. Each calls ``_emit()`` (which folds during replay), so live and
+    # replay share not just the sequencing rules but the very same code path.
+
+    def _process_text_delta(self, text: str) -> None:
+        """Emit ``TEXT_MESSAGE_START`` (if needed) + ``TEXT_MESSAGE_CONTENT``.
+
+        Closes any open reasoning phase first so a thought that arrived
+        before text is closed at the text boundary (not concatenated into
+        the next thought's reasoning message). Opens the assistant message
+        lazily on the first delta and reuses it for subsequent deltas until
+        a ``tool_call`` or ``turn_end`` closes it via ``_close_open_message``.
+        """
+        self._close_open_reasoning()
+        if not self._has_open_message:
+            msg_id = str(uuid.uuid4())
+            self._current_message_id = msg_id
+            self._has_open_message = True
+            self._emit(TextMessageStartEvent(messageId=msg_id))
+        self._emit(
+            TextMessageContentEvent(
+                messageId=self._current_message_id,  # type: ignore[arg-type]
+                delta=text,
+            )
+        )
+
+    def _process_thought_delta(self, text: str) -> None:
+        """Emit the ``REASONING_*`` sequence for a thought delta (thin alias
+        over ``_emit_reasoning_delta`` kept for symmetry with the other
+        ``_process_*`` primitives)."""
+        self._emit_reasoning_delta(text)
+
+    def _process_tool_call_start(
+        self, tool_call_id: str, tool_name: str, raw_input: Any = None
+    ) -> None:
+        """Buffer a tool call — ``TOOL_CALL_START`` and ``TOOL_CALL_ARGS``
+        are both deferred to the first ``ToolCallProgress`` with
+        ``raw_input`` (see ``_process_tool_call_update``). The ag-ui client
+        APPENDS ``TOOL_CALL_ARGS`` deltas, so emitting partial args here
+        and the full args later would concatenate into broken JSON.
+        ``raw_input`` from ``ToolCallStart`` (if present) is stored as a
+        fallback for args + display name when no ``ToolCallProgress.raw_input``
+        arrives before completion. Approval is driven solely by the ACP
+        ``request_permission`` callback, which emits an interrupt
+        ``RUN_FINISHED`` — no policy gate here.
+        """
+        self._close_open_reasoning()
+        self._close_open_message()
+        if isinstance(raw_input, dict):
+            cast(dict[str, Any], raw_input).pop("__tool_use_purpose", None)
+        self._pending_tool_starts[tool_call_id] = (
+            tool_name,
+            self._current_message_id,
+            raw_input,
+        )
+
+    def _process_tool_call_update(
+        self,
+        *,
+        tool_call_id: str,
+        status: Any,
+        raw_input: Any,
+        result_obj: Any,
+    ) -> None:
+        """Flush a deferred ``TOOL_CALL_START`` (if pending) and emit
+        ``TOOL_CALL_ARGS`` (on the first ``raw_input``) or
+        ``TOOL_CALL_END`` + ``TOOL_CALL_RESULT`` (on ``completed``/``failed``).
+
+        Shared by the typed and dict-fallback handlers. Calls ``_emit()``,
+        so during replay the same events fold into the accumulator — there
+        is no replay-specific branch.
+        """
         if status in ("completed", "failed"):
             # Flush a pending TOOL_CALL_START if no raw_input arrived first
-            # (rare — the tool completed without streaming args).
+            # (rare — the tool completed without streaming args). Use the
+            # raw_input from ToolCallStart (if any) as a fallback for the
+            # display name and args so a tool call that carries its full
+            # raw_input at start time (and never sends a progress with
+            # raw_input) still shows non-empty args.
             pending = self._pending_tool_starts.pop(tool_call_id, None)
             if pending is not None:
-                tool_name, parent_msg_id = pending
+                tool_name, parent_msg_id, start_raw_input = pending
+                effective_raw_input = (
+                    raw_input if raw_input is not None else start_raw_input
+                )
+                if isinstance(effective_raw_input, dict):
+                    cast(dict[str, Any], effective_raw_input).pop(
+                        "__tool_use_purpose", None
+                    )
                 self._emit(
                     ToolCallStartEvent(
                         toolCallId=tool_call_id,
-                        toolCallName=tool_name,
+                        toolCallName=self._display_tool_name(
+                            tool_name, effective_raw_input
+                        ),
                         parentMessageId=parent_msg_id,
                     )
                 )
                 self._open_tool_calls.add(tool_call_id)
+                # Emit TOOL_CALL_ARGS from the fallback raw_input if we have
+                # one and no progress-delivered raw_input already emitted them.
+                if (
+                    effective_raw_input is not None
+                    and tool_call_id not in self._tool_args_emitted
+                ):
+                    args_json = (
+                        json.dumps(effective_raw_input) if effective_raw_input else "{}"
+                    )
+                    self._emit(
+                        ToolCallArgsEvent(
+                            toolCallId=tool_call_id,
+                            delta=args_json,
+                        )
+                    )
+                    self._tool_args_emitted.add(tool_call_id)
             if tool_call_id in self._open_tool_calls:
                 result_str = self._serialize_tool_result(result_obj)
                 self._emit(
@@ -1240,112 +1373,7 @@ class AcpToAguiBridge:
                 cast(dict[str, Any], raw_input).pop("__tool_use_purpose", None)
             pending = self._pending_tool_starts.pop(tool_call_id, None)
             if pending is not None:
-                tool_name, parent_msg_id = pending
-                self._emit(
-                    ToolCallStartEvent(
-                        toolCallId=tool_call_id,
-                        toolCallName=self._display_tool_name(tool_name, raw_input),
-                        parentMessageId=parent_msg_id,
-                    )
-                )
-                self._open_tool_calls.add(tool_call_id)
-            args_json = json.dumps(raw_input) if raw_input else "{}"
-            self._emit(
-                ToolCallArgsEvent(
-                    toolCallId=tool_call_id,
-                    delta=args_json,
-                )
-            )
-            self._tool_args_emitted.add(tool_call_id)
-
-    # ── Dict-based handlers (fallback for raw dict updates) ──────────────────
-
-    def _handle_agent_message_chunk_dict(self, update: dict[str, Any]) -> None:
-        """Translate agent_message_chunk dict to TEXT_MESSAGE_START/CONTENT."""
-        content = update.get("content", {})
-        text = content.get("text", "")
-        if not text:
-            return
-
-        # See _handle_agent_message_chunk_typed for why.
-        self._close_open_reasoning()
-
-        if not self._has_open_message:
-            msg_id = str(uuid.uuid4())
-            self._current_message_id = msg_id
-            self._has_open_message = True
-            self._emit(TextMessageStartEvent(messageId=msg_id))
-
-        self._emit(
-            TextMessageContentEvent(
-                messageId=self._current_message_id,  # type: ignore[arg-type]
-                delta=text,
-            )
-        )
-
-    def _handle_tool_call_dict(self, update: dict[str, Any]) -> None:
-        """Translate tool_call dict — buffer the tool call until
-        ToolCallProgress delivers raw_input (see _handle_tool_call_typed)."""
-        self._close_open_reasoning()
-        self._close_open_message()
-
-        tool_call_id = update.get("toolCallId", str(uuid.uuid4()))
-        tool_name = update.get("title", update.get("toolName", "unknown"))
-
-        self._pending_tool_starts[tool_call_id] = (
-            tool_name,
-            self._current_message_id,
-        )
-
-    def _handle_tool_call_update_dict(self, update: dict[str, Any]) -> None:
-        """Translate tool_call_update dict to TOOL_CALL_ARGS or TOOL_CALL_END."""
-        tool_call_id = update.get("toolCallId", "")
-        status = update.get("status", "")
-        # Prefer raw_output (ACP field); fall back to result for legacy dicts.
-        result_obj = update.get("raw_output")
-        if result_obj is None:
-            result_obj = update.get("result")
-        # raw_input carries the actual tool arguments on in_progress updates.
-        raw_input = update.get("raw_input")
-
-        if status in ("completed", "failed"):
-            pending = self._pending_tool_starts.pop(tool_call_id, None)
-            if pending is not None:
-                tool_name, parent_msg_id = pending
-                self._emit(
-                    ToolCallStartEvent(
-                        toolCallId=tool_call_id,
-                        toolCallName=tool_name,
-                        parentMessageId=parent_msg_id,
-                    )
-                )
-                self._open_tool_calls.add(tool_call_id)
-            if tool_call_id in self._open_tool_calls:
-                result_str = self._serialize_tool_result(result_obj)
-                self._emit(
-                    ToolCallEndEvent(
-                        toolCallId=tool_call_id,
-                        result=result_str or None,
-                    )
-                )
-                # See _handle_tool_call_update_typed for rationale: emit a
-                # TOOL_CALL_RESULT so CopilotKit synthesizes a ToolMessage and
-                # the renderer can flip to "complete" with the actual output.
-                self._emit(
-                    ToolCallResultEvent(
-                        messageId=f"{tool_call_id}-result",
-                        toolCallId=tool_call_id,
-                        content=result_str,
-                    )
-                )
-                self._open_tool_calls.discard(tool_call_id)
-                self._tool_args_emitted.discard(tool_call_id)
-        elif raw_input is not None and tool_call_id not in self._tool_args_emitted:
-            if isinstance(raw_input, dict):
-                raw_input.pop("__tool_use_purpose", None)
-            pending = self._pending_tool_starts.pop(tool_call_id, None)
-            if pending is not None:
-                tool_name, parent_msg_id = pending
+                tool_name, parent_msg_id, _start_raw_input = pending
                 self._emit(
                     ToolCallStartEvent(
                         toolCallId=tool_call_id,
@@ -1366,12 +1394,13 @@ class AcpToAguiBridge:
     # ── Turn end ─────────────────────────────────────────────────────────────
 
     def _handle_turn_end(self) -> None:
-        """Translate turn_end to close open message/tools + RUN_FINISHED."""
-        if self._replay_mode:
-            # Replay history is closed by end_replay(), not by turn_end — a
-            # historical turn boundary just closes the open assistant message.
-            self._close_replay_assistant()
-            return
+        """Translate turn_end to close open message/tools + RUN_FINISHED.
+
+        During replay this also closes any dangling frames via
+        ``finish_run``; the ``RUN_FINISHED`` it emits is folded harmlessly
+        into the accumulator (``_run_id`` is preserved across replay turns
+        so ``end_replay`` can still reference it).
+        """
         self.finish_run()
 
     # ── Agent extension notifications to CUSTOM ──────────────────────────────
@@ -1413,12 +1442,12 @@ class AcpToAguiBridge:
         bracket AG-UI requires for reasoning.
 
         Also closes any open text message before opening the reasoning
-        phase — mirrors the replay path where ``_append_replay_text`` and
-        ``_append_replay_reasoning`` create separate messages for text and
-        reasoning chunks. Without this, a text chunk that arrives between
-        two thoughts would append to the *same* assistant message, and the
-        reasoning would appear separated from the tool calls instead of
-        interleaved with them.
+        phase so a text chunk that arrives between two thoughts doesn't
+        append to the same assistant message — text and reasoning are
+        separate messages in transcript order. During replay these events
+        fold into the ``MessageSnapshotAccumulator`` via ``_emit()``, so the
+        reasoning renders interleaved with text and tool calls in the
+        snapshot too (no replay-specific code path).
         """
         if not self._has_open_reasoning:
             self._close_open_message()
@@ -1442,18 +1471,32 @@ class AcpToAguiBridge:
     def _close_all_tool_calls(self) -> None:
         """Close all open tool calls."""
         # Flush any pending tool starts (ToolCallStart received but no
-        # raw_input arrived before the turn ended).
-        for tc_id, (tool_name, parent_msg_id) in list(
+        # raw_input arrived before the turn ended). Use the raw_input from
+        # ToolCallStart (if any) as a fallback for the display name and args.
+        for tc_id, (tool_name, parent_msg_id, start_raw_input) in list(
             self._pending_tool_starts.items()
         ):
+            effective_raw_input = start_raw_input
+            if isinstance(effective_raw_input, dict):
+                cast(dict[str, Any], effective_raw_input).pop(
+                    "__tool_use_purpose", None
+                )
             self._emit(
                 ToolCallStartEvent(
                     toolCallId=tc_id,
-                    toolCallName=tool_name,
+                    toolCallName=self._display_tool_name(
+                        tool_name, effective_raw_input
+                    ),
                     parentMessageId=parent_msg_id,
                 )
             )
             self._open_tool_calls.add(tc_id)
+            if effective_raw_input is not None and tc_id not in self._tool_args_emitted:
+                args_json = (
+                    json.dumps(effective_raw_input) if effective_raw_input else "{}"
+                )
+                self._emit(ToolCallArgsEvent(toolCallId=tc_id, delta=args_json))
+                self._tool_args_emitted.add(tc_id)
         self._pending_tool_starts.clear()
         for tc_id in list(self._open_tool_calls):
             self._emit(ToolCallEndEvent(toolCallId=tc_id))
@@ -1469,157 +1512,18 @@ class AcpToAguiBridge:
             )
         self._open_tool_calls.clear()
 
-    # ── Replay coalescing ──────────────────────────────────────────────────
-    #
-    # During ``session/load`` the agent re-emits the historical session/update
-    # stream. Instead of re-streaming AG-UI deltas we coalesce the chunks
-    # back into whole ``SnapshotMessage`` objects and emit ONE
-    # ``MESSAGES_SNAPSHOT`` from ``end_replay``. The state machine mirrors
-    # the delta-emitting one (close open message on tool_call, multiple open
-    # tool calls, turn_end closes everything) but redirects output to the
-    # ``_replay_messages`` list instead of the SSE queue.
-
-    def _append_replay_text(self, role: str, text: str) -> None:
-        """Append a text delta to the current message of ``role``, starting a
-        new message if the last one is a different role (or, for assistant
-        messages, already carries tool calls — text after tools opens a fresh
-        assistant message)."""
-        self._close_replay_reasoning()
-        last = self._replay_messages[-1] if self._replay_messages else None
-        if last is not None and last.role == role:
-            if role == "assistant" and last.toolCalls:
-                # Text following tool calls → new assistant message.
-                last = None
-            else:
-                last.content = (last.content or "") + text
-                return
-        msg = SnapshotMessage(
-            id=str(uuid.uuid4()), role=role, content=text  # type: ignore[arg-type]
-        )
-        self._replay_messages.append(msg)
-
-    def _close_replay_assistant(self) -> None:
-        """Close any open tool calls on the current assistant message so
-        subsequent text opens a fresh message."""
-        # Nothing to "close" structurally — _append_replay_text handles the
-        # transition via the toolCalls check. Drop open tool-call handles
-        # whose results never arrived so they don't leak across turns.
-        self._close_replay_reasoning()
-        self._replay_open_tools.clear()
-
-    def _append_replay_reasoning(self, text: str) -> None:
-        """Append a thought delta to the current replay reasoning message,
-        opening a new ``role="reasoning"`` ``SnapshotMessage`` when the
-        previous thought run was closed by an intervening non-thought chunk.
-        Contiguous ``AgentThoughtChunk`` deltas coalesce into one message
-        (mirroring the live ``REASONING_*`` state machine), preserving
-        transcript position so the replayed reasoning renders where it
-        occurred instead of concatenated at the top."""
-        if self._replay_reasoning_open and self._replay_messages:
-            last = self._replay_messages[-1]
-            if last.role == "reasoning":
-                last.content = (last.content or "") + text
-                return
-        msg = SnapshotMessage(id=str(uuid.uuid4()), role="reasoning", content=text)
-        self._replay_messages.append(msg)
-        self._replay_reasoning_open = True
-
-    def _close_replay_reasoning(self) -> None:
-        """Mark the current replay reasoning message closed so the next
-        thought delta opens a fresh one."""
-        self._replay_reasoning_open = False
-
-    def _append_replay_tool_start(self, update: acp.schema.ToolCallStart) -> None:
-        """Attach a tool call to the current assistant message (creating one
-        if needed) and remember its position so the result can close it.
-
-        Only ``raw_input`` is stored as the arguments — ``kind`` and
-        ``locations`` from ``ToolCallStart`` are deliberately NOT added to
-        the args, matching the live path (which emits only ``raw_input`` as
-        ``TOOL_CALL_ARGS``). This keeps live and replay JSON consistent.
-        The display name is finalized in ``_update_replay_tool`` when the
-        full ``raw_input`` arrives from ``ToolCallProgress``.
-        """
-        self._close_replay_reasoning()
-        tool_call_id = str(
-            getattr(update, "tool_call_id", None)
-            or getattr(update, "toolCallId", str(uuid.uuid4()))
-        )
-        tool_name = getattr(update, "title", None) or "unknown"
-        raw_input: Any = getattr(update, "raw_input", None) or {}
-        if isinstance(raw_input, dict):
-            cast(dict[str, Any], raw_input).pop("__tool_use_purpose", None)
-        args_obj: dict[str, Any] = (
-            cast(dict[str, Any], raw_input) if isinstance(raw_input, dict) else {}
-        )
-
-        last = self._replay_messages[-1] if self._replay_messages else None
-        if last is None or last.role != "assistant":
-            last = SnapshotMessage(id=str(uuid.uuid4()), role="assistant")
-            self._replay_messages.append(last)
-        if last.toolCalls is None:
-            last.toolCalls = []  # pylint: disable=invalid-name
-
-        call = AssistantToolCall(
-            id=tool_call_id,
-            function={"name": tool_name, "arguments": json.dumps(args_obj)},
-        )
-        last.toolCalls.append(call)
-        idx = len(last.toolCalls) - 1
-        self._replay_open_tools[tool_call_id] = (
-            len(self._replay_messages) - 1,
-            idx,
-            tool_name,
-        )
-
-    def _update_replay_tool(
-        self, tool_call_id: str, raw_input: Any, title: str | None = None
-    ) -> None:
-        """Update the stored tool call's arguments and display name from a
-        ``ToolCallProgress`` update.
-
-        During replay, ``ToolCallStart`` may carry only a partial
-        ``raw_input`` (e.g. ``{cwd}``) and the full arguments arrive in a
-        subsequent ``ToolCallProgress``. The display name is derived from
-        the original tool name (saved at ``ToolCallStart`` time) and the
-        command in ``raw_input`` (e.g. ``"bash: ls -la"``) — NOT from the
-        progress ``title``, which ACP agents like opencode set to the raw
-        command string (``"ls -la"``), losing the tool name. This keeps
-        replay consistent with the live path, which also uses the original
-        name + command. The ``title`` parameter is accepted but unused.
-        """
-        handle = self._replay_open_tools.get(tool_call_id)
-        if handle is None:
-            return
-        msg_idx, tc_idx, original_name = handle
-        msg = self._replay_messages[msg_idx]
-        if not msg.toolCalls or tc_idx >= len(msg.toolCalls):
-            return
-        if isinstance(raw_input, dict):
-            cast(dict[str, Any], raw_input).pop("__tool_use_purpose", None)
-        msg.toolCalls[tc_idx].function["arguments"] = json.dumps(
-            raw_input if raw_input else {}
-        )
-        msg.toolCalls[tc_idx].function["name"] = self._display_tool_name(
-            original_name, raw_input
-        )
-
-    def _append_replay_tool_result(self, tool_call_id: str, result_str: str) -> None:
-        """Mint a ``role="tool"`` message carrying the tool's result."""
-        # Drop the open-tool handle; the result closes it.
-        self._replay_open_tools.pop(tool_call_id, None)
-        self._close_replay_reasoning()
-        self._replay_messages.append(
-            SnapshotMessage(
-                id=f"{tool_call_id}-result",
-                role="tool",
-                content=result_str,
-                toolCallId=tool_call_id,
-            )
-        )
-
     def _emit(self, event: AguiEvent) -> None:
-        """Put an event into the asyncio queue (non-blocking)."""
+        """Put an event into the asyncio queue (non-blocking).
+
+        During replay (``_replay_mode``), fold the event into the
+        ``MessageSnapshotAccumulator`` instead of putting it on the SSE
+        queue — the single fold point that makes replay a pure
+        consequence of the live state machine rather than a parallel one.
+        """
+        if self._replay_mode:
+            if self._replay_accumulator is not None:
+                self._replay_accumulator.fold(event)
+            return
         if self._queue is None:
             self._log.warning("Cannot emit — no queue: %s", event.type)
             return
@@ -1642,17 +1546,23 @@ class AcpToAguiBridge:
     @staticmethod
     def _display_tool_name(tool_name: str, raw_input: Any) -> str:
         """Build a display name for a tool call by appending a key argument
-        (e.g. the command for bash) to the tool name: ``"bash: ls -la"``.
+        to the tool name: ``"bash: ls -la"`` for shell tools, ``"read: foo.ts"``
+        for read/edit/write tools.
 
-        Only appends when ``raw_input`` is a dict with a ``command`` key
-        (bash-style tools); other tools (read, edit, glob, etc.) use just
-        the tool name, since their primary argument (file_path, pattern) is
-        already visible in the JSON args.
+        Appends when ``raw_input`` is a dict with a ``command`` key
+        (bash-style tools) or a ``filePath``/``filepath``/``path`` key
+        (read/edit/write-style tools). Other tools use just the tool name,
+        since their primary argument is already visible in the JSON args.
         """
         if isinstance(raw_input, dict):
-            command = raw_input.get("command")
+            ri = cast(dict[str, object], raw_input)
+            command = ri.get("command")
             if isinstance(command, str) and command:
                 return f"{tool_name}: {command}"
+            for key in ("filePath", "filepath", "path"):
+                file_path = ri.get(key)
+                if isinstance(file_path, str) and file_path:
+                    return f"{tool_name}: {file_path}"
         return tool_name
 
     @staticmethod

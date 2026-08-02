@@ -41,14 +41,26 @@ stream, where the client is already committed to parsing SSE.
 
 AGUI "thread id" is 1:1 with ACP "session id". There is some impedence mismatch where we have to store partially complete ACP interactions while waiting for AGUI interactions that will complete them.
 
-Mode/model/config changes mid-conversation are applied via
-`forwardedProps.mode` / `.model` / `.configOptions` on `POST /ag-ui` —
-AG-UI's sanctioned extension field (`RunAgentInput.forwardedProps` is
-untyped by design). The bridge applies them after `start_run` attaches the
-run's queue and before the post-`start_run` `STATE_SNAPSHOT`, best-effort
-(a bad option is logged and skipped, never aborting the turn). This
-replaces an earlier bridge-only `POST /ag-ui/config` endpoint; there is no
-bespoke sibling endpoint for config changes — use the standard run call.
+Mode/model/config changes mid-conversation are applied via AG-UI's native
+`state` channel (`RunAgentInput.state`), read on `POST /ag-ui` on both the
+fresh-prompt and the resume path. `state` is persisted client-side (e.g.
+CopilotKit's `useCoAgent({ state, setState })`) and resent on every run —
+fresh prompt or resume — so a setting changed once sticks without every call
+site having to re-supply it. (The earlier `forwardedProps.mode` / `.model` /
+`.configOptions` path was removed in favour of `state`; `forwardedProps`
+now carries only `mcpServers`, a create/resume-time parameter.)
+
+Because `state` is resent even when unchanged, the bridge diffs the incoming
+`mode` / `model` / `configOptions` against its last-applied baseline
+(`ActiveSession.current_mode_id` and the `currentValue` of each advertised
+`configOptions` entry) and only fires `session/set_mode` /
+`session/set_config_option` for fields that actually differ. A successful
+apply refreshes the baseline so the next run that resends the same `state` is
+a no-op. The apply runs after `start_run` (fresh path) / `resolve_interrupt`
+(resume path) attached the run's queue, before the post-`start_run`
+`STATE_SNAPSHOT`, and is best-effort (a bad option is logged and skipped,
+never aborting the turn). See `proposals/state-based-session-config.md` for
+the full rationale.
 
 For the full bidirectional field mapping and impedance-mismatch notes, see [agui-acp-mapping.md](agui-acp-mapping.md).
 

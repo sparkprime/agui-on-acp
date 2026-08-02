@@ -56,6 +56,7 @@ def _agui_body(
     content: str = "hello",
     forwarded_props: dict[str, Any] | None = None,
     resume: list[dict[str, Any]] | None = None,
+    state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     body: dict[str, Any] = {
         "threadId": thread_id,
@@ -65,6 +66,8 @@ def _agui_body(
     }
     if resume is not None:
         body["resume"] = resume
+    if state is not None:
+        body["state"] = state
     return body
 
 
@@ -145,7 +148,9 @@ async def test_tool_call_emits_start_args_end_and_result(
 
     start = event_of_type(events, "TOOL_CALL_START")
     assert start["data"]["toolCallId"] == "tc1"
-    assert start["data"]["toolCallName"] == "read file"
+    # The display name includes the file path from raw_input (read/edit-style
+    # tools), mirroring the bash "tool: command" enrichment.
+    assert start["data"]["toolCallName"] == "read file: /a"
 
     result = event_of_type(events, "TOOL_CALL_RESULT")
     assert result["data"]["toolCallId"] == "tc1"
@@ -190,6 +195,32 @@ async def test_bash_tool_call_display_name_includes_command(
     # kind/locations from ToolCallStart are NOT in the args
     assert "kind" not in payload
     assert "locations" not in payload
+
+
+@pytest.mark.asyncio
+async def test_read_tool_call_display_name_includes_file_path(
+    fake_agent: FakeAcpAgent, http_client: httpx.AsyncClient
+):
+    """A read/edit/write tool call displays as ``"read: foo.ts"`` (tool name +
+    file path), mirroring the bash ``"bash: ls -la"`` enrichment. The path
+    is read from ``filePath`` (opencode's field), with ``filepath``/``path``
+    as fallbacks for other agents."""
+    fake_agent.script = [
+        tool_start(
+            "tc1",
+            title="read",
+            kind="read",
+            raw_input={"filePath": "/repo/src/foo.ts"},
+        ),
+        tool_end("tc1", status="completed", raw_output={"output": "contents"}),
+        end_turn(),
+    ]
+    async with http_client.stream("POST", "/ag-ui", json=_agui_body()) as resp:
+        events = await read_sse_events(resp)
+    start = event_of_type(events, "TOOL_CALL_START")
+    assert start["data"]["toolCallName"] == "read: /repo/src/foo.ts"
+    args = event_of_type(events, "TOOL_CALL_ARGS")
+    assert json.loads(args["data"]["delta"]) == {"filePath": "/repo/src/foo.ts"}
 
 
 @pytest.mark.asyncio
@@ -1089,57 +1120,12 @@ async def test_elicitation_future_expires_when_no_resume_arrives(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Mid-session mode/model/config change via forwardedProps on POST /ag-ui (P3)
+# Mid-session mode/model/config change via state on POST /ag-ui (P3)
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_prompt_forwarded_props_applies_mode(
-    fake_agent: FakeAcpAgent, http_client: httpx.AsyncClient
-):
-    """``POST /ag-ui`` with ``forwardedProps.mode`` translates to ACP
-    ``session/set_mode`` before the turn runs."""
-    fake_agent.script = [text("hi"), end_turn()]
-    body = _agui_body(forwarded_props={"cwd": "/tmp/opencode", "mode": "plan"})
-    async with http_client.stream("POST", "/ag-ui", json=body) as resp:
-        events = await read_sse_events(resp)
-    assert ("fake-session-1", "plan") in fake_agent.set_mode_calls
-    # The run still completes normally.
-    assert events[-1]["type"] == "RUN_FINISHED"
-
-
-@pytest.mark.asyncio
-async def test_prompt_forwarded_props_applies_model(
-    fake_agent: FakeAcpAgent, http_client: httpx.AsyncClient
-):
-    """``POST /ag-ui`` with ``forwardedProps.model`` translates to ACP
-    ``session/set_config_option(config_id="model", …)`` before the turn."""
-    fake_agent.script = [text("hi"), end_turn()]
-    body = _agui_body(forwarded_props={"cwd": "/tmp/opencode", "model": "claude-y"})
-    async with http_client.stream("POST", "/ag-ui", json=body) as resp:
-        events = await read_sse_events(resp)
-    assert ("fake-session-1", "claude-y") in fake_agent.set_model_calls
-    assert events[-1]["type"] == "RUN_FINISHED"
-
-
-@pytest.mark.asyncio
-async def test_prompt_forwarded_props_applies_config_options(
-    fake_agent: FakeAcpAgent, http_client: httpx.AsyncClient
-):
-    """``POST /ag-ui`` with ``forwardedProps.configOptions`` applies each via
-    ``session/set_config_option`` before the turn."""
-    fake_agent.script = [text("hi"), end_turn()]
-    body = _agui_body(
-        forwarded_props={"cwd": "/tmp/opencode", "configOptions": {"foo": "bar"}}
-    )
-    async with http_client.stream("POST", "/ag-ui", json=body) as resp:
-        events = await read_sse_events(resp)
-    assert ("fake-session-1", "foo", "bar") in fake_agent.set_config_option_calls
-    assert events[-1]["type"] == "RUN_FINISHED"
-
-
-@pytest.mark.asyncio
-async def test_prompt_forwarded_props_bad_option_does_not_abort_run(
+async def test_prompt_state_bad_option_does_not_abort_run(
     fake_agent: FakeAcpAgent, http_client: httpx.AsyncClient
 ):
     """A bad/unsupported mode or config value is logged and skipped (best-effort);
@@ -1148,8 +1134,7 @@ async def test_prompt_forwarded_props_bad_option_does_not_abort_run(
     fake_agent.fail_set_mode = "no-such-mode"
     fake_agent.fail_set_config_option.add("bad-opt")
     body = _agui_body(
-        forwarded_props={
-            "cwd": "/tmp/opencode",
+        state={
             "mode": "no-such-mode",
             "configOptions": {"bad-opt": "x", "good-opt": "y"},
         }
@@ -1165,6 +1150,213 @@ async def test_prompt_forwarded_props_bad_option_does_not_abort_run(
     # No RUN_ERROR — the run finished normally.
     assert all(e["type"] != "RUN_ERROR" for e in events)
     assert events[-1]["type"] == "RUN_FINISHED"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# State-based session config (diff-and-apply) (P3b)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_prompt_state_applies_mode_and_model(
+    fake_agent: FakeAcpAgent, http_client: httpx.AsyncClient
+):
+    """``POST /ag-ui`` with ``state.mode`` / ``state.model`` translates to ACP
+    ``session/set_mode`` / ``session/set_config_option(config_id="model")``
+    before the turn runs — the ``state`` channel is the persisted, always-resent
+    replacement for ``forwardedProps.mode/.model``."""
+    fake_agent.script = [text("hi"), end_turn()]
+    body = _agui_body(state={"mode": "plan", "model": "claude-y"})
+    async with http_client.stream("POST", "/ag-ui", json=body) as resp:
+        events = await read_sse_events(resp)
+    assert ("fake-session-1", "plan") in fake_agent.set_mode_calls
+    assert ("fake-session-1", "claude-y") in fake_agent.set_model_calls
+    assert events[-1]["type"] == "RUN_FINISHED"
+
+
+@pytest.mark.asyncio
+async def test_prompt_state_applies_config_options(
+    fake_agent: FakeAcpAgent, http_client: httpx.AsyncClient
+):
+    """``POST /ag-ui`` with ``state.configOptions`` applies each via
+    ``session/set_config_option`` before the turn."""
+    fake_agent.script = [text("hi"), end_turn()]
+    body = _agui_body(state={"configOptions": {"foo": "bar"}})
+    async with http_client.stream("POST", "/ag-ui", json=body) as resp:
+        events = await read_sse_events(resp)
+    assert ("fake-session-1", "foo", "bar") in fake_agent.set_config_option_calls
+    assert events[-1]["type"] == "RUN_FINISHED"
+
+
+@pytest.mark.asyncio
+async def test_state_resent_unchanged_does_not_reapply():
+    """The defining behaviour of the state-based design: ``state`` is resent on
+    every run, so the bridge must diff against its last-applied baseline and
+    skip the ``set_*`` calls when nothing changed. Two prompts with identical
+    ``state.mode`` / ``state.model`` should issue exactly one ``set_mode`` and
+    one ``set_model`` (the first), not two of each. Requires the agent to
+    advertise the model config option so the bridge has a baseline to diff
+    against (unadvertised options can't be tracked — see ``_set_option_value``)."""
+    fake, manager, client = await make_stack()
+    try:
+        fake.config_options = [
+            {
+                "id": "model",
+                "name": "Model",
+                "type": "select",
+                "currentValue": "gpt-x",
+                "options": [
+                    {"value": "gpt-x", "name": "X"},
+                    {"value": "claude-y", "name": "Y"},
+                ],
+            }
+        ]
+        fake.script = [text("hi"), end_turn()]
+        active = await manager.create_session(cwd="/tmp/opencode")
+        body = _agui_body(
+            thread_id=active.session_id, state={"mode": "plan", "model": "claude-y"}
+        )
+        async with client.stream("POST", "/ag-ui", json=body) as resp:
+            await read_sse_events(resp)
+        async with client.stream("POST", "/ag-ui", json=body) as resp:
+            await read_sse_events(resp)
+        assert fake.set_mode_calls.count((active.session_id, "plan")) == 1
+        assert fake.set_model_calls.count((active.session_id, "claude-y")) == 1
+    finally:
+        await teardown_stack(fake, manager, client)
+
+
+@pytest.mark.asyncio
+async def test_state_only_changed_fields_reapplied():
+    """When a subsequent run changes only one field of ``state``, only that
+    field's ``set_*`` fires a second time — the unchanged field is diffed away
+    against the baseline the first run refreshed. Requires the advertised
+    model option so the model baseline is trackable."""
+    fake, manager, client = await make_stack()
+    try:
+        fake.config_options = [
+            {
+                "id": "model",
+                "name": "Model",
+                "type": "select",
+                "currentValue": "gpt-x",
+                "options": [
+                    {"value": "gpt-x", "name": "X"},
+                    {"value": "claude-y", "name": "Y"},
+                ],
+            }
+        ]
+        fake.script = [text("hi"), end_turn()]
+        active = await manager.create_session(cwd="/tmp/opencode")
+        body1 = _agui_body(
+            thread_id=active.session_id, state={"mode": "plan", "model": "claude-y"}
+        )
+        async with client.stream("POST", "/ag-ui", json=body1) as resp:
+            await read_sse_events(resp)
+        body2 = _agui_body(
+            thread_id=active.session_id, state={"mode": "plan", "model": "gpt-x"}
+        )
+        async with client.stream("POST", "/ag-ui", json=body2) as resp:
+            await read_sse_events(resp)
+        # mode applied exactly once (unchanged on run 2); model applied twice
+        # (changed), once per distinct value.
+        assert fake.set_mode_calls.count((active.session_id, "plan")) == 1
+        assert (active.session_id, "claude-y") in fake.set_model_calls
+        assert (active.session_id, "gpt-x") in fake.set_model_calls
+        assert len(fake.set_model_calls) == 2
+    finally:
+        await teardown_stack(fake, manager, client)
+
+
+@pytest.mark.asyncio
+async def test_resume_applies_state_config_after_resolve(
+    fake_agent: FakeAcpAgent, http_client: httpx.AsyncClient
+):
+    """A resume run carrying ``state.mode`` resolves the parked permission
+    first (settling it under the mode active when the agent asked), THEN
+    applies the new mode — the same diff-and-apply as the fresh-prompt path,
+    now on the resume path too."""
+    fake_agent.script = [
+        text("before-approval"),
+        request_permission("perm1", title="run bash"),
+        text("after-approval"),
+        end_turn(),
+    ]
+    # Run 1: ends with the interrupt (no state config).
+    async with http_client.stream("POST", "/ag-ui", json=_agui_body()) as resp:
+        run1 = await read_until(resp, {"RUN_FINISHED"})
+    assert run1[-1]["data"]["outcome"]["type"] == "interrupt"
+    assert not fake_agent.set_mode_calls  # nothing applied on run 1
+
+    # Run 2: resume with state.mode = "plan".
+    resume_body = _agui_body(
+        resume=[{"interruptId": "perm1", "status": "resolved", "payload": "once"}],
+        state={"mode": "plan"},
+    )
+    async with http_client.stream("POST", "/ag-ui", json=resume_body) as resp:
+        run2 = await read_sse_events(resp)
+    assert run2[-1]["type"] == "RUN_FINISHED"
+    # The permission was resolved...
+    assert len(fake_agent.permission_replies) == 1
+    # ...and the mode change from state was applied on the resume path.
+    assert ("fake-session-1", "plan") in fake_agent.set_mode_calls
+
+
+@pytest.mark.asyncio
+async def test_resume_without_state_does_not_reapply(
+    fake_agent: FakeAcpAgent, http_client: httpx.AsyncClient
+):
+    """A plain resume (no state config) doesn't fire any ``set_*`` calls — the
+    resume path's apply is diff-driven and diffed away, same as the fresh
+    path with unchanged state."""
+    fake_agent.script = [
+        request_permission("perm1"),
+        end_turn(),
+    ]
+    async with http_client.stream("POST", "/ag-ui", json=_agui_body()) as resp:
+        await read_until(resp, {"RUN_FINISHED"})
+    resume_body = _agui_body(
+        resume=[{"interruptId": "perm1", "status": "resolved", "payload": "once"}]
+    )
+    async with http_client.stream("POST", "/ag-ui", json=resume_body) as resp:
+        await read_sse_events(resp)
+    assert fake_agent.set_mode_calls == []
+    assert fake_agent.set_model_calls == []
+    assert fake_agent.set_config_option_calls == []
+
+
+@pytest.mark.asyncio
+async def test_create_time_model_reflected_into_state_diff_baseline() -> None:
+    """A model set at create time is reflected into the session's advertised
+    ``configOptions`` baseline, so the first prompt that echoes the same value
+    back via ``state.model`` diffs to "no change" and doesn't redundantly
+    re-apply it."""
+    fake, manager, client = await make_stack()
+    try:
+        fake.config_options = [
+            {
+                "id": "model",
+                "name": "Model",
+                "type": "select",
+                "currentValue": "gpt-x",
+                "options": [
+                    {"value": "gpt-x", "name": "X"},
+                    {"value": "claude-y", "name": "Y"},
+                ],
+            }
+        ]
+        fake.script = [text("hi"), end_turn()]
+        active = await manager.create_session(cwd="/tmp/opencode", model="claude-y")
+        # The create-time apply records one set_model("claude-y").
+        before = list(fake.set_model_calls)
+        # First prompt echoes the just-applied model back via state — diff
+        # baseline already reflects "claude-y", so no set_model fires again.
+        body = _agui_body(thread_id=active.session_id, state={"model": "claude-y"})
+        async with client.stream("POST", "/ag-ui", json=body) as resp:
+            await read_sse_events(resp)
+        assert fake.set_model_calls == before  # no new set_model on the prompt
+    finally:
+        await teardown_stack(fake, manager, client)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
