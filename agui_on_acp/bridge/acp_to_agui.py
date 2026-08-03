@@ -411,6 +411,20 @@ class AcpToAguiBridge:
         self._replay_mode = True
         self._replay_accumulator = MessageSnapshotAccumulator()
 
+    def merge_replay_state(self, extra: dict[str, Any]) -> None:
+        """Merge response-derived meta (``modes`` / ``currentModeId`` /
+        ``configOptions`` from a ``LoadSessionResponse``) into the replay
+        accumulator's state, so the ``STATE_SNAPSHOT`` emitted by
+        ``end_replay`` carries them alongside the folded plan/usage/
+        sessionInfo.
+
+        Call between ``load_session`` returning and ``end_replay``. No-op
+        when not replaying (defensive — probe bridges, etc.). Only non-None
+        entries are merged.
+        """
+        if self._replay_mode and self._replay_accumulator is not None:
+            self._replay_accumulator.merge_state(extra)
+
     def end_replay(self) -> None:
         """Finish a replay: close any dangling frames, flip replay off,
         and emit the coalesced ``STATE_SNAPSHOT`` + ``MESSAGES_SNAPSHOT`` +
@@ -552,9 +566,7 @@ class AcpToAguiBridge:
             options = serialize_config_options(getattr(update, "config_options", []))
             self._emit(
                 StateDeltaEvent(
-                    delta=[
-                        {"op": "replace", "path": "/configOptions", "value": options}
-                    ]
+                    delta=[{"op": "add", "path": "/configOptions", "value": options}]
                 )
             )
             # Refresh the bridge-side diff baseline (same class of staleness
@@ -572,9 +584,7 @@ class AcpToAguiBridge:
                 value["cost"] = _model_to_dict(cost)
             self._usage = value
             self._emit(
-                StateDeltaEvent(
-                    delta=[{"op": "replace", "path": "/usage", "value": value}]
-                )
+                StateDeltaEvent(delta=[{"op": "add", "path": "/usage", "value": value}])
             )
         elif isinstance(update, acp.schema.SessionInfoUpdate):
             # ACP allows ``title``/``updatedAt`` to be set to null to clear —
@@ -588,7 +598,7 @@ class AcpToAguiBridge:
             self._session_info = value
             self._emit(
                 StateDeltaEvent(
-                    delta=[{"op": "replace", "path": "/sessionInfo", "value": value}]
+                    delta=[{"op": "add", "path": "/sessionInfo", "value": value}]
                 )
             )
         elif isinstance(update, acp.schema.AgentPlanUpdate):
@@ -599,7 +609,7 @@ class AcpToAguiBridge:
                 StateDeltaEvent(
                     delta=[
                         {
-                            "op": "replace",
+                            "op": "add",
                             "path": "/plans/default",
                             "value": value,
                         }
@@ -616,7 +626,7 @@ class AcpToAguiBridge:
                 StateDeltaEvent(
                     delta=[
                         {
-                            "op": "replace",
+                            "op": "add",
                             "path": f"/plans/{_escape_pointer_token(plan_id)}",
                             "value": plan,
                         }
@@ -1144,9 +1154,7 @@ class AcpToAguiBridge:
             )
             self._emit(
                 StateDeltaEvent(
-                    delta=[
-                        {"op": "replace", "path": "/configOptions", "value": options}
-                    ]
+                    delta=[{"op": "add", "path": "/configOptions", "value": options}]
                 )
             )
             if self.on_config_options_changed is not None:
@@ -1160,9 +1168,7 @@ class AcpToAguiBridge:
                 value["cost"] = update.get("cost")
             self._usage = value
             self._emit(
-                StateDeltaEvent(
-                    delta=[{"op": "replace", "path": "/usage", "value": value}]
-                )
+                StateDeltaEvent(delta=[{"op": "add", "path": "/usage", "value": value}])
             )
         elif kind == "session_info_update":
             value = {
@@ -1172,7 +1178,7 @@ class AcpToAguiBridge:
             self._session_info = value
             self._emit(
                 StateDeltaEvent(
-                    delta=[{"op": "replace", "path": "/sessionInfo", "value": value}]
+                    delta=[{"op": "add", "path": "/sessionInfo", "value": value}]
                 )
             )
         elif kind == "plan":
@@ -1181,7 +1187,7 @@ class AcpToAguiBridge:
             self._plans["default"] = value
             self._emit(
                 StateDeltaEvent(
-                    delta=[{"op": "replace", "path": "/plans/default", "value": value}]
+                    delta=[{"op": "add", "path": "/plans/default", "value": value}]
                 )
             )
         elif kind == "plan_update":
@@ -1194,7 +1200,7 @@ class AcpToAguiBridge:
                 StateDeltaEvent(
                     delta=[
                         {
-                            "op": "replace",
+                            "op": "add",
                             "path": f"/plans/{_escape_pointer_token(plan_id)}",
                             "value": plan,
                         }

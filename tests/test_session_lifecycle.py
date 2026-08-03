@@ -548,6 +548,100 @@ async def test_connect_replay_plan_removed_clears_plan_in_state():
 
 
 @pytest.mark.asyncio
+async def test_connect_extracts_modes_and_config_options_into_replay_snapshot():
+    """``connect_session`` extracts modes/configOptions/currentModeId from
+    the ``LoadSessionResponse`` and injects them into the connect
+    ``STATE_SNAPSHOT`` — so the mode selector and config UI aren't empty
+    after a connect. Without this fix the connect snapshot carried only
+    plan/usage/sessionInfo (folded from the replay stream) and the first
+    prompt's STATE_SNAPSHOT carried no modes (active.modes was None)."""
+    fake, manager, client = await make_stack(
+        capabilities_opts=capabilities(load_session=True)
+    )
+    try:
+        fake.modes = [
+            {"id": "build", "name": "Build"},
+            {"id": "plan", "name": "Plan"},
+        ]
+        fake.config_options = [
+            {
+                "id": "model",
+                "name": "Model",
+                "type": "select",
+                "currentValue": "gpt-x",
+                "options": [{"value": "gpt-x", "name": "GPT X"}],
+            }
+        ]
+        active = await manager.create_session(cwd=CWD)
+        sid = active.session_id
+        fake.store.sessions[sid].transcript = [text("hi"), end_turn()]
+        async with client.stream("GET", f"/ag-ui/sessions/{sid}/connect") as resp:
+            assert resp.status_code == 200
+            events = await read_sse_events(resp)
+        snaps = [e for e in events if e["type"] == "STATE_SNAPSHOT"]
+        assert snaps, "expected a STATE_SNAPSHOT from connect"
+        state = snaps[-1]["data"]["snapshot"]
+        # Modes injected from the LoadSessionResponse.
+        assert state["modes"] == [
+            {"id": "build", "name": "Build"},
+            {"id": "plan", "name": "Plan"},
+        ]
+        assert state["currentModeId"] == "build"
+        # configOptions injected too.
+        assert state["configOptions"][0]["id"] == "model"
+        assert state["configOptions"][0]["currentValue"] == "gpt-x"
+        # active.* also populated so the first prompt's STATE_SNAPSHOT
+        # advertises them.
+        active2 = manager.sessions[sid]
+        assert active2.modes == [
+            {"id": "build", "name": "Build"},
+            {"id": "plan", "name": "Plan"},
+        ]
+        assert active2.current_mode_id == "build"
+        assert active2.config_options is not None
+        assert active2.config_options[0]["id"] == "model"
+    finally:
+        await teardown_stack(fake, manager, client)
+
+
+@pytest.mark.asyncio
+async def test_attach_for_prompt_extracts_modes_from_resume_response():
+    """``attach_for_prompt`` (resume-after-restart path) extracts
+    modes/configOptions/currentModeId from the ``ResumeSessionResponse`` so
+    the first prompt's STATE_SNAPSHOT carries them. ``session/resume``
+    doesn't replay the update stream, so this RPC response is the only
+    source of these fields — without the extraction the mode selector
+    starts empty until the agent happens to re-emit an update."""
+    fake, manager, client = await make_stack(
+        capabilities_opts=capabilities(resume=True)
+    )
+    try:
+        fake.modes = [{"id": "build", "name": "Build"}]
+        fake.config_options = [
+            {
+                "id": "model",
+                "name": "Model",
+                "type": "select",
+                "currentValue": "gpt-x",
+                "options": [{"value": "gpt-x", "name": "GPT X"}],
+            }
+        ]
+        active = await manager.create_session(cwd=CWD)
+        sid = active.session_id
+        # Drop the live ActiveSession to force attach_for_prompt through the
+        # session/resume path (modeling a bridge restart).
+        await manager.stop(sid)
+        attached = await manager.attach_for_prompt(sid, cwd=CWD)
+        assert attached.modes == [{"id": "build", "name": "Build"}]
+        assert attached.current_mode_id == "build"
+        assert attached.config_options is not None
+        assert attached.config_options[0]["id"] == "model"
+        assert attached.config_options[0]["currentValue"] == "gpt-x"
+    finally:
+        await teardown_stack(fake, manager, client)
+
+
+@pytest.mark.asyncio
 async def test_connect_unsupported_load_session_is_clear_error():
     """Connecting when loadSession is unsupported returns a 501 error."""
     fake, manager, client = await make_stack(

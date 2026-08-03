@@ -294,16 +294,14 @@ def test_state_delta_replaces_usage_and_session_info():
     acc = MessageSnapshotAccumulator()
     acc.fold(
         StateDeltaEvent(
-            delta=[
-                {"op": "replace", "path": "/usage", "value": {"used": 99, "size": 1000}}
-            ]
+            delta=[{"op": "add", "path": "/usage", "value": {"used": 99, "size": 1000}}]
         )
     )
     acc.fold(
         StateDeltaEvent(
             delta=[
                 {
-                    "op": "replace",
+                    "op": "add",
                     "path": "/sessionInfo",
                     "value": {"title": "chat", "updatedAt": "2026-01-01T00:00:00Z"},
                 }
@@ -327,7 +325,7 @@ def test_state_delta_plan_replace_and_remove():
         StateDeltaEvent(
             delta=[
                 {
-                    "op": "replace",
+                    "op": "add",
                     "path": "/plans/default",
                     "value": {"type": "items", "entries": [{"content": "x"}]},
                 }
@@ -338,7 +336,7 @@ def test_state_delta_plan_replace_and_remove():
         StateDeltaEvent(
             delta=[
                 {
-                    "op": "replace",
+                    "op": "add",
                     "path": "/plans/plan-2",
                     "value": {"type": "items", "id": "plan-2", "entries": []},
                 }
@@ -364,7 +362,7 @@ def test_state_delta_first_replace_on_missing_path_is_lenient():
         StateDeltaEvent(
             delta=[
                 {
-                    "op": "replace",
+                    "op": "add",
                     "path": "/plans/custom",
                     "value": {"type": "markdown", "content": "# hi"},
                 }
@@ -380,9 +378,7 @@ def test_state_snapshot_replaces_state_wholesale():
     with the seed baseline so plan/usage/sessionInfo paths stay defined)."""
     acc = MessageSnapshotAccumulator()
     acc.fold(
-        StateDeltaEvent(
-            delta=[{"op": "replace", "path": "/usage", "value": {"used": 5}}]
-        )
+        StateDeltaEvent(delta=[{"op": "add", "path": "/usage", "value": {"used": 5}}])
     )
     acc.fold(StateSnapshotEvent(snapshot={"configOptions": [{"id": "model"}]}))
     state = acc.state_snapshot()
@@ -399,11 +395,29 @@ def test_state_events_do_not_mint_messages():
     acc = MessageSnapshotAccumulator()
     acc.fold(StateSnapshotEvent(snapshot={"modes": []}))
     acc.fold(
-        StateDeltaEvent(
-            delta=[{"op": "replace", "path": "/usage", "value": {"used": 1}}]
-        )
+        StateDeltaEvent(delta=[{"op": "add", "path": "/usage", "value": {"used": 1}}])
     )
     assert not acc.snapshot()
+
+
+def test_merge_state_injects_response_meta():
+    """``merge_state`` folds response-derived meta (modes/configOptions)
+    into the accumulator's state for the replay snapshot — only non-None
+    entries, so absent fields don't clobber folded values."""
+    acc = MessageSnapshotAccumulator()
+    acc.fold(
+        StateDeltaEvent(delta=[{"op": "add", "path": "/usage", "value": {"used": 5}}])
+    )
+    acc.merge_state(
+        {"modes": [{"id": "build"}], "currentModeId": "build", "configOptions": None}
+    )
+    state = acc.state_snapshot()
+    assert state["modes"] == [{"id": "build"}]
+    assert state["currentModeId"] == "build"
+    # None entries are skipped — usage (folded from a delta) is preserved,
+    # and configOptions stays absent (not clobbered to None).
+    assert state["usage"] == {"used": 5}
+    assert "configOptions" not in state
 
 
 def test_messages_snapshot_event_is_no_op():

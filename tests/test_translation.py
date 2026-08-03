@@ -719,7 +719,7 @@ async def test_config_option_update_notification_emits_state_delta(
     ]
     assert config_deltas, "expected a STATE_DELTA replacing /configOptions"
     op = config_deltas[-1]["data"]["delta"][0]
-    assert op["op"] == "replace"
+    assert op["op"] == "add"
     assert op["value"][0]["id"] == "model"
     assert op["value"][0]["currentValue"] == "claude-y"
     # No STATE_SNAPSHOT carries configOptions mid-turn anymore.
@@ -862,9 +862,13 @@ async def test_plan_update_and_removed_become_state_delta(
         and d["data"]["delta"][0]["path"].startswith("/plans/")
     ]
     assert len(plan_deltas) == 2, f"expected 2 plan STATE_DELTAs, got {plan_deltas}"
-    # First: replace /plans/default with the items plan.
+    # First: add /plans/default with the items plan (RFC 6902 `add` to an
+    # object member replaces-if-exists / creates-if-not — works whether the
+    # client's STATE_SNAPSHOT baseline pre-populated the id or not, which
+    # `replace` does not: it fails silently on a missing path under
+    # fast-json-patch's validate=true).
     replace = plan_deltas[0]["data"]["delta"][0]
-    assert replace["op"] == "replace"
+    assert replace["op"] == "add"
     assert replace["path"] == "/plans/default"
     assert replace["value"]["type"] == "items"
     assert len(replace["value"]["entries"]) == 2

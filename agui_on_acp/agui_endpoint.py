@@ -143,9 +143,10 @@ async def ag_ui_run(body: RunAgentInput, request: Request):
 
     # ── Fresh prompt on an existing/resumed session ─────────────────────────
     fp = body.forwardedProps
-    # Resolve cwd from the bridge's durable ``session_id → cwd`` record so
-    # the client doesn't need to resend it (``forwardedProps.cwd`` is accepted
-    # for backward compatibility but ignored in favour of the stored record).
+    # Resolve cwd from the bridge's durable ``session_id → cwd`` record —
+    # this is the only source; ``forwardedProps``/``state`` are never
+    # consulted for ``cwd`` on the prompt path (cwd is decided once, at
+    # Create, and is never client-resettable afterwards).
     try:
         cwd = await manager.resolve_cwd(thread_id)
     except CwdRecordNotFoundError as exc:

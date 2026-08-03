@@ -605,19 +605,8 @@ class FakeAcpAgent:
             }
         )
         stored = self.store.create(cwd)
-        resp_kwargs: dict[str, Any] = {"session_id": stored.session_id}
-        if self.modes is not None:
-            modes = self.modes
-            resp_kwargs["modes"] = schema.SessionModeState(
-                available_modes=[
-                    schema.SessionMode(id=m["id"], name=m["name"]) for m in modes
-                ],
-                current_mode_id=str(modes[0]["id"]) if modes else "",
-            )
-        if self.config_options is not None:
-            resp_kwargs["config_options"] = [
-                self._build_config_option(opt) for opt in self.config_options
-            ]
+        resp_kwargs = self._session_response_kwargs()
+        resp_kwargs["session_id"] = stored.session_id
         return schema.NewSessionResponse(**resp_kwargs)
 
     async def load_session(
@@ -644,7 +633,7 @@ class FakeAcpAgent:
         # agent's session/load delivers.
         if stored.transcript:
             await self._run_script(session_id, script=stored.transcript)
-        return schema.LoadSessionResponse()
+        return schema.LoadSessionResponse(**self._session_response_kwargs())
 
     async def set_session_mode(
         self, mode_id: str, session_id: str, **_kwargs: Any
@@ -753,7 +742,7 @@ class FakeAcpAgent:
         # Validate the id against the store — a missing/deleted id raises
         # resource_not_found, matching a real agent's resume failure.
         self.store.get(session_id)
-        return schema.ResumeSessionResponse()
+        return schema.ResumeSessionResponse(**self._session_response_kwargs())
 
     async def delete_session(
         self, session_id: str, **_kwargs: Any
@@ -905,6 +894,26 @@ class FakeAcpAgent:
                 schema.ToolCallLocation(**loc) for loc in step.locations
             ]
         return acp.start_tool_call(**kwargs)
+
+    def _session_response_kwargs(self) -> dict[str, Any]:
+        """Build the common kwargs (``modes`` / ``config_options``) shared by
+        ``NewSessionResponse`` / ``LoadSessionResponse`` / ``ResumeSessionResponse``.
+        Lets load/resume advertise the same modes/config as new_session so
+        the bridge can extract them on every lifecycle path."""
+        resp_kwargs: dict[str, Any] = {}
+        if self.modes is not None:
+            modes = self.modes
+            resp_kwargs["modes"] = schema.SessionModeState(
+                available_modes=[
+                    schema.SessionMode(id=m["id"], name=m["name"]) for m in modes
+                ],
+                current_mode_id=str(modes[0]["id"]) if modes else "",
+            )
+        if self.config_options is not None:
+            resp_kwargs["config_options"] = [
+                self._build_config_option(opt) for opt in self.config_options
+            ]
+        return resp_kwargs
 
     def _build_config_option(self, opt: dict[str, Any]) -> Any:
         """Build a ``SessionConfigOptionSelect`` or ``SessionConfigOptionBoolean``

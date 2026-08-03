@@ -172,7 +172,25 @@ class MessageSnapshotAccumulator:
             # RUN_*, CUSTOM, MESSAGES_SNAPSHOT — not message- or state-shaped.
             pass
 
-    # ── Direct (non-wire) entry point ─────────────────────────────────────
+    # ── Direct (non-wire) entry points ────────────────────────────────────
+
+    def merge_state(self, extra: dict[str, Any]) -> None:
+        """Merge response-derived meta (``modes`` / ``currentModeId`` /
+        ``configOptions``) into the accumulated state.
+
+        Used by ``connect_session`` to fold the ``LoadSessionResponse``'s
+        advertised meta into the replay snapshot — those fields come from
+        the RPC response, not from the replayed ``session/update`` stream
+        (modes aren't carried by any update kind; configOptions arrive via
+        ``ConfigOptionUpdate`` but an agent may not replay one). Only
+        non-``None`` entries are merged so absent fields don't clobber
+        anything the replay stream already established. The response
+        reflects the current (final) state, so merging it after the replay
+        stream is delivered is correct and idempotent.
+        """
+        for key, value in extra.items():
+            if value is not None:
+                self._state[key] = value
 
     def add_user_text(self, text: str) -> None:
         """Append a user text delta, merging with the trailing message when

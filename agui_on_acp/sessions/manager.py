@@ -369,7 +369,7 @@ class SessionManager:
         bridge.start_replay(replay_queue)
 
         try:
-            await protocol.load_session(
+            load_result = await protocol.load_session(
                 session_id, cwd, _normalize_mcp_servers(mcp_servers)
             )
         except acp.RequestError as exc:
@@ -377,6 +377,25 @@ class SessionManager:
             if exc.code == -32002:  # resource_not_found
                 raise SessionNotFoundError(session_id) from exc
             raise
+
+        # Extract modes/configOptions/currentModeId from the LoadSessionResponse.
+        # These are NOT delivered by the replayed session/update stream (modes
+        # has no update kind; configOptions arrive via ConfigOptionUpdate but
+        # an agent may not replay one). Inject them into the replay accumulator
+        # so the connect STATE_SNAPSHOT carries the full current state — and
+        # onto ActiveSession so the first prompt's _emit_state_snapshot (which
+        # reads active.*) advertises them too. Without this, the mode selector
+        # and config UI start empty after a connect (the bug this fixes).
+        modes, _models, current_mode_id, config_opts = _extract_session_meta(
+            load_result
+        )
+        bridge.merge_replay_state(
+            {
+                "modes": modes,
+                "currentModeId": current_mode_id,
+                "configOptions": config_opts,
+            }
+        )
 
         bridge.end_replay()
 
@@ -386,6 +405,10 @@ class SessionManager:
             runner=runner,
             protocol=protocol,
             bridge=bridge,
+            modes=modes,
+            models=_models,
+            current_mode_id=current_mode_id,
+            config_options=config_opts,
         )
         _attach_state_callbacks(active)
         self._sessions[session_id] = active
@@ -431,12 +454,25 @@ class SessionManager:
             self._capabilities = init_caps
 
         try:
-            await protocol.resume_session(
+            resume_result = await protocol.resume_session(
                 session_id, cwd, _normalize_mcp_servers(mcp_servers)
             )
         except acp.RequestError as exc:
             await runner.kill()
             raise SessionResumeFailedError(session_id) from exc
+
+        # Extract modes/configOptions/currentModeId from the ResumeSessionResponse
+        # so the first prompt's _emit_state_snapshot (which reads active.*)
+        # advertises them. ``session/resume`` doesn't replay the update stream
+        # (unlike ``session/load``), so this is the ONLY source of these fields
+        # on the resume-after-restart path — without it the mode selector and
+        # config UI start empty until the agent happens to re-emit an update.
+        # (Plan/usage/sessionInfo can't be recovered here — ACP offers no
+        # query for them; see
+        # /home/spark/modular_agents/acp_proposals/session-state-on-attach-responses.md.)
+        modes, _models, current_mode_id, config_opts = _extract_session_meta(
+            resume_result
+        )
 
         active = ActiveSession(
             session_id=session_id,
@@ -444,6 +480,10 @@ class SessionManager:
             runner=runner,
             protocol=protocol,
             bridge=bridge,
+            modes=modes,
+            models=_models,
+            current_mode_id=current_mode_id,
+            config_options=config_opts,
         )
         _attach_state_callbacks(active)
         self._sessions[session_id] = active
